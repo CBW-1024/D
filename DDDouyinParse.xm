@@ -619,7 +619,7 @@ static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次（对�
     }
     if (self.retries < DDPMaxRetries) {
         self.retries += 1;
-        DDDLog(@"handleRenderedHTML: 未命中 playwm，重试 (%u/%d) url=%@", self.retries, DDPMaxRetries, self.ddpRequest.URL);
+        DDDLog(@"handleRenderedHTML: 未命中 playwm，重试 (%u/%ld) url=%@", self.retries, (long)DDPMaxRetries, self.ddpRequest.URL);
         [self.webView loadRequest:self.ddpRequest];
         return;
     }
@@ -887,10 +887,10 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     return instance;
 }
 
-// 从 sender.m_userData 取 content/user
+// 从 sheet.userInfo 取 content/user（WCActionSheet 用 userInfo 字典；KVC 读取绕开未知 selector）
 + (NSString *)contentFromSender:(id)sender {
-    if ([sender respondsToSelector:@selector(m_userData)]) {
-        id data = [sender m_userData];
+    if ([sender respondsToSelector:@selector(valueForKey:)]) {
+        id data = [sender valueForKey:@"userInfo"];
         if ([data respondsToSelector:@selector(valueForKey:)]) {
             NSString *c = [data valueForKey:@"content"];
             if ([c isKindOfClass:NSString.class] && c.length) return c;
@@ -899,8 +899,8 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     return gDDPPanelContent;
 }
 + (NSString *)userFromSender:(id)sender {
-    if ([sender respondsToSelector:@selector(m_userData)]) {
-        id data = [sender m_userData];
+    if ([sender respondsToSelector:@selector(valueForKey:)]) {
+        id data = [sender valueForKey:@"userInfo"];
         if ([data respondsToSelector:@selector(valueForKey:)]) {
             NSString *u = [data valueForKey:@"user"];
             if ([u isKindOfClass:NSString.class] && u.length) return u;
@@ -940,7 +940,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 
 #pragma mark - WCActionSheet delegate（点击底部面板按钮回调）
 // 同一 sheet 的 clicked/dismiss 两个回调都可能触发，用关联对象保证只分发一次
-static const char kDDPActionSheetHandledKey;
+static const char *kDDPActionSheetHandledKey;
 
 - (void)actionSheet:(id)sheet didDismissWithButtonIndex:(NSInteger)buttonIndex {
     [self ddpDispatchSheet:sheet buttonIndex:buttonIndex];
@@ -1010,6 +1010,10 @@ static const char kDDPActionSheetHandledKey;
         } else {
             @try { [sheet setValue:handler forKey:@"delegate"]; } @catch (NSException *e) {}
         }
+
+        // 把 content/user 写进 WCActionSheet.userInfo，回调时 KVC 读回（兜底全局变量）
+        @try { [sheet setValue:@{@"content": content ?: @"", @"user": user ?: @""} forKey:@"userInfo"]; }
+        @catch (NSException *e) {}
 
         if ([sheet respondsToSelector:@selector(showInView:)]) {
             [sheet showInView:top.view];
