@@ -539,7 +539,7 @@ static const NSInteger DDPMaxRetries = 11;         // 对齐 PKC：最多重试 
 
 // 对齐 PKC webView:didFinishNavigation:：延迟后取渲染后的 outerHTML
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
-    DDDLog(@"DDPWebFetcher: didFinishNavigation retries=%u", self.retries);
+    DDDLog(@"DDPWebFetcher: didFinishNavigation retries=%ld", (long)self.retries);
     __weak typeof(self) wself = self;
     // 对齐 PKC：dispatch_after(retries 秒 + 5 秒)，给 JS 渲染留时间
     dispatch_time_t delay = dispatch_time(DISPATCH_TIME_NOW,
@@ -619,7 +619,7 @@ static const NSInteger DDPMaxRetries = 11;         // 对齐 PKC：最多重试 
     }
     if (self.retries < DDPMaxRetries) {
         self.retries += 1;
-        DDDLog(@"handleRenderedHTML: 未命中 playwm，重试 (%u/%d) url=%@", self.retries, DDPMaxRetries, self.ddpRequest.URL);
+        DDDLog(@"handleRenderedHTML: 未命中 playwm，重试 (%ld/%ld) url=%@", (long)self.retries, (long)DDPMaxRetries, self.ddpRequest.URL);
         [self.webView loadRequest:self.ddpRequest];
         return;
     }
@@ -897,7 +897,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 // 对齐 PKC：所有按钮回调都从 sender（面板本身）的 m_userData 取 content / user
 + (NSString *)contentFromSender:(id)sender {
     if ([sender respondsToSelector:@selector(m_userData)]) {
-        id data = [sender m_userData];
+        id data = [sender valueForKey:@"m_userData"];
         if ([data respondsToSelector:@selector(valueForKey:)]) {
             NSString *c = [data valueForKey:@"content"];
             if ([c isKindOfClass:NSString.class] && c.length) return c;
@@ -907,7 +907,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 }
 + (NSString *)userFromSender:(id)sender {
     if ([sender respondsToSelector:@selector(m_userData)]) {
-        id data = [sender m_userData];
+        id data = [sender valueForKey:@"m_userData"];
         if ([data respondsToSelector:@selector(valueForKey:)]) {
             NSString *u = [data valueForKey:@"user"];
             if ([u isKindOfClass:NSString.class] && u.length) return u;
@@ -955,12 +955,13 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 }
 - (void)ddpDispatchButtonIndex:(NSInteger)idx {
     // 按钮顺序对齐 PKC：0 直接发送 / 1 解析发送 / 2 解析预览 / 3 解析链接 / 4 保存相册 / 5 取消
+    // sender 传 nil：各 onXxx: 经 contentFromSender: 回退全局 gDDPPanelContent/gDDPPanelUser
     switch (idx) {
-        case 0: [self onDirectSend:sheet];   break;
-        case 1: [self onParseSend:sheet];    break;
-        case 2: [self onParsePreview:sheet]; break;
-        case 3: [self onParseLink:sheet];    break;
-        case 4: [self onSaveAlbum:sheet];    break;
+        case 0: [self onDirectSend:nil];   break;
+        case 1: [self onParseSend:nil];    break;
+        case 2: [self onParsePreview:nil]; break;
+        case 3: [self onParseLink:nil];    break;
+        case 4: [self onSaveAlbum:nil];    break;
         default: break; // 取消 / 点遮罩
     }
 }
