@@ -10,6 +10,8 @@
 #import <objc/message.h>
 #import <CommonCrypto/CommonCrypto.h>
 #import <AVKit/AVKit.h>
+#import <AVFoundation/AVFoundation.h>
+#import <CoreGraphics/CoreGraphics.h>
 #import <unistd.h>
 #import <string.h>
 
@@ -1071,7 +1073,42 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     });
 }
 
+// 生成视频缩略图（对齐 PKC generateThumbnailForVideo:，main_parser.asm:128727）：
+// AVAssetImageGenerator 取第 0.5s 帧 → JPEG 写临时目录 thumb_<UUID>.jpg → 返回路径
++ (NSString *)generateThumbnailForVideoPath:(NSString *)path {
+    if (!path.length) return nil;
+    NSString *thumbPath = nil;
+    @try {
+        NSURL *videoURL = [NSURL fileURLWithPath:path];
+        AVAsset *asset = [AVAsset assetWithURL:videoURL];
+        if (!asset) return nil;
+        AVAssetImageGenerator *gen = [AVAssetImageGenerator assetImageGeneratorWithAsset:asset];
+        gen.appliesPreferredTrackTransform = YES;
+        // CMTimeMake(1,2) = 0.5s（对齐 PKC）
+        CGImageRef cg = [gen copyCGImageAtTime:CMTimeMake(1, 2)
+                                    actualTime:NULL error:NULL];
+        if (!cg) return nil;
+        UIImage *img = [UIImage imageWithCGImage:cg];
+        CGImageRelease(cg);
+        NSData *jpg = UIImageJPEGRepresentation(img, 0.5);   // 对齐 PKC 压缩质量 0.5
+        if (jpg.length) {
+            thumbPath = [NSTemporaryDirectory()
+                stringByAppendingPathComponent:[NSString stringWithFormat:@"thumb_%@.jpg",
+                                                [[NSUUID UUID] UUIDString]]];
+            [jpg writeToFile:thumbPath atomically:YES];
+        }
+    } @catch (NSException *e) {
+        DDDLog(@"generateThumbnail 异常 %@", e);
+        return nil;
+    }
+    return thumbPath;
+}
+
 // 发视频消息（CMessageMgr AddVideoMsg:ToUsr:VideoInfo:）
+// 完整对齐 PKC sendVideo:videoPath:（main_parser.asm:129031）：
+//   取码率(getVideoBitrateFromFilePath:)→生成缩略图(generateThumbnailForVideo:)→
+//   码率≥300kbps(0x4b400)走 OpenApiMgrHelper.genCaptureVideoInfoWithVideoData:，
+//   <300kbps 走 CaptureVideoInfo.genVideoInfoWithVideoUrl:thumb: → setThumb_path:
 + (void)sendVideoAtPath:(NSString *)path toUser:(NSString *)user {
     if (!path.length) return;
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1081,29 +1118,60 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
             return;
         }
         CMessageMgr *msgMgr = DDPMessageMgr();
-        if (msgMgr && [msgMgr respondsToSelector:@selector(AddVideoMsg:ToUsr:VideoInfo:)]) {
-            // 对齐 PKC sendVideo:videoPath:（main_parser.asm:129031）：优先用微信私有
-            // CaptureVideoInfo genVideoInfoWithVideoUrl:thumb: 构造 VideoInfo 字典
-            // （低码率分支，PKC 高码率另走 OpenApiMgrHelper）；类/方法不可用时回退 nil，
-            // 微信对 nil 有完整兜底（自动补码率/缩略图）。
-            id videoInfo = nil;
-            Class capCls = objc_getClass("CaptureVideoInfo");
-            if (capCls && [capCls respondsToSelector:@selector(genVideoInfoWithVideoUrl:thumb:)]) {
-                @try {
-                    // 动态调用（objc_getClass 返回裸 Class，编译器不认该 selector，走 performSelector）
+        if (!msgMgr || ![msgMgr respondsToSelector:@selector(AddVideoMsg:ToUsr:VideoInfo:)]) {
+            DDPShowSystemTip(@"发送失败");
+            return;
+        }
+        id videoInfo = nil;
+        @try {
+            // 1) 生成缩略图（对齐 PKC generateThumbnailForVideo:）
+            NSString *thumbPath = [self generateThumbnailForVideoPath:path];
+
+            // 2) 取码率（对齐 PKC getVideoBitrateFromFilePath: → videoBitrate 字典 → longLongValue）
+            long long bitrate = 0;
+            Class pkcCls = objc_getClass("GXYeazddpmkzikglugu");   // 混淆类，暴露 getVideoBitrateFromFilePath:
+            if (pkcCls && [pkcCls respondsToSelector:@selector(getVideoBitrateFromFilePath:)]) {
+                id bd = [pkcCls performSelector:@selector(getVideoBitrateFromFilePath:) withObject:path];
+                if ([bd respondsToSelector:@selector(objectForKeyedSubscript:)]) {
+                    id v = [bd objectForKeyedSubscript:@"videoBitrate"];
+                    if ([v respondsToSelector:@selector(longLongValue)]) bitrate = [v longLongValue];
+                }
+            }
+            // 码率拿不到时按体积/时长粗略估计：>2MB 视为高码率（兜底）
+            if (bitrate == 0) {
+                NSNumber *sz = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil][NSFileSize];
+                if (sz.longLongValue > 2 * 1024 * 1024) bitrate = 400000;   // >2MB 视为 ≥300kbps
+            }
+
+            // 3) 分支构造 VideoInfo（对齐 PKC：0x4b400 = 307200）
+            if (bitrate >= 307200) {
+                // 高码率分支：OpenApiMgrHelper.genCaptureVideoInfoWithVideoData:mediaMessage:nil param:nil
+                Class ohCls = objc_getClass("OpenApiMgrHelper");
+                if (ohCls && [ohCls respondsToSelector:@selector(genCaptureVideoInfoWithVideoData:mediaMessage:param:)]) {
+                    NSData *videoData = [NSData dataWithContentsOfFile:path];
+                    videoInfo = [ohCls genCaptureVideoInfoWithVideoData:videoData mediaMessage:nil param:nil];
+                }
+            } else {
+                // 低码率分支：CaptureVideoInfo.genVideoInfoWithVideoUrl:thumb: + setThumb_path:
+                Class capCls = objc_getClass("CaptureVideoInfo");
+                if (capCls && [capCls respondsToSelector:@selector(genVideoInfoWithVideoUrl:thumb:)]) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
                     videoInfo = [capCls performSelector:@selector(genVideoInfoWithVideoUrl:thumb:)
                                              withObject:[NSURL fileURLWithPath:path]
-                                             withObject:nil];
+                                             withObject:thumbPath];
 #pragma clang diagnostic pop
-                } @catch (NSException *e) { videoInfo = nil; }
+                    if (videoInfo && thumbPath && [videoInfo respondsToSelector:@selector(setThumb_path:)]) {
+                        [videoInfo setThumb_path:thumbPath];
+                    }
+                }
             }
-            DDPShowSystemTip(@"解析成功，正在发送");
-            [msgMgr AddVideoMsg:path ToUsr:chatName VideoInfo:videoInfo];
-        } else {
-            DDPShowSystemTip(@"发送失败");
+        } @catch (NSException *e) {
+            DDDLog(@"构造 VideoInfo 异常 %@", e);
+            videoInfo = nil;
         }
+        DDPShowSystemTip(@"解析成功，正在发送");
+        [msgMgr AddVideoMsg:path ToUsr:chatName VideoInfo:videoInfo];
     });
 }
 
