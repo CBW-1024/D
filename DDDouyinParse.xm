@@ -1,7 +1,8 @@
 
 // DDDouyinParse：微信抖音链接解析（复刻 PKCWeChatTools 混淆类 GXYeazddpmkzikglugu）。
 // 流程：识别消息 → 隐藏 WKWebView 抓分享页 HTML → 正则提取/去水印 → 面板发送/预览/保存。
-// 面板用系统 UIAlertController actionSheet（对齐 PKC 面板风格）；长按菜单 hook MMMenuController 追加"解析/预览"。去水印不依赖微信私有 API。
+// 面板复刻 PKC 灰色圆角卡片（微信原生 MMTipsViewController，addButtonWithTitle:target:sel: + show）；
+// 长按菜单 hook MMMenuController 追加"解析/预览"。去水印不依赖微信私有 API。
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <WebKit/WebKit.h>
@@ -156,7 +157,7 @@ static inline void DDDClearLog(void) {
 + (NSString *)GetMMUserAgent;
 @end
 
-// 面板用系统 UIAlertController actionSheet（标题"抖音解析"，message 为消息原文，5 个操作 + 取消）
+// 面板用微信原生 MMTipsViewController（复刻 PKC 灰色圆角卡片：addButtonWithTitle:target:sel: + show）
 
 @interface MMMenuController : NSObject  // 长按菜单控制器（hook setMenuItems: 追加项）
 + (instancetype)sharedMenuController;
@@ -171,8 +172,35 @@ static inline void DDDClearLog(void) {
 @property (nonatomic, weak) id target;
 @end
 
-@interface BaseMessageCellView : UIView  // 消息 cell（hook canShowForwardMenuItem: 存当前消息）
-- (BOOL)canShowForwardMenuItem;
+// 微信原生提示面板（PKC 抖音面板的真实控件，复刻 pkc tipsTitle:Msg:Type:Hidden:CancelTitle:Data: Type==8 分支）
+// 反汇编锚点：DTXcjsghusskmsktjxjkusyvmqnqkzs(混淆类) alertControllerWithTitle:message:preferredStyle:
+//   → addTextViewWithMaxLen:0xbb8 → setTextFieldDefaultText: → setTipsTextPlaceholder:
+//   → addButtonWithTitle:target:sel: ×6(dyzzfs:..dyjxSave:) → addButtonWithCancelTitle:target:sel: → show
+@interface MMTipsViewController : UIViewController
+- (instancetype)initWithTitle:(NSString *)title content:(NSString *)content buttons:(NSArray *)buttons;  // MMTipsViewController.h:150
+- (void)addTextViewWithMaxLen:(unsigned int)maxLen;                                                       // MMTipsViewController.h:129
+- (void)addButtonWithTitle:(NSString *)title target:(id)target sel:(SEL)sel;                              // MMTipsViewController.h:135
+- (void)addCancelButtonWithTitle:(NSString *)title handler:(void (^)(void))handler;                       // MMTipsViewController.h:132
+- (void)show;                                                                                             // MMTipsViewController.h:121
+@property (copy, nonatomic) NSString *textFieldDefaultText;   // MMTipsViewController.h:65（KVC 读写）
+@property (copy, nonatomic) NSString *tipsTextPlaceholder;    // MMTipsViewController.h:66
+@property (retain, nonatomic) id m_userData;                  // MMTipsViewController.h:67
+@end
+
+// 面板按钮适配器：MMTipsViewController 的 addButtonWithTitle:target:sel: 需要「实例对象 + 单参 sel」
+// 对齐 PKC 的 dyzzfs:/dyjxfs:/dyjxyl:/dyjxlj:/dyjxzq:/dyjxSave:（receiver=GXY.. 实例）。这里用单例持有
+// 当前 content/user/topVC，每个按钮 sel 分发到 DDPPanel 对应多参类方法。
+@interface DDPPanelTarget : NSObject
++ (instancetype)shared;
+@property (nonatomic, copy) NSString *content;
+@property (nonatomic, copy) NSString *user;
+@property (nonatomic, weak) UIViewController *topVC;
+- (void)onDirectSend:(id)sender;
+- (void)onParseSend:(id)sender;
+- (void)onParsePreview:(id)sender;
+- (void)onParseLink:(id)sender;
+- (void)onSaveAlbum:(id)sender;
+- (void)onCancel:(id)sender;   // 取消（对齐 PKC getTipsCancel:，仅关闭面板）
 @end
 
 #pragma mark - 配置
@@ -552,9 +580,10 @@ static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次（对�
         return;
     }
 
+    // 对齐 PKC（main_parser.asm:42d74）：cachePolicy=0（NSURLRequestUseProtocolCachePolicy 默认协议缓存）、timeout=30s
     NSURLRequest *request = [NSURLRequest requestWithURL:nsurl
-                                             cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
-                                         timeoutInterval:30.0];   // 30s 超时
+                                             cachePolicy:NSURLRequestUseProtocolCachePolicy
+                                         timeoutInterval:30.0];
 
     // 按配置决定是否走 WKWebView
     BOOL webFetch = DDPConfig.shared.webFetchEnable;
@@ -942,59 +971,121 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 
 @implementation DDPPanel
 
-// 系统 UIAlertController actionSheet（对齐 PKC 面板风格：标题"抖音解析"，message 为消息原文）
+// 复刻 PKC 抖音面板：微信原生 MMTipsViewController 灰色圆角卡片。
+// 反汇编锚点 tipsTitle:Msg:Type:Hidden:CancelTitle:Data: Type==8（main_parser.asm:89e30-89f3c）
 + (BOOL)showForContent:(NSString *)content user:(NSString *)user {
     if (!content.length) return NO;
 
     @try {
+        // 复刻 PKC 抖音面板：微信原生 MMTipsViewController（灰色圆角卡片）。
+        // 反汇编锚点：tipsTitle:Msg:Type:Hidden:CancelTitle:Data: Type==8（main_parser.asm:89e30-89f3c）
+        Class tipsCls = objc_getClass("MMTipsViewController");
+        if (!tipsCls) { DDDLog(@"DDPanel: MMTipsViewController 不存在，回退系统面板"); return NO; }
+        if (![tipsCls instancesRespondToSelector:@selector(addButtonWithTitle:target:sel:)]) {
+            DDDLog(@"DDPanel: MMTipsViewController 缺方法，回退系统面板"); return NO;
+        }
+
         UIWindow *window = DDPKeyWindow();
         UIViewController *top = window.rootViewController;
         while (top.presentedViewController) top = top.presentedViewController;
         if (!top) { DDDLog(@"DDPanel: 找不到顶层 VC"); return NO; }
 
-        UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"抖音解析"
-                                                                       message:content
-                                                                preferredStyle:UIAlertControllerStyleActionSheet];
-        if (!sheet) { DDDLog(@"DDPanel: UIAlertController 初始化失败"); return NO; }
+        // 适配器持有当前 content/user/topVC，按钮 sel 分发给 DDPPanel 类方法
+        DDPPanelTarget *target = [DDPPanelTarget shared];
+        target.content = content;
+        target.user = user;
+        target.topVC = top;
 
-        // 取消：iPad 必须设置 popover 锚点，否则崩溃
-        if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) {
-            sheet.popoverPresentationController.sourceView = top.view;
-            sheet.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(top.view.bounds), CGRectGetMaxY(top.view.bounds), 1, 1);
-            sheet.popoverPresentationController.permittedArrowDirections = 0;
+        // buttons 传空数组（后续手动 addButtonWithTitle），避免 nil 数组在 VC 内部被 count 崩溃。
+        // tipsCls 是 Class（objc_getClass 返回），alloc 需强转 id 以消除 "no known class method" 警告。
+        MMTipsViewController *sheet = [[(id)tipsCls alloc] initWithTitle:@"抖音解析" content:content buttons:@[]];
+        if (!sheet) { DDDLog(@"DDPanel: MMTipsViewController 初始化失败"); return NO; }
+
+        // 对齐 PKC：addTextViewWithMaxLen:0xbb8(3000) 内容输入框 + 默认文本(msg) + 占位符。
+        // 反汇编锚点：Type==8 分支 setTextFieldDefaultText: 与 setTipsTextPlaceholder: 都传 Data["msg"]（消息原文）
+        [sheet addTextViewWithMaxLen:3000];
+        @try {
+            [sheet setValue:content forKey:@"textFieldDefaultText"];   // KVC 写私有 property
+            [sheet setValue:content forKey:@"tipsTextPlaceholder"];    // 对齐 PKC：placeholder 也用消息原文
+        } @catch (NSException *e) {
+            DDDLog(@"DDPanel: textFieldDefaultText/placeholder 设置失败 %@", e);
         }
 
-        // 5 个操作按钮（对齐 PKC 抖音解析面板：直接发送 / 解析发送 / 解析预览 / 解析链接 / 保存相册）
-        [sheet addAction:[UIAlertAction actionWithTitle:@"直接发送" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-            [DDPPanel handleDirectSend:content user:user];
-        }]];
-        [sheet addAction:[UIAlertAction actionWithTitle:@"解析发送" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-            NSString *url = DDPExtractURL(content);
-            if (url.length) [DDPPanel handleParseSend:url user:user force:NO];
-        }]];
-        [sheet addAction:[UIAlertAction actionWithTitle:@"解析预览" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-            NSString *url = DDPExtractURL(content);
-            if (!url.length) return;
-            [DDPPanel handleParsePreview:url fromVC:top];
-        }]];
-        [sheet addAction:[UIAlertAction actionWithTitle:@"解析链接" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-            NSString *url = DDPExtractURL(content);
-            if (url.length) [DDPPanel handleParseLink:url user:user];
-        }]];
-        [sheet addAction:[UIAlertAction actionWithTitle:@"保存相册" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-            NSString *url = DDPExtractURL(content);
-            if (url.length) [DDPPanel handleSaveAlbum:url];
-        }]];
-        [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+        // 5 个操作按钮（对齐 PKC dyzzfs:/dyjxfs:/dyjxyl:/dyjxlj:/dyjxSave:；去掉解析转圈 dyjxzq:）
+        [sheet addButtonWithTitle:@"直接发送" target:target sel:@selector(onDirectSend:)];
+        [sheet addButtonWithTitle:@"解析发送" target:target sel:@selector(onParseSend:)];
+        [sheet addButtonWithTitle:@"解析预览" target:target sel:@selector(onParsePreview:)];
+        [sheet addButtonWithTitle:@"解析链接" target:target sel:@selector(onParseLink:)];
+        [sheet addButtonWithTitle:@"保存相册" target:target sel:@selector(onSaveAlbum:)];
 
-        [top presentViewController:sheet animated:YES completion:nil];
-        DDDLog(@"DDPanel: 系统 actionSheet 已 show user=%@", user);
+        // 取消（对齐 PKC addButtonWithCancelTitle:target:sel:；该方法是 PKC 私有 category，动态调用，缺则回退）
+        if ([sheet respondsToSelector:@selector(addButtonWithCancelTitle:target:sel:)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wcast-function-type"
+            ((void(*)(id, SEL, id, id, SEL))objc_msgSend)(sheet,
+                @selector(addButtonWithCancelTitle:target:sel:), @"取消", target, @selector(onCancel:));
+#pragma clang diagnostic pop
+        } else if ([sheet respondsToSelector:@selector(addCancelButtonWithTitle:handler:)]) {
+            [sheet addCancelButtonWithTitle:@"取消" handler:nil];
+        }
+
+        [sheet show];
+        DDDLog(@"DDPanel: MMTipsViewController 面板已 show user=%@", user);
         return YES;
     } @catch (NSException *e) {
         DDDLog(@"DDPanel: 异常 %@", e);
         return NO;
     }
 }
+
+@end   // 先闭合 DDPPanel，再插入独立的 DDPPanelTarget 实现，避免嵌套 @implementation
+
+// DDPPanelTarget 实现：单参 sel 分发给 DDPPanel 多参类方法
+@implementation DDPPanelTarget
+
++ (instancetype)shared {
+    static DDPPanelTarget *instance;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ instance = [[self alloc] init]; });
+    return instance;
+}
+
+// 直接发送（对齐 PKC dyzzfs:）
+- (void)onDirectSend:(id)sender {
+    [DDPPanel handleDirectSend:self.content user:self.user];
+}
+
+// 解析发送（对齐 PKC dyjxfs:）
+- (void)onParseSend:(id)sender {
+    NSString *url = DDPExtractURL(self.content);
+    if (url.length) [DDPPanel handleParseSend:url user:self.user force:NO];
+}
+
+// 解析预览（对齐 PKC dyjxyl:）
+- (void)onParsePreview:(id)sender {
+    NSString *url = DDPExtractURL(self.content);
+    if (url.length) [DDPPanel handleParsePreview:url fromVC:self.topVC];
+}
+
+// 解析链接（对齐 PKC dyjxlj:）
+- (void)onParseLink:(id)sender {
+    NSString *url = DDPExtractURL(self.content);
+    if (url.length) [DDPPanel handleParseLink:url user:self.user];
+}
+
+// 保存相册（对齐 PKC dyjxSave:）
+- (void)onSaveAlbum:(id)sender {
+    NSString *url = DDPExtractURL(self.content);
+    if (url.length) [DDPPanel handleSaveAlbum:url];
+}
+
+// 取消（对齐 PKC getTipsCancel:；MMTipsViewController 取消按钮点击后自会关闭，无需额外动作）
+- (void)onCancel:(id)sender {
+}
+
+@end
+
+@implementation DDPPanel   // 重新打开 DDPPanel，继续剩余方法
 
 // 直接发送（对齐 PKC dyzzfs:）
 + (void)handleDirectSend:(NSString *)content user:(NSString *)user {
@@ -1430,20 +1521,25 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     }];
 }
 
-// 保存到相册（图片，图文/滑块）
+// 保存到相册（图片，图文/滑块）——对齐 PKC saveImageToPhotoAlbum:（main_parser.asm:ebd48-ebd78）
+// PKC：imageWithData: 转 UIImage → requestAuthorization: → block 里 creationRequestForAssetFromImage:(UIImage) + setCreationDate:[NSDate date]
 + (void)saveImageToAlbumAtPath:(NSString *)path {
     if (!path.length) return;
-    NSURL *fileURL = [NSURL fileURLWithPath:path];
+    UIImage *image = [UIImage imageWithContentsOfFile:path];
+    if (!image) { DDPShowSystemTip(@"保存失败"); return; }
     [PHPhotoLibrary requestAuthorization:^(PHAuthorizationStatus status) {
         if (status != PHAuthorizationStatusAuthorized) {
             dispatch_async(dispatch_get_main_queue(), ^{ DDPShowSystemTip(@"未授权相册权限"); });
             return;
         }
         [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
-            [PHAssetCreationRequest creationRequestForAssetFromImageAtFileURL:fileURL];
+            PHAssetCreationRequest *req = [PHAssetCreationRequest creationRequestForAssetFromImage:image];
+            req.creationDate = [NSDate date];   // 对齐 PKC：写入创建时间为当前时间
         } completionHandler:^(BOOL success, NSError *error) {
-            if (success) DDPShowSystemTip(@"已保存到相册");
-            else DDPShowSystemTip(@"保存失败");
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (success) DDPShowSystemTip(@"已保存到相册");
+                else DDPShowSystemTip(@"保存失败");
+            });
         }];
     }];
 }
