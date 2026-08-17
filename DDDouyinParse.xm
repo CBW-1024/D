@@ -1152,15 +1152,17 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
                 // 高码率分支：OpenApiMgrHelper.genCaptureVideoInfoWithVideoData:mediaMessage:nil param:nil
                 Class ohCls = objc_getClass("OpenApiMgrHelper");
                 if (ohCls && [ohCls respondsToSelector:@selector(genCaptureVideoInfoWithVideoData:mediaMessage:param:)]) {
-                    // 动态调用（objc_getClass 返回裸 Class，编译器不认该 selector，走 performSelector）
+                    // 动态调用（3 参私有方法，performSelector 最多 2 参，用 objc_msgSend 可变参）
                     NSData *videoData = [NSData dataWithContentsOfFile:path];
+                    if (videoData) {
 #pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                    videoInfo = [ohCls performSelector:@selector(genCaptureVideoInfoWithVideoData:mediaMessage:param:)
-                                            withObject:videoData
-                                            withObject:nil
-                                            withObject:nil];
+#pragma clang diagnostic ignored "-Wcast-function-type"
+                        videoInfo = ((id(*)(id, SEL, id, id, id))objc_msgSend)(
+                            (id)ohCls,
+                            @selector(genCaptureVideoInfoWithVideoData:mediaMessage:param:),
+                            videoData, nil, nil);
 #pragma clang diagnostic pop
+                    }
                 }
             } else {
                 // 低码率分支：CaptureVideoInfo.genVideoInfoWithVideoUrl:thumb: + setThumb_path:
@@ -1173,7 +1175,11 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
                                              withObject:thumbPath];
 #pragma clang diagnostic pop
                     if (videoInfo && thumbPath && [videoInfo respondsToSelector:@selector(setThumb_path:)]) {
-                        [videoInfo setThumb_path:thumbPath];
+                        // 动态调用（id 类型，编译器不认私有 setter，走 performSelector 一参版本）
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                        [videoInfo performSelector:@selector(setThumb_path:) withObject:thumbPath];
+#pragma clang diagnostic pop
                     }
                 }
             }
