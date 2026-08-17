@@ -1,7 +1,7 @@
 
 // DDDouyinParse：微信抖音链接解析（复刻 PKCWeChatTools 混淆类 GXYeazddpmkzikglugu）。
 // 流程：识别消息 → 隐藏 WKWebView 抓分享页 HTML → 正则提取/去水印 → 面板发送/预览/保存。
-// 面板用微信原生 WCActionSheet；长按菜单 hook MMMenuController 追加"解析/预览"。去水印不依赖微信私有 API。
+// 面板用系统 UIAlertController actionSheet（对齐 PKC 面板风格）；长按菜单 hook MMMenuController 追加"解析/预览"。去水印不依赖微信私有 API。
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <WebKit/WebKit.h>
@@ -12,6 +12,13 @@
 #import <AVKit/AVKit.h>
 #import <unistd.h>
 #import <string.h>
+
+@class DDPImageViewerController;   // 直接观看图片查看器
+
+// 微信自带视频播放器（PKC 预览用它播放本地 mp4，对齐 pkcDyVideoJxYl → MMMoviePlayerController）
+@interface MMMoviePlayerController : UIViewController
+- (instancetype)initWithMsgWrap:(id)arg1 VideoPath:(NSString *)arg2;
+@end
 
 #pragma mark - 文件日志
 
@@ -114,8 +121,23 @@ static inline void DDDClearLog(void) {
 @end
 
 @interface CMessageMgr : NSObject
-- (id)AddVideoMsg:(NSString *)path ToUsr:(NSString *)usr VideoInfo:(id)info;  // 微信真实签名（头文件）
+- (id)AddVideoMsg:(NSString *)path ToUsr:(NSString *)usr VideoInfo:(id)info;
 - (void)AddMsg:(NSString *)usr MsgWrap:(CMessageWrap *)wrap;
+@end
+
+// 图片消息扩展操作（对齐 PKC sendImg:image: 调用 IMsgExtendOperation.set外界）
+@protocol DDPMsgExtendOperation <NSObject>
+- (void)setImage:(UIImage *)arg1 withData:(NSData *)arg2 isOriginImage:(BOOL)arg3;
+@end
+
+// 图片消息构造（CMessageWrap 由 WeixinContentLogicController.FormImageMsg:withImage:withData: 生成；签名对齐 MsgDelegate-Protocol.h:28）
+@interface CMessageWrap (DDP)
+- (id<DDPMsgExtendOperation>)m_extendInfoWithMsgType;
+@end
+
+@interface WeixinContentLogicController : NSObject
+- (instancetype)init;
+- (CMessageWrap *)FormImageMsg:(NSString *)arg1 withImage:(UIImage *)arg2 withData:(NSData *)arg3;
 @end
 
 @interface CContactMgr : NSObject
@@ -126,7 +148,7 @@ static inline void DDDClearLog(void) {
 + (NSString *)GetMMUserAgent;
 @end
 
-// 面板用微信原生 WCActionSheet（模拟 UIActionSheet：addButtonWithTitle:/setDelegate:/showInView:）
+// 面板用系统 UIAlertController actionSheet（标题"抖音解析"，message 为消息原文，5 个操作 + 取消）
 
 @interface MMMenuController : NSObject  // 长按菜单控制器（hook setMenuItems: 追加项）
 + (instancetype)sharedMenuController;
@@ -328,6 +350,13 @@ static inline NSString *DDPTempPath(NSString *url) {
     NSString *md5 = DDPMD5(url);
     if (!md5) return nil;
     return [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"%@_1.mp4", md5]];
+}
+
+// 图片缓存路径 MD5_1.<ext>
+static inline NSString *DDPTempPathExt(NSString *url, NSString *ext) {
+    NSString *md5 = DDPMD5(url);
+    if (!md5) return nil;
+    return [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"%@_1.%@", md5, ext ?: @"dat"]];
 }
 
 // 取当前 foreground 的 keyWindow（iOS 13+ 多场景）
@@ -638,11 +667,20 @@ static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次（对�
 
 @end
 
-#pragma mark - 解析引擎：抓 HTML → 提取去水印链接 → 下载
+#pragma mark - 解析引擎：抓官方分享页 HTML → 按内容类型提取直链（纯本机，不依赖任何第三方接口）
+
+// 内容类型：视频 / 图文(图集) / 滑块(幻灯片)
+typedef NS_ENUM(NSInteger, DDPMediaType) {
+    DDPMediaTypeUnknown = -1,
+    DDPMediaTypeVideo   = 0,
+    DDPMediaTypeImage   = 1,
+};
 
 @interface DDPEngine : NSObject
 + (instancetype)shared;
-- (void)parseDouyinURL:(NSString *)url completion:(void (^)(NSString *videoURL, NSError *err))completion;
+// 始终返回在线直链：视频→videoURL；图文/滑块→imageURLs。绝不返回本地缓存路径
+- (void)parseDouyinURL:(NSString *)url
+            completion:(void (^)(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err))completion;
 - (NSData *)downloadVideoFromURL:(NSString *)url headers:(NSDictionary *)headers;
 @end
 
@@ -655,8 +693,8 @@ static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次（对�
     return instance;
 }
 
-// 正则提取 playwm 直链并去水印、去重（对齐 PKC extractVideoLinksFromHTML:）
-- (NSArray *)extractVideoLinksFromHTML:(NSString *)html {
+// 视频：正则抠 playwm 直链并去水印、去重（对齐 PKC extractVideoLinksFromHTML:）
+- (NSArray<NSString *> *)extractVideoLinksFromHTML:(NSString *)html {
     if (!html.length) return @[];
 
     NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"https://aweme\\.snssdk\\.com/aweme/v1/playwm/\\?[^\"\\s]+"
@@ -675,17 +713,36 @@ static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次（对�
     return [result copy];
 }
 
-
-// 解析入口：缓存 → 抓 HTML → 提取链接（对齐 PKC fetchRenderedHTMLContentYl:）
-- (void)parseDouyinURL:(NSString *)url completion:(void (^)(NSString *videoURL, NSError *err))completion {
-    if (!url.length) { if (completion) completion(nil, [NSError errorWithDomain:@"DDP" code:-1 userInfo:nil]); return; }
-
-    // 命中缓存直接返回
-    NSString *tempPath = DDPTempPath(url);
-    if (tempPath && DDPFileUsable(tempPath)) {
-        if (completion) completion(tempPath, nil);
-        return;
+// 图文/滑块：抠图集与幻灯片图片（对齐 PKC extractGalleryImagesFromHTML: 两段正则）
+- (NSArray<NSString *> *)extractGalleryImagesFromHTML:(NSString *)html {
+    if (!html.length) return @[];
+    NSMutableArray *result = [NSMutableArray array];
+    // 1) 图集：class 含 gallery-container ... __carousel__image（options=1 忽略大小写）
+    NSRegularExpression *re1 = [NSRegularExpression
+        regularExpressionWithPattern:@"<img[^>]*src=\"([^\"]+)\"[^>]*class=\"[^\"]*gallery-container[^\"]*__carousel__image[^\"]*\""
+        options:NSRegularExpressionCaseInsensitive error:nil];
+    // 2) 滑块/幻灯片：aweme-slides-swiper-item 内的 img（options=9 含 DotMatchesLineSeparators，让 .*? 跨换行）
+    NSRegularExpression *re2 = [NSRegularExpression
+        regularExpressionWithPattern:@"<div[^>]*class=\"aweme-slides-swiper-item[^>]*>.*?<img[^>]*src=\"([^\"]+)\""
+        options:(NSRegularExpressionCaseInsensitive | NSRegularExpressionDotMatchesLineSeparators) error:nil];
+    for (NSRegularExpression *re in @[re1, re2]) {
+        if (!re) continue;
+        NSArray *matches = [re matchesInString:html options:0 range:NSMakeRange(0, html.length)];
+        for (NSTextCheckingResult *m in matches) {
+            if (m.numberOfRanges < 2) continue;
+            NSString *u = [html substringWithRange:[m rangeAtIndex:1]];
+            u = [u stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
+            if (u.length && ![result containsObject:u]) [result addObject:u];
+        }
     }
+    DDDLog(@"extractGalleryImages: 候选数=%lu", (unsigned long)result.count);
+    return [result copy];
+}
+
+// 解析入口：本机 WKWebView 抓官方分享页 → 按内容类型提取直链（不命中本地缓存，始终返回在线直链）
+- (void)parseDouyinURL:(NSString *)url
+            completion:(void (^)(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err))completion {
+    if (!url.length) { if (completion) completion(DDPMediaTypeUnknown, nil, nil, [NSError errorWithDomain:@"DDP" code:-1 userInfo:nil]); return; }
 
     __weak typeof(self) wself = self;
     [[DDPWebFetcher sharedFetcher] fetchHTMLFromURL:url completion:^(NSString *html, NSInteger errCode) {
@@ -696,19 +753,24 @@ static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次（对�
                [NSThread isMainThread] ? @"main" : @"bg");
         @try {
             if (!html.length) {
-                if (completion) completion(nil, [NSError errorWithDomain:@"DDP" code:-2 userInfo:nil]);
+                if (completion) completion(DDPMediaTypeUnknown, nil, nil, [NSError errorWithDomain:@"DDP" code:-2 userInfo:nil]);
                 return;
             }
-            NSArray *urls = [sself extractVideoLinksFromHTML:html];
-            DDDLog(@"parseDouyinURL: 匹配到视频链接数=%lu", (unsigned long)urls.count);
-            if (urls.count == 0) {
-                if (completion) completion(nil, [NSError errorWithDomain:@"DDP" code:-3 userInfo:nil]);
+            // 视频优先；否则图文/滑块
+            NSArray *videos = [sself extractVideoLinksFromHTML:html];
+            if (videos.count) {
+                if (completion) completion(DDPMediaTypeVideo, videos.firstObject, nil, nil);
                 return;
             }
-            if (completion) completion(urls.firstObject, nil);
+            NSArray *images = [sself extractGalleryImagesFromHTML:html];
+            if (images.count) {
+                if (completion) completion(DDPMediaTypeImage, nil, images, nil);
+                return;
+            }
+            if (completion) completion(DDPMediaTypeUnknown, nil, nil, [NSError errorWithDomain:@"DDP" code:-3 userInfo:nil]);
         } @catch (NSException *e) {
             DDDLog(@"parseDouyinURL 异常 %@", e);
-            if (completion) completion(nil, [NSError errorWithDomain:@"DDP" code:-5 userInfo:nil]);
+            if (completion) completion(DDPMediaTypeUnknown, nil, nil, [NSError errorWithDomain:@"DDP" code:-5 userInfo:nil]);
         }
     }];
 }
@@ -770,10 +832,6 @@ static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次（对�
 
 // 一次性放行标志（对应 PKC pkcDyTcEnable）
 static BOOL gDDPDyTcEnable;
-
-// content/user 兜底
-static NSString *gDDPPanelContent;
-static NSString *gDDPPanelUser;
 
 // 取 CMessageMgr（优先 activeUserContext）
 static CMessageMgr *DDPMessageMgr(void) {
@@ -865,110 +923,17 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 + (void)handleParseLink:(NSString *)url user:(NSString *)user;
 + (void)handleSaveAlbum:(NSString *)url;
 + (void)sendVideoAtPath:(NSString *)path toUser:(NSString *)user;
++ (void)sendImageAtPath:(NSString *)path toUser:(NSString *)user;
++ (void)sendImagesForURLs:(NSArray<NSString *> *)urls shareURL:(NSString *)shareURL user:(NSString *)user force:(BOOL)force;
 + (void)playVideoAtPath:(NSString *)path fromVC:(UIViewController *)vc;
 + (void)saveVideoToAlbumAtPath:(NSString *)path;
-@end
-
-@interface DDPPanelHandler : NSObject
-+ (instancetype)shared;
-- (void)onDirectSend:(id)sender;      // 直接发送
-- (void)onParseSend:(id)sender;       // 解析发送
-- (void)onParsePreview:(id)sender;    // 解析预览
-- (void)onParseLink:(id)sender;       // 解析链接
-- (void)onSaveAlbum:(id)sender;       // 保存相册
-- (void)onCancel:(id)sender;
-@end
-
-@implementation DDPPanelHandler
-+ (instancetype)shared {
-    static DDPPanelHandler *instance;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ instance = [[self alloc] init]; });
-    return instance;
-}
-
-// 从 sheet.userInfo 取 content/user（WCActionSheet 用 userInfo 字典；KVC 读取绕开未知 selector）
-+ (NSString *)contentFromSender:(id)sender {
-    if ([sender respondsToSelector:@selector(valueForKey:)]) {
-        id data = [sender valueForKey:@"userInfo"];
-        if ([data respondsToSelector:@selector(valueForKey:)]) {
-            NSString *c = [data valueForKey:@"content"];
-            if ([c isKindOfClass:NSString.class] && c.length) return c;
-        }
-    }
-    return gDDPPanelContent;
-}
-+ (NSString *)userFromSender:(id)sender {
-    if ([sender respondsToSelector:@selector(valueForKey:)]) {
-        id data = [sender valueForKey:@"userInfo"];
-        if ([data respondsToSelector:@selector(valueForKey:)]) {
-            NSString *u = [data valueForKey:@"user"];
-            if ([u isKindOfClass:NSString.class] && u.length) return u;
-        }
-    }
-    return gDDPPanelUser;
-}
-
-- (void)onDirectSend:(id)sender {
-    NSString *content = [DDPPanelHandler contentFromSender:sender];
-    NSString *user    = [DDPPanelHandler userFromSender:sender];
-    [DDPPanel handleDirectSend:content user:user];
-}
-- (void)onParseSend:(id)sender {
-    NSString *url  = DDPExtractURL([DDPPanelHandler contentFromSender:sender]);
-    NSString *user = [DDPPanelHandler userFromSender:sender];
-    if (url.length) [DDPPanel handleParseSend:url user:user force:NO];
-}
-- (void)onParsePreview:(id)sender {
-    NSString *url = DDPExtractURL([DDPPanelHandler contentFromSender:sender]);
-    if (!url.length) return;
-    UIWindow *window = DDPKeyWindow();
-    UIViewController *topVC = window.rootViewController;
-    while (topVC.presentedViewController) topVC = topVC.presentedViewController;
-    if (topVC) [DDPPanel handleParsePreview:url fromVC:topVC];
-}
-- (void)onParseLink:(id)sender {
-    NSString *url  = DDPExtractURL([DDPPanelHandler contentFromSender:sender]);
-    NSString *user = [DDPPanelHandler userFromSender:sender];
-    if (url.length) [DDPPanel handleParseLink:url user:user];
-}
-- (void)onSaveAlbum:(id)sender {
-    NSString *url = DDPExtractURL([DDPPanelHandler contentFromSender:sender]);
-    if (url.length) [DDPPanel handleSaveAlbum:url];
-}
-- (void)onCancel:(id)sender { /* 取消：不操作（消息已被拦截） */ }
-
-#pragma mark - WCActionSheet delegate（点击底部面板按钮回调）
-// 同一 sheet 的 clicked/dismiss 两个回调都可能触发，用关联对象保证只分发一次
-static const char *kDDPActionSheetHandledKey;
-
-- (void)actionSheet:(id)sheet didDismissWithButtonIndex:(NSInteger)buttonIndex {
-    [self ddpDispatchSheet:sheet buttonIndex:buttonIndex];
-}
-- (void)actionSheet:(id)sheet clickedButtonAtIndex:(NSInteger)buttonIndex {
-    [self ddpDispatchSheet:sheet buttonIndex:buttonIndex];
-}
-- (void)ddpDispatchSheet:(id)sheet buttonIndex:(NSInteger)idx {
-    if (!sheet) return;
-    NSNumber *handled = objc_getAssociatedObject(sheet, &kDDPActionSheetHandledKey);
-    if (handled.boolValue) return;
-    objc_setAssociatedObject(sheet, &kDDPActionSheetHandledKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-    // 按钮索引：0直接发送 1解析发送 2预览 3链接 4保存；原生取消走 default
-    switch (idx) {
-        case 0: [self onDirectSend:sheet];   break;
-        case 1: [self onParseSend:sheet];    break;
-        case 2: [self onParsePreview:sheet]; break;
-        case 3: [self onParseLink:sheet];    break;
-        case 4: [self onSaveAlbum:sheet];    break;
-        default: break; // 取消 / 点遮罩
-    }
-}
++ (void)saveImageToAlbumAtPath:(NSString *)path;
++ (void)downloadAndSaveImages:(NSArray<NSString *> *)urls shareURL:(NSString *)shareURL;
 @end
 
 @implementation DDPPanel
 
-// 微信原生底部面板 WCActionSheet
+// 系统 UIAlertController actionSheet（对齐 PKC 面板风格：标题"抖音解析"，message 为消息原文）
 + (BOOL)showForContent:(NSString *)content user:(NSString *)user {
     if (!content.length) return NO;
 
@@ -978,49 +943,43 @@ static const char *kDDPActionSheetHandledKey;
         while (top.presentedViewController) top = top.presentedViewController;
         if (!top) { DDDLog(@"DDPanel: 找不到顶层 VC"); return NO; }
 
-        gDDPPanelContent = content;
-        gDDPPanelUser = user;
+        UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"抖音解析"
+                                                                       message:content
+                                                                preferredStyle:UIAlertControllerStyleActionSheet];
+        if (!sheet) { DDDLog(@"DDPanel: UIAlertController 初始化失败"); return NO; }
 
-        // 微信原生面板类 WCActionSheet
-        Class wcSheet = NSClassFromString(@"WCActionSheet");
-        if (!wcSheet || ![wcSheet instancesRespondToSelector:@selector(addButtonWithTitle:)] ||
-            ![wcSheet instancesRespondToSelector:@selector(setDelegate:)] ||
-            (![wcSheet instancesRespondToSelector:@selector(showInView:)] &&
-             ![wcSheet instancesRespondToSelector:@selector(show)])) {
-            DDDLog(@"DDPanel: WCActionSheet 不可用，面板未弹出");
-            return NO;
+        // 取消：iPad 必须设置 popover 锚点，否则崩溃
+        if (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad) {
+            sheet.popoverPresentationController.sourceView = top.view;
+            sheet.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(top.view.bounds), CGRectGetMaxY(top.view.bounds), 1, 1);
+            sheet.popoverPresentationController.permittedArrowDirections = 0;
         }
 
-        id sheet = [wcSheet instancesRespondToSelector:@selector(initWithTitle:)]
-            ? [[wcSheet alloc] initWithTitle:@"抖音解析"]
-            : [[wcSheet alloc] init];
-        if (!sheet) { DDDLog(@"DDPanel: WCActionSheet 初始化失败"); return NO; }
+        // 5 个操作按钮（对齐 PKC 抖音解析面板：直接发送 / 解析发送 / 解析预览 / 解析链接 / 保存相册）
+        [sheet addAction:[UIAlertAction actionWithTitle:@"直接发送" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+            [DDPPanel handleDirectSend:content user:user];
+        }]];
+        [sheet addAction:[UIAlertAction actionWithTitle:@"解析发送" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+            NSString *url = DDPExtractURL(content);
+            if (url.length) [DDPPanel handleParseSend:url user:user force:NO];
+        }]];
+        [sheet addAction:[UIAlertAction actionWithTitle:@"解析预览" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+            NSString *url = DDPExtractURL(content);
+            if (!url.length) return;
+            [DDPPanel handleParsePreview:url fromVC:top];
+        }]];
+        [sheet addAction:[UIAlertAction actionWithTitle:@"解析链接" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+            NSString *url = DDPExtractURL(content);
+            if (url.length) [DDPPanel handleParseLink:url user:user];
+        }]];
+        [sheet addAction:[UIAlertAction actionWithTitle:@"保存相册" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+            NSString *url = DDPExtractURL(content);
+            if (url.length) [DDPPanel handleSaveAlbum:url];
+        }]];
+        [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
 
-        // 按钮顺序：直接发送 → 解析发送 → 解析预览 → 解析链接 → 保存相册
-        // 不主动加“取消”，WCActionSheet 自身已带原生取消按钮
-        [sheet addButtonWithTitle:@"直接发送"];
-        [sheet addButtonWithTitle:@"解析发送"];
-        [sheet addButtonWithTitle:@"解析预览"];
-        [sheet addButtonWithTitle:@"解析链接"];
-        [sheet addButtonWithTitle:@"保存相册"];
-
-        DDPPanelHandler *handler = [DDPPanelHandler shared];
-        if ([sheet respondsToSelector:@selector(setDelegate:)]) {
-            [sheet setDelegate:(id)handler];
-        } else {
-            @try { [sheet setValue:handler forKey:@"delegate"]; } @catch (NSException *e) {}
-        }
-
-        // 把 content/user 写进 WCActionSheet.userInfo，回调时 KVC 读回（兜底全局变量）
-        @try { [sheet setValue:@{@"content": content ?: @"", @"user": user ?: @""} forKey:@"userInfo"]; }
-        @catch (NSException *e) {}
-
-        if ([sheet respondsToSelector:@selector(showInView:)]) {
-            [sheet showInView:top.view];
-        } else {
-            [sheet show];
-        }
-        DDDLog(@"DDPanel: 微信原生面板已 show user=%@ (WCActionSheet)", user);
+        [top presentViewController:sheet animated:YES completion:nil];
+        DDDLog(@"DDPanel: 系统 actionSheet 已 show user=%@", user);
         return YES;
     } @catch (NSException *e) {
         DDDLog(@"DDPanel: 异常 %@", e);
@@ -1040,40 +999,70 @@ static const char *kDDPActionSheetHandledKey;
 + (void)handleParseSend:(NSString *)url user:(NSString *)user force:(BOOL)force {
     DDDLog(@"handleParseSend: 开始 url=%@ user=%@", url, user);
     DDPShowSystemTip(@"抖音解析后台任务开始");
-    [[DDPEngine shared] parseDouyinURL:url completion:^(NSString *videoURL, NSError *err) {
+    [[DDPEngine shared] parseDouyinURL:url completion:^(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err) {
         @try {
-            if (err || !videoURL) {
+            if (err || type == DDPMediaTypeUnknown) {
                 DDDLog(@"handleParseSend: 解析失败 url=%@ err=%@", url, err);
                 dispatch_async(dispatch_get_main_queue(), ^{ DDPShowSystemTip(@"解析失败，请检查网络重试！"); });
                 return;
             }
-            DDDLog(@"handleParseSend: 解析成功 videoURL=%@ user=%@", videoURL, user);
-            NSString *path = DDPTempPath(url);
-            // flag=1 忽略缓存
-            if (!force && DDPFileUsable(path)) {
-                [DDPPanel sendVideoAtPath:path toUser:user];
-                return;
+            if (type == DDPMediaTypeVideo) {
+                [self sendVideoForURL:videoURL shareURL:url user:user force:force];
+            } else {
+                [self sendImagesForURLs:imageURLs shareURL:url user:user force:force];   // 图文/滑块：下载直链逐张发进聊天
             }
-            // 后台下载
-            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                NSData *data = [[DDPEngine shared] downloadVideoFromURL:videoURL headers:nil];
-                BOOL ok = NO;
-                if (data.length) {
-                    NSFileManager *fm = [NSFileManager defaultManager];
-                    if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
-                    ok = [data writeToFile:path atomically:YES];
-                }
-                if (ok) {
-                    [DDPPanel sendVideoAtPath:path toUser:user];
-                } else {
-                    dispatch_async(dispatch_get_main_queue(), ^{ DDPShowSystemTip(@"下载失败"); });
-                }
-            });
         } @catch (NSException *e) {
             DDDLog(@"handleParseSend 异常 %@", e);
             dispatch_async(dispatch_get_main_queue(), ^{ DDPShowSystemTip(@"解析失败"); });
         }
     }];
+}
+
+// 下载视频直链并发到聊天（含本地缓存复用）
++ (void)sendVideoForURL:(NSString *)videoURL shareURL:(NSString *)url user:(NSString *)user force:(BOOL)force {
+    if (!videoURL.length) { dispatch_async(dispatch_get_main_queue(), ^{ DDPShowSystemTip(@"解析失败"); }); return; }
+    NSString *path = DDPTempPath(url);
+    if (!force && DDPFileUsable(path)) {
+        [DDPPanel sendVideoAtPath:path toUser:user];
+        return;
+    }
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSData *data = [[DDPEngine shared] downloadVideoFromURL:videoURL headers:nil];
+        BOOL ok = NO;
+        if (data.length) {
+            NSFileManager *fm = [NSFileManager defaultManager];
+            if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
+            ok = [data writeToFile:path atomically:YES];
+        }
+        if (ok) [DDPPanel sendVideoAtPath:path toUser:user];
+        else dispatch_async(dispatch_get_main_queue(), ^{ DDPShowSystemTip(@"下载失败"); });
+    });
+}
+
+// 下载图片直链并批量存相册（图文/滑块，纯本机官方直链）
++ (void)downloadAndSaveImages:(NSArray<NSString *> *)urls shareURL:(NSString *)shareURL {
+    if (!urls.count) { DDPShowSystemTip(@"未找到图片"); return; }
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSInteger saved = 0;
+        for (NSString *imgURL in urls) {
+            NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL headers:nil];
+            if (!data.length) continue;
+            NSString *ext = @"jpg";
+            if ([[imgURL pathExtension].lowercaseString isEqualToString:@"png"]) ext = @"png";
+            NSString *path = DDPTempPathExt(imgURL, ext);
+            NSFileManager *fm = [NSFileManager defaultManager];
+            if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
+            if ([data writeToFile:path atomically:YES]) {
+                [DDPPanel saveImageToAlbumAtPath:path];
+                saved++;
+            }
+        }
+        NSInteger n = saved;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            DDPShowSystemTip(n > 1 ? [NSString stringWithFormat:@"已保存 %ld 张", (long)n]
+                            : (n == 1 ? @"已保存到相册" : @"保存失败"));
+        });
+    });
 }
 
 // 发视频消息（CMessageMgr AddVideoMsg:ToUsr:VideoInfo:）
@@ -1087,43 +1076,128 @@ static const char *kDDPActionSheetHandledKey;
         }
         CMessageMgr *msgMgr = DDPMessageMgr();
         if (msgMgr && [msgMgr respondsToSelector:@selector(AddVideoMsg:ToUsr:VideoInfo:)]) {
+            // 对齐 PKC sendVideo:videoPath:（main_parser.asm:129031）：优先用微信私有
+            // CaptureVideoInfo genVideoInfoWithVideoUrl:thumb: 构造 VideoInfo 字典
+            // （低码率分支，PKC 高码率另走 OpenApiMgrHelper）；类/方法不可用时回退 nil，
+            // 微信对 nil 有完整兜底（自动补码率/缩略图）。
+            id videoInfo = nil;
+            Class capCls = objc_getClass("CaptureVideoInfo");
+            if (capCls && [capCls respondsToSelector:@selector(genVideoInfoWithVideoUrl:thumb:)]) {
+                @try {
+                    videoInfo = [capCls genVideoInfoWithVideoUrl:[NSURL fileURLWithPath:path] thumb:nil];
+                } @catch (NSException *e) { videoInfo = nil; }
+            }
             DDPShowSystemTip(@"解析成功，正在发送");
-            [msgMgr AddVideoMsg:path ToUsr:chatName VideoInfo:path];
+            [msgMgr AddVideoMsg:path ToUsr:chatName VideoInfo:videoInfo];
         } else {
             DDPShowSystemTip(@"发送失败");
         }
     });
 }
 
-// 解析预览（AVPlayer 播放）
+// 发图片消息（CMessageMgr AddMsg:MsgWrap:；wrap 由 WeixinContentLogicController.FormImageMsg:withImage:withData: 构造，对齐 PKC sendImg:image:）
++ (void)sendImageAtPath:(NSString *)path toUser:(NSString *)user {
+    if (!path.length) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSString *chatName = user.length ? user : DDPCurrentChatName();
+        if (!chatName.length) { DDPShowSystemTip(@"发送失败"); return; }
+
+        UIImage *image = [UIImage imageWithContentsOfFile:path];
+        if (!image) { DDPShowSystemTip(@"发送失败"); return; }
+        NSData *data = UIImagePNGRepresentation(image);
+        if (!data.length) { DDPShowSystemTip(@"发送失败"); return; }
+
+        Class ctrlCls = objc_getClass("WeixinContentLogicController");
+        if (!ctrlCls) { DDPShowSystemTip(@"发送失败"); return; }
+        id ctrl = [[ctrlCls alloc] init];
+        if (!ctrl || ![ctrl respondsToSelector:@selector(FormImageMsg:withImage:withData:)]) {
+            DDPShowSystemTip(@"发送失败"); return;
+        }
+        CMessageWrap *wrap = [ctrl FormImageMsg:chatName withImage:image withData:data];
+        if (!wrap) { DDPShowSystemTip(@"发送失败"); return; }
+
+        // 写入原图扩展信息（对齐 PKC：m_extendInfoWithMsgType → setImage:withData:isOriginImage:YES）
+        id<DDPMsgExtendOperation> ext = [wrap m_extendInfoWithMsgType];
+        if (ext && [ext respondsToSelector:@selector(setImage:withData:isOriginImage:)]) {
+            [ext setImage:image withData:data isOriginImage:YES];
+        }
+
+        CMessageMgr *mgr = DDPMessageMgr();
+        if (mgr && [mgr respondsToSelector:@selector(AddMsg:MsgWrap:)]) {
+            DDPShowSystemTip(@"解析成功，正在发送");
+            [mgr AddMsg:chatName MsgWrap:wrap];   // 图片 type=3，不会命中抖音面板拦截
+        } else {
+            DDPShowSystemTip(@"发送失败");
+        }
+    });
+}
+
+// 下载图片直链并逐张发进聊天（图文/滑块，纯本机官方直链；对齐 PKC sendImg:image:）
++ (void)sendImagesForURLs:(NSArray<NSString *> *)urls shareURL:(NSString *)shareURL user:(NSString *)user force:(BOOL)force {
+    if (!urls.count) { DDPShowSystemTip(@"未找到图片"); return; }
+    DDPShowSystemTip(@"抖音解析后台任务开始");
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSInteger sent = 0;
+        for (NSString *imgURL in urls) {
+            @autoreleasepool {
+                NSString *ext = @"jpg";
+                if ([[imgURL pathExtension].lowercaseString isEqualToString:@"png"]) ext = @"png";
+                NSString *path = DDPTempPathExt(imgURL, ext);
+                if (!force && DDPFileUsable(path)) {
+                    [DDPPanel sendImageAtPath:path toUser:user];
+                    sent++;
+                    continue;
+                }
+                NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL headers:nil];
+                if (!data.length) continue;
+                NSFileManager *fm = [NSFileManager defaultManager];
+                if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
+                if ([data writeToFile:path atomically:YES]) {
+                    [DDPPanel sendImageAtPath:path toUser:user];
+                    sent++;
+                }
+            }
+        }
+        NSInteger n = sent;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            DDPShowSystemTip(n > 0 ? [NSString stringWithFormat:@"已发送 %ld 张", (long)n] : @"发送失败");
+        });
+    });
+}
+
+// 解析预览：视频→AVPlayer 播放；图文/滑块→下载存相册后查看
 + (void)handleParsePreview:(NSString *)url fromVC:(UIViewController *)vc {
     DDPShowSystemTip(@"抖音解析后台任务开始");
-    [[DDPEngine shared] parseDouyinURL:url completion:^(NSString *videoURL, NSError *err) {
+    [[DDPEngine shared] parseDouyinURL:url completion:^(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err) {
         @try {
-            if (err || !videoURL) {
+            if (err || type == DDPMediaTypeUnknown) {
                 dispatch_async(dispatch_get_main_queue(), ^{ DDPShowSystemTip(@"解析失败"); });
                 return;
             }
-            NSString *path = DDPTempPath(url);
-            if (DDPFileUsable(path)) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [DDPPanel playVideoAtPath:path fromVC:vc];
-                });
-                return;
-            }
-            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                NSData *data = [[DDPEngine shared] downloadVideoFromURL:videoURL headers:nil];
-                if (data.length) {
-                    NSFileManager *fm = [NSFileManager defaultManager];
-                    if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
-                    [data writeToFile:path atomically:YES];
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        [DDPPanel playVideoAtPath:path fromVC:vc];
-                    });
-                } else {
-                    dispatch_async(dispatch_get_main_queue(), ^{ DDPShowSystemTip(@"下载失败"); });
+            if (type == DDPMediaTypeVideo) {
+                NSString *path = DDPTempPath(url);
+                if (DDPFileUsable(path)) {
+                    dispatch_async(dispatch_get_main_queue(), ^{ [DDPPanel playVideoAtPath:path fromVC:vc]; });
+                    return;
                 }
-            });
+                dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                    NSData *data = [[DDPEngine shared] downloadVideoFromURL:videoURL headers:nil];
+                    if (data.length) {
+                        NSFileManager *fm = [NSFileManager defaultManager];
+                        if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
+                        [data writeToFile:path atomically:YES];
+                        dispatch_async(dispatch_get_main_queue(), ^{ [DDPPanel playVideoAtPath:path fromVC:vc]; });
+                    } else {
+                        dispatch_async(dispatch_get_main_queue(), ^{ DDPShowSystemTip(@"下载失败"); });
+                    }
+                });
+            } else {
+                // 图文/滑块：下载到本地后直接观看（多图横向滑动 + 捏合缩放）
+                [DDPPanel downloadImagesLocally:imageURLs completion:^(NSArray<NSString *> *paths) {
+                    if (!paths.count) { DDPShowSystemTip(@"下载失败"); return; }
+                    [DDPPanel presentImageViewer:paths fromVC:vc];
+                }];
+            }
         } @catch (NSException *e) {
             DDDLog(@"handleParsePreview 异常 %@", e);
             dispatch_async(dispatch_get_main_queue(), ^{ DDPShowSystemTip(@"解析失败"); });
@@ -1131,64 +1205,108 @@ static const char *kDDPActionSheetHandledKey;
     }];
 }
 
+// 视频预览：对齐 PKC pkcDyVideoJxYl —— 用微信自带 MMMoviePlayerController 播放本地 mp4 并 push 到导航栈
 + (void)playVideoAtPath:(NSString *)path fromVC:(UIViewController *)vc {
     if (!path.length || !vc) return;
+    Class cls = objc_getClass("MMMoviePlayerController");
+    if (cls && [cls instancesRespondToSelector:@selector(initWithMsgWrap:VideoPath:)]) {
+        id player = [[cls alloc] initWithMsgWrap:nil VideoPath:path];
+        UINavigationController *nav = vc.navigationController;
+        if (nav) { [nav pushViewController:player animated:YES]; return; }
+        [vc presentViewController:player animated:YES completion:nil];
+        return;
+    }
+    // 兜底：MMMoviePlayerController 不可用时退回系统播放器
     AVPlayerViewController *player = [[AVPlayerViewController alloc] init];
     player.player = [AVPlayer playerWithURL:[NSURL fileURLWithPath:path]];
     [vc presentViewController:player animated:YES completion:^{ [player.player play]; }];
 }
 
-// 解析链接（对齐 PKC dyjxlj:，type=1 以文本消息发送）
+// 下载图片直链到本地缓存（供"直接观看"，不存相册；复用 MD5 缓存）
++ (void)downloadImagesLocally:(NSArray<NSString *> *)urls completion:(void (^)(NSArray<NSString *> *paths))completion {
+    if (!urls.count) { dispatch_async(dispatch_get_main_queue(), ^{ if (completion) completion(@[]); }); return; }
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSMutableArray *out = [NSMutableArray array];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        for (NSString *imgURL in urls) {
+            NSString *ext = @"jpg";
+            if ([[imgURL pathExtension].lowercaseString isEqualToString:@"png"]) ext = @"png";
+            NSString *path = DDPTempPathExt(imgURL, ext);
+            if (![fm fileExistsAtPath:path]) {
+                NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL headers:nil];
+                if (data.length) {
+                    if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
+                    [data writeToFile:path atomically:YES];
+                }
+            }
+            if ([fm fileExistsAtPath:path]) [out addObject:path];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{ if (completion) completion(out); });
+    });
+}
+
+// 直接观看图片（多图横向分页 + 捏合缩放），系统 UIKit，无第三方依赖
++ (void)presentImageViewer:(NSArray<NSString *> *)paths fromVC:(UIViewController *)vc {
+    if (!paths.count || !vc) return;
+    DDPImageViewerController *ivc = [[DDPImageViewerController alloc] init];
+    ivc.imagePaths = paths;
+    [vc presentViewController:ivc animated:YES completion:nil];
+}
+
+// 解析链接（对齐 PKC dyjxlj:，type=1 以文本消息发送原始直链）
+// 视频→发 aweme 无水管直链；图文/滑块→发图片直链（每行一张）
 + (void)handleParseLink:(NSString *)url user:(NSString *)user {
     DDPShowSystemTip(@"抖音解析后台任务开始");
-    [[DDPEngine shared] parseDouyinURL:url completion:^(NSString *videoURL, NSError *err) {
-        @try {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (err || !videoURL) { DDPShowSystemTip(@"解析失败"); return; }
-                DDPCopyToPasteboard(videoURL);
+    [[DDPEngine shared] parseDouyinURL:url completion:^(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            @try {
+                if (err || type == DDPMediaTypeUnknown) { DDPShowSystemTip(@"解析失败"); return; }
+                NSString *link = (type == DDPMediaTypeVideo)
+                    ? videoURL
+                    : [imageURLs componentsJoinedByString:@"\n"];
+                if (!link.length) { DDPShowSystemTip(@"解析失败"); return; }
+                DDPCopyToPasteboard(link);
                 NSString *target = user.length ? user : DDPCurrentChatName();
                 if (target.length) {
-                    DDPSendTextMsg(videoURL, target);   // 链接以文本消息发出
+                    DDPSendTextMsg(link, target);   // 原始直链以文本消息发出
                     DDPShowSystemTip(@"已发送解析链接");
                 } else {
                     DDPShowSystemTip(@"已复制无水印链接");
                 }
-            });
-        } @catch (NSException *e) {
-            DDDLog(@"handleParseLink 异常 %@", e);
-            dispatch_async(dispatch_get_main_queue(), ^{ DDPShowSystemTip(@"解析失败"); });
-        }
+            } @catch (NSException *e) {
+                DDDLog(@"handleParseLink 异常 %@", e);
+                DDPShowSystemTip(@"解析失败");
+            }
+        });
     }];
 }
 
-// 保存相册（PHPhotoLibrary + PHAssetCreationRequest）
+// 保存相册：视频→存视频；图文/滑块→下载存图片
 + (void)handleSaveAlbum:(NSString *)url {
     DDPShowSystemTip(@"抖音解析后台任务开始");
-    [[DDPEngine shared] parseDouyinURL:url completion:^(NSString *videoURL, NSError *err) {
+    [[DDPEngine shared] parseDouyinURL:url completion:^(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err) {
         @try {
-            if (err || !videoURL) {
+            if (err || type == DDPMediaTypeUnknown) {
                 dispatch_async(dispatch_get_main_queue(), ^{ DDPShowSystemTip(@"解析失败"); });
                 return;
             }
-            NSString *path = DDPTempPath(url);
-            if (DDPFileUsable(path)) {
-                [DDPPanel saveVideoToAlbumAtPath:path];
-                return;
+            if (type == DDPMediaTypeVideo) {
+                NSString *path = DDPTempPath(url);
+                if (DDPFileUsable(path)) { [DDPPanel saveVideoToAlbumAtPath:path]; return; }
+                dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                    NSData *data = [[DDPEngine shared] downloadVideoFromURL:videoURL headers:nil];
+                    BOOL ok = NO;
+                    if (data.length) {
+                        NSFileManager *fm = [NSFileManager defaultManager];
+                        if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
+                        ok = [data writeToFile:path atomically:YES];
+                    }
+                    if (ok) [DDPPanel saveVideoToAlbumAtPath:path];
+                    else dispatch_async(dispatch_get_main_queue(), ^{ DDPShowSystemTip(@"保存失败"); });
+                });
+            } else {
+                [self downloadAndSaveImages:imageURLs shareURL:url];
             }
-            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                NSData *data = [[DDPEngine shared] downloadVideoFromURL:videoURL headers:nil];
-                BOOL ok = NO;
-                if (data.length) {
-                    NSFileManager *fm = [NSFileManager defaultManager];
-                    if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
-                    ok = [data writeToFile:path atomically:YES];
-                }
-                if (ok) {
-                    [DDPPanel saveVideoToAlbumAtPath:path];
-                } else {
-                    dispatch_async(dispatch_get_main_queue(), ^{ DDPShowSystemTip(@"保存失败"); });
-                }
-            });
         } @catch (NSException *e) {
             DDDLog(@"handleSaveAlbum 异常 %@", e);
             dispatch_async(dispatch_get_main_queue(), ^{ DDPShowSystemTip(@"保存失败"); });
@@ -1196,7 +1314,7 @@ static const char *kDDPActionSheetHandledKey;
     }];
 }
 
-// 保存到相册
+// 保存到相册（视频）
 + (void)saveVideoToAlbumAtPath:(NSString *)path {
     NSURL *fileURL = [NSURL fileURLWithPath:path];
     [PHPhotoLibrary requestAuthorization:^(PHAuthorizationStatus status) {
@@ -1211,6 +1329,24 @@ static const char *kDDPActionSheetHandledKey;
                 if (success) DDPShowSystemTip(@"已保存到相册");
                 else DDPShowSystemTip(@"保存失败");
             });
+        }];
+    }];
+}
+
+// 保存到相册（图片，图文/滑块）
++ (void)saveImageToAlbumAtPath:(NSString *)path {
+    if (!path.length) return;
+    NSURL *fileURL = [NSURL fileURLWithPath:path];
+    [PHPhotoLibrary requestAuthorization:^(PHAuthorizationStatus status) {
+        if (status != PHAuthorizationStatusAuthorized) {
+            dispatch_async(dispatch_get_main_queue(), ^{ DDPShowSystemTip(@"未授权相册权限"); });
+            return;
+        }
+        [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
+            [PHAssetCreationRequest creationRequestForAssetFromImageAtFileURL:fileURL];
+        } completionHandler:^(BOOL success, NSError *error) {
+            if (success) DDPShowSystemTip(@"已保存到相册");
+            else DDPShowSystemTip(@"保存失败");
         }];
     }];
 }
@@ -1489,6 +1625,121 @@ static __weak CMessageWrap *gDDPCurrentMsgWrap;
     } @catch (NSException *e) {
         DDDLog(@"清空日志异常 %@", e);
     }
+}
+
+@end
+
+#pragma mark - 图片查看器（直接观看，多图横向分页 + 捏合缩放）
+
+@interface DDPImageViewerController : UIViewController <UIScrollViewDelegate>
+@property (nonatomic, copy) NSArray<NSString *> *imagePaths;
+@property (nonatomic, strong) UIScrollView *pager;
+@property (nonatomic, strong) UIPageControl *pageCtl;
+@property (nonatomic, assign) NSInteger currentIndex;
+@end
+
+@implementation DDPImageViewerController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = [UIColor blackColor];
+    CGFloat w = self.view.bounds.size.width;
+    CGFloat h = self.view.bounds.size.height;
+    NSInteger n = self.imagePaths.count;
+    self.pager = [[UIScrollView alloc] initWithFrame:self.view.bounds];
+    self.pager.pagingEnabled = YES;
+    self.pager.showsHorizontalScrollIndicator = NO;
+    self.pager.showsVerticalScrollIndicator = NO;
+    self.pager.contentSize = CGSizeMake(w * n, h);
+    self.pager.delegate = self;
+    self.pager.backgroundColor = [UIColor blackColor];
+    [self.view addSubview:self.pager];
+
+    for (NSInteger i = 0; i < n; i++) {
+        CGRect f = CGRectMake(w * i, 0, w, h);
+        UIScrollView *zoom = [[UIScrollView alloc] initWithFrame:f];
+        zoom.minimumZoomScale = 1.0;
+        zoom.maximumZoomScale = 3.0;
+        zoom.showsHorizontalScrollIndicator = NO;
+        zoom.showsVerticalScrollIndicator = NO;
+        zoom.delegate = self;
+        UIImage *img = [UIImage imageWithContentsOfFile:self.imagePaths[i]];
+        UIImageView *iv = [[UIImageView alloc] initWithImage:img];
+        iv.contentMode = UIViewContentModeScaleAspectFit;
+        iv.userInteractionEnabled = YES;
+        CGSize sz = [self fitSize:img.size inSize:CGSizeMake(w, h)];
+        iv.frame = CGRectMake((w - sz.width) / 2, (h - sz.height) / 2, sz.width, sz.height);
+        [zoom addSubview:iv];
+        zoom.contentSize = CGSizeMake(w, h);
+        [self.pager addSubview:zoom];
+        // 单击关闭 / 双击放大（对齐 PKCShowImgVC handleDoubleTap:）
+        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(dismissSelf)];
+        tap.numberOfTapsRequired = 1;
+        UITapGestureRecognizer *dtap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(onDoubleTap:)];
+        dtap.numberOfTapsRequired = 2;
+        [tap requireGestureRecognizerToFail:dtap];
+        [zoom addGestureRecognizer:tap];
+        [zoom addGestureRecognizer:dtap];
+    }
+
+    // 关闭按钮（右上，对齐 PKCShowImgVC closeView）
+    UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
+    [close setTitle:@"关闭" forState:UIControlStateNormal];
+    [close setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    close.frame = CGRectMake(w - 64, 20, 56, 32);
+    [close addTarget:self action:@selector(dismissSelf) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:close];
+
+    // 保存到相册按钮（左上，对齐 PKCShowImgVC saveImageToCameraRoll:）
+    UIButton *save = [UIButton buttonWithType:UIButtonTypeSystem];
+    [save setTitle:@"保存" forState:UIControlStateNormal];
+    [save setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    save.frame = CGRectMake(20, 20, 56, 32);
+    [save addTarget:self action:@selector(onSaveCurrent) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:save];
+
+    if (n > 1) {
+        self.pageCtl = [[UIPageControl alloc] initWithFrame:CGRectMake(0, h - 30, w, 20)];
+        self.pageCtl.numberOfPages = n;
+        self.pageCtl.currentPage = 0;
+        [self.view addSubview:self.pageCtl];
+    }
+}
+
+- (CGSize)fitSize:(CGSize)src inSize:(CGSize)box {
+    if (src.width <= 0 || src.height <= 0) return box;
+    CGFloat r = MIN(box.width / src.width, box.height / src.height);
+    return CGSizeMake(src.width * r, src.height * r);
+}
+
+- (void)scrollViewDidEndDecelerating:(UIScrollView *)scrollView {
+    if (scrollView == self.pager && self.pageCtl) {
+        NSInteger p = (NSInteger)(self.pager.contentOffset.x / self.pager.bounds.size.width + 0.5);
+        self.pageCtl.currentPage = p;
+        self.currentIndex = p;
+    }
+}
+
+- (UIView *)viewForZoomingInScrollView:(UIScrollView *)scrollView {
+    if (scrollView == self.pager) return nil;
+    return scrollView.subviews.firstObject;
+}
+
+// 双击放大/还原（对齐 PKCShowImgVC handleDoubleTap:）
+- (void)onDoubleTap:(UITapGestureRecognizer *)gesture {
+    UIScrollView *zoom = (UIScrollView *)gesture.view;
+    CGFloat scale = (zoom.zoomScale > 1.0) ? 1.0 : 2.0;
+    [zoom setZoomScale:scale animated:YES];
+}
+
+// 保存当前图片到相册（对齐 PKCShowImgVC saveImageToCameraRoll:）
+- (void)onSaveCurrent {
+    if (self.currentIndex < 0 || self.currentIndex >= self.imagePaths.count) return;
+    [DDPPanel saveImageToAlbumAtPath:self.imagePaths[self.currentIndex]];
+}
+
+- (void)dismissSelf {
+    [self dismissViewControllerAnimated:YES completion:nil];
 }
 
 @end
