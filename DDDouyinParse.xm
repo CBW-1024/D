@@ -13,7 +13,13 @@
 #import <unistd.h>
 #import <string.h>
 
-@class DDPImageViewerController;   // 直接观看图片查看器
+// 直接观看图片查看器（完整接口提前声明，供 DDPPanel presentImageViewer: 编译期识别）
+@interface DDPImageViewerController : UIViewController <UIScrollViewDelegate>
+@property (nonatomic, copy) NSArray<NSString *> *imagePaths;
+@property (nonatomic, strong) UIScrollView *pager;
+@property (nonatomic, strong) UIPageControl *pageCtl;
+@property (nonatomic, assign) NSInteger currentIndex;
+@end
 
 // 微信自带视频播放器（PKC 预览用它播放本地 mp4，对齐 pkcDyVideoJxYl → MMMoviePlayerController）
 @interface MMMoviePlayerController : UIViewController
@@ -914,7 +920,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     });
 }
 
-// DDPPanel 接口声明（需前置声明，供 DDPPanelHandler 回调调用类方法）
+// DDPPanel 接口声明
 @interface DDPPanel : NSObject
 + (BOOL)showForContent:(NSString *)content user:(NSString *)user;
 + (void)handleDirectSend:(NSString *)content user:(NSString *)user;
@@ -949,7 +955,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         if (!sheet) { DDDLog(@"DDPanel: UIAlertController 初始化失败"); return NO; }
 
         // 取消：iPad 必须设置 popover 锚点，否则崩溃
-        if (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad) {
+        if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) {
             sheet.popoverPresentationController.sourceView = top.view;
             sheet.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(top.view.bounds), CGRectGetMaxY(top.view.bounds), 1, 1);
             sheet.popoverPresentationController.permittedArrowDirections = 0;
@@ -1084,7 +1090,13 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
             Class capCls = objc_getClass("CaptureVideoInfo");
             if (capCls && [capCls respondsToSelector:@selector(genVideoInfoWithVideoUrl:thumb:)]) {
                 @try {
-                    videoInfo = [capCls genVideoInfoWithVideoUrl:[NSURL fileURLWithPath:path] thumb:nil];
+                    // 动态调用（objc_getClass 返回裸 Class，编译器不认该 selector，走 performSelector）
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                    videoInfo = [capCls performSelector:@selector(genVideoInfoWithVideoUrl:thumb:)
+                                             withObject:[NSURL fileURLWithPath:path]
+                                             withObject:nil];
+#pragma clang diagnostic pop
                 } @catch (NSException *e) { videoInfo = nil; }
             }
             DDPShowSystemTip(@"解析成功，正在发送");
@@ -1630,13 +1642,6 @@ static __weak CMessageWrap *gDDPCurrentMsgWrap;
 @end
 
 #pragma mark - 图片查看器（直接观看，多图横向分页 + 捏合缩放）
-
-@interface DDPImageViewerController : UIViewController <UIScrollViewDelegate>
-@property (nonatomic, copy) NSArray<NSString *> *imagePaths;
-@property (nonatomic, strong) UIScrollView *pager;
-@property (nonatomic, strong) UIPageControl *pageCtl;
-@property (nonatomic, assign) NSInteger currentIndex;
-@end
 
 @implementation DDPImageViewerController
 
