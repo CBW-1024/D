@@ -931,6 +931,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 + (void)handleParseLink:(NSString *)url user:(NSString *)user;
 + (void)handleSaveAlbum:(NSString *)url;
 + (void)sendVideoAtPath:(NSString *)path toUser:(NSString *)user;
++ (NSString *)generateThumbnailForVideoPath:(NSString *)path;
 + (void)sendImageAtPath:(NSString *)path toUser:(NSString *)user;
 + (void)sendImagesForURLs:(NSArray<NSString *> *)urls shareURL:(NSString *)shareURL user:(NSString *)user force:(BOOL)force;
 + (void)playVideoAtPath:(NSString *)path fromVC:(UIViewController *)vc;
@@ -1131,7 +1132,10 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
             long long bitrate = 0;
             Class pkcCls = objc_getClass("GXYeazddpmkzikglugu");   // 混淆类，暴露 getVideoBitrateFromFilePath:
             if (pkcCls && [pkcCls respondsToSelector:@selector(getVideoBitrateFromFilePath:)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
                 id bd = [pkcCls performSelector:@selector(getVideoBitrateFromFilePath:) withObject:path];
+#pragma clang diagnostic pop
                 if ([bd respondsToSelector:@selector(objectForKeyedSubscript:)]) {
                     id v = [bd objectForKeyedSubscript:@"videoBitrate"];
                     if ([v respondsToSelector:@selector(longLongValue)]) bitrate = [v longLongValue];
@@ -1148,8 +1152,15 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
                 // 高码率分支：OpenApiMgrHelper.genCaptureVideoInfoWithVideoData:mediaMessage:nil param:nil
                 Class ohCls = objc_getClass("OpenApiMgrHelper");
                 if (ohCls && [ohCls respondsToSelector:@selector(genCaptureVideoInfoWithVideoData:mediaMessage:param:)]) {
+                    // 动态调用（objc_getClass 返回裸 Class，编译器不认该 selector，走 performSelector）
                     NSData *videoData = [NSData dataWithContentsOfFile:path];
-                    videoInfo = [ohCls genCaptureVideoInfoWithVideoData:videoData mediaMessage:nil param:nil];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                    videoInfo = [ohCls performSelector:@selector(genCaptureVideoInfoWithVideoData:mediaMessage:param:)
+                                            withObject:videoData
+                                            withObject:nil
+                                            withObject:nil];
+#pragma clang diagnostic pop
                 }
             } else {
                 // 低码率分支：CaptureVideoInfo.genVideoInfoWithVideoUrl:thumb: + setThumb_path:
