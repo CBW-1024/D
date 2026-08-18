@@ -967,6 +967,9 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 + (void)saveVideoToAlbumAtPath:(NSString *)path;
 + (void)saveImageToAlbumAtPath:(NSString *)path;
 + (void)downloadAndSaveImages:(NSArray<NSString *> *)urls shareURL:(NSString *)shareURL;
++ (void)sendVideoForURL:(NSString *)videoURL shareURL:(NSString *)shareURL user:(NSString *)user force:(BOOL)force;
++ (void)downloadImagesLocally:(NSArray<NSString *> *)urls completion:(void (^)(NSArray<NSString *> *paths))completion;
++ (void)presentImageViewer:(NSArray<NSString *> *)paths fromVC:(UIViewController *)vc;
 @end
 
 @implementation DDPPanel
@@ -1037,55 +1040,6 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         return NO;
     }
 }
-
-@end   // 先闭合 DDPPanel，再插入独立的 DDPPanelTarget 实现，避免嵌套 @implementation
-
-// DDPPanelTarget 实现：单参 sel 分发给 DDPPanel 多参类方法
-@implementation DDPPanelTarget
-
-+ (instancetype)shared {
-    static DDPPanelTarget *instance;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ instance = [[self alloc] init]; });
-    return instance;
-}
-
-// 直接发送（对齐 PKC dyzzfs:）
-- (void)onDirectSend:(id)sender {
-    [DDPPanel handleDirectSend:self.content user:self.user];
-}
-
-// 解析发送（对齐 PKC dyjxfs:）
-- (void)onParseSend:(id)sender {
-    NSString *url = DDPExtractURL(self.content);
-    if (url.length) [DDPPanel handleParseSend:url user:self.user force:NO];
-}
-
-// 解析预览（对齐 PKC dyjxyl:）
-- (void)onParsePreview:(id)sender {
-    NSString *url = DDPExtractURL(self.content);
-    if (url.length) [DDPPanel handleParsePreview:url fromVC:self.topVC];
-}
-
-// 解析链接（对齐 PKC dyjxlj:）
-- (void)onParseLink:(id)sender {
-    NSString *url = DDPExtractURL(self.content);
-    if (url.length) [DDPPanel handleParseLink:url user:self.user];
-}
-
-// 保存相册（对齐 PKC dyjxSave:）
-- (void)onSaveAlbum:(id)sender {
-    NSString *url = DDPExtractURL(self.content);
-    if (url.length) [DDPPanel handleSaveAlbum:url];
-}
-
-// 取消（对齐 PKC getTipsCancel:；MMTipsViewController 取消按钮点击后自会关闭，无需额外动作）
-- (void)onCancel:(id)sender {
-}
-
-@end
-
-@implementation DDPPanel   // 重新打开 DDPPanel，继续剩余方法
 
 // 直接发送（对齐 PKC dyzzfs:）
 + (void)handleDirectSend:(NSString *)content user:(NSString *)user {
@@ -1546,6 +1500,51 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 
 @end
 
+// DDPPanelTarget 实现：单参 sel 分发给 DDPPanel 多参类方法
+@implementation DDPPanelTarget
+
++ (instancetype)shared {
+    static DDPPanelTarget *instance;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ instance = [[self alloc] init]; });
+    return instance;
+}
+
+// 直接发送（对齐 PKC dyzzfs:）
+- (void)onDirectSend:(id)sender {
+    [DDPPanel handleDirectSend:self.content user:self.user];
+}
+
+// 解析发送（对齐 PKC dyjxfs:）
+- (void)onParseSend:(id)sender {
+    NSString *url = DDPExtractURL(self.content);
+    if (url.length) [DDPPanel handleParseSend:url user:self.user force:NO];
+}
+
+// 解析预览（对齐 PKC dyjxyl:）
+- (void)onParsePreview:(id)sender {
+    NSString *url = DDPExtractURL(self.content);
+    if (url.length) [DDPPanel handleParsePreview:url fromVC:self.topVC];
+}
+
+// 解析链接（对齐 PKC dyjxlj:）
+- (void)onParseLink:(id)sender {
+    NSString *url = DDPExtractURL(self.content);
+    if (url.length) [DDPPanel handleParseLink:url user:self.user];
+}
+
+// 保存相册（对齐 PKC dyjxSave:）
+- (void)onSaveAlbum:(id)sender {
+    NSString *url = DDPExtractURL(self.content);
+    if (url.length) [DDPPanel handleSaveAlbum:url];
+}
+
+// 取消（对齐 PKC getTipsCancel:；MMTipsViewController 取消按钮点击后自会关闭，无需额外动作）
+- (void)onCancel:(id)sender {
+}
+
+@end
+
 #pragma mark - Hook：长按菜单（canShowForwardMenuItem 存消息 + setMenuItems 加项）
 
 // 当前长按消息（供菜单回调）
@@ -1615,8 +1614,8 @@ static __weak CMessageWrap *gDDPCurrentMsgWrap;
 
 - (BOOL)canShowForwardMenuItem {
     BOOL ret = %orig;
-    // 经 viewModel.messageWrap 取消息
-    id viewModel = [self valueForKey:@"viewModel"];
+    // 经 viewModel.messageWrap 取消息（BaseMessageCellView 仅前向声明，强转 id 以调用 KVC）
+    id viewModel = [(id)self valueForKey:@"viewModel"];
     CMessageWrap *wrap = viewModel ? [viewModel valueForKey:@"messageWrap"] : nil;
     gDDPCurrentMsgWrap = wrap;
     DDDLog(@"canShowForwardMenuItem: viewModel=%@ messageWrap=%@ content=%@",
