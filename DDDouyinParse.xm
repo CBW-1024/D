@@ -130,7 +130,8 @@ static inline void DDDClearLog(void) {
 @end
 
 @interface CMessageMgr : NSObject
-- (id)AddVideoMsg:(NSString *)path ToUsr:(NSString *)usr VideoInfo:(id)info;
+// 注意：AddVideoMsg 第一个参数是【发送方】本机 wxid，第二个参数是【接收方】。
+- (id)AddVideoMsg:(NSString *)fromUsr ToUsr:(NSString *)toUsr VideoInfo:(id)info;
 - (void)AddMsg:(NSString *)usr MsgWrap:(CMessageWrap *)wrap;
 @end
 
@@ -173,9 +174,10 @@ static inline void DDDClearLog(void) {
 @end
 
 // 微信原生提示面板（PKC 抖音面板的真实控件，复刻 pkc tipsTitle:Msg:Type:Hidden:CancelTitle:Data: Type==8 分支）
-// 反汇编锚点：DTXcjsghusskmsktjxjkusyvmqnqkzs(混淆类) alertControllerWithTitle:message:preferredStyle:
-//   → addTextViewWithMaxLen:0xbb8 → setTextFieldDefaultText: → setTipsTextPlaceholder:
-//   → addButtonWithTitle:target:sel: ×6(dyzzfs:..dyjxSave:) → addButtonWithCancelTitle:target:sel: → show
+// PKC 抖音面板 = UIAlertController 子类 DTXcjsghusskmsktjxjkusyvmqnqkzs（alertControllerWithTitle:message:preferredStyle:）。
+// Type==8 抖音分支（-[GXYeazddpmkzikglugu tipsTitle:Msg:Type:Hidden:CancelTitle:Data:] 89498→0x89e30）：
+//   message 纯展示内容 + addButtonWithTitle:target:sel: ×6(dyzzfs:..dyjxSave:) + 取消 + show，无任何输入框。
+// 本插件沿用微信原生 MMTipsViewController 面板（用户确认外观一致），content 经 initWithTitle:content:buttons: 展示。
 @interface MMTipsViewController : UIViewController
 - (instancetype)initWithTitle:(NSString *)title content:(NSString *)content buttons:(NSArray *)buttons;  // MMTipsViewController.h:150
 - (void)addTextViewWithMaxLen:(unsigned int)maxLen;                                                       // MMTipsViewController.h:129
@@ -1004,15 +1006,13 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         MMTipsViewController *sheet = [[(id)tipsCls alloc] initWithTitle:@"抖音解析" content:content buttons:@[]];
         if (!sheet) { DDDLog(@"DDPanel: MMTipsViewController 初始化失败"); return NO; }
 
-        // 对齐 PKC：addTextViewWithMaxLen:0xbb8(3000) 内容输入框 + 默认文本(msg) + 占位符。
-        // 反汇编锚点：Type==8 分支 setTextFieldDefaultText: 与 setTipsTextPlaceholder: 都传 Data["msg"]（消息原文）
-        [sheet addTextViewWithMaxLen:3000];
-        @try {
-            [sheet setValue:content forKey:@"textFieldDefaultText"];   // KVC 写私有 property
-            [sheet setValue:content forKey:@"tipsTextPlaceholder"];    // 对齐 PKC：placeholder 也用消息原文
-        } @catch (NSException *e) {
-            DDDLog(@"DDPanel: textFieldDefaultText/placeholder 设置失败 %@", e);
-        }
+        // 对齐 PKC：Type==8（抖音）分支【不调用 addTextViewWithMaxLen:】，内容经 message 纯展示 + 按钮，无输入框。
+        // 反汇编锚点：-[GXYeazddpmkzikglugu tipsTitle:Msg:Type:Hidden:CancelTitle:Data:] 8949c cmp w26,#0x8
+        //   → b.eq 0x89e30（Type==8 抖音分支：直接 addButtonWithTitle: dyzzfs:/dyjxfs:/dyjxyl:/dyjxlj:/dyjxzq:/dyjxSave: → show）
+        //   addTextViewWithMaxLen:0xbb8(89d54) 属于 Type==7 分支（msgAI/朋友圈），并非抖音面板。
+        // 故 content 由 initWithTitle:content:buttons: 的 content 参数展示（m_tipsContentLabel），不额外加输入框。
+        // （曾误加 addTextViewWithMaxLen:3000 + KVC textFieldDefaultText/tipsTextPlaceholder，
+        //   导致面板上多出一个可编辑 UITextView 输入框，已按 PKC 移除。）
 
         // 5 个操作按钮（对齐 PKC dyzzfs:/dyjxfs:/dyjxyl:/dyjxlj:/dyjxSave:；去掉解析转圈 dyjxzq:）
         [sheet addButtonWithTitle:@"直接发送" target:target sel:@selector(onDirectSend:)];
@@ -1152,9 +1152,11 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 
 // 发视频消息（CMessageMgr AddVideoMsg:ToUsr:VideoInfo:）
 // 完整对齐 PKC sendVideo:videoPath:（main_parser.asm:129031）：
-//   取码率(getVideoBitrateFromFilePath:)→生成缩略图(generateThumbnailForVideo:)→
-//   码率≥300kbps(0x4b400)走 OpenApiMgrHelper.genCaptureVideoInfoWithVideoData:，
-//   <300kbps 走 CaptureVideoInfo.genVideoInfoWithVideoUrl:thumb: → setThumb_path:
+//   主线程执行 → fileExistsAtPath: 检查 → 取码率(getVideoBitrateFromFilePath:)→
+//   生成缩略图(generateThumbnailForVideo:)→ 码率≥5Mbps(0x4c4b40)走 OpenApiMgrHelper.genCaptureVideoInfoWithVideoData:，
+//   <5Mbps 走 CaptureVideoInfo.genVideoInfoWithVideoUrl:thumb: → setThumb_path: →
+//   AddVideoMsg:[SettingUtil getLocalUsrName:0] ToUsr:target VideoInfo:info
+// 注意：AddVideoMsg: 第一个参数是【发送方】（本机 wxid），不是视频路径。
 + (void)sendVideoAtPath:(NSString *)path toUser:(NSString *)user {
     if (!path.length) return;
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1186,14 +1188,15 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
                     if ([v respondsToSelector:@selector(longLongValue)]) bitrate = [v longLongValue];
                 }
             }
-            // 码率拿不到时按体积/时长粗略估计：>2MB 视为高码率（兜底）
+            // 码率拿不到时按体积兜底：PKC 在码率为 0 时直接报错，但这里保留兜底避免私有方法失效导致完全不能发。
+            // 对齐 PKC 阈值 0x4c4b40 = 5,000,000 bps（5 Mbps）。
             if (bitrate == 0) {
                 NSNumber *sz = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil][NSFileSize];
-                if (sz.longLongValue > 2 * 1024 * 1024) bitrate = 400000;   // >2MB 视为 ≥300kbps
+                if (sz.longLongValue > 5 * 1024 * 1024) bitrate = 5000000;   // >5MB 视为 ≥5Mbps
             }
 
-            // 3) 分支构造 VideoInfo（对齐 PKC：0x4b400 = 307200）
-            if (bitrate >= 307200) {
+            // 3) 分支构造 VideoInfo（对齐 PKC：0x4c4b40 = 5,000,000 bps）
+            if (bitrate >= 5000000) {
                 // 高码率分支：OpenApiMgrHelper.genCaptureVideoInfoWithVideoData:mediaMessage:nil param:nil
                 Class ohCls = objc_getClass("OpenApiMgrHelper");
                 if (ohCls && [ohCls respondsToSelector:@selector(genCaptureVideoInfoWithVideoData:mediaMessage:param:)]) {
@@ -1233,7 +1236,22 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
             videoInfo = nil;
         }
         DDPShowSystemTip(@"解析成功，正在发送");
-        [msgMgr AddVideoMsg:path ToUsr:chatName VideoInfo:videoInfo];
+        // 对齐 PKC sendVideo:videoPath:（main_parser.asm:80b74-80b84）：
+        // AddVideoMsg: 第一个参数是发送方（本机 wxid，[SettingUtil getLocalUsrName:0]）
+        // ToUsr: 第二个参数是接收方（chatName）
+        // VideoInfo: 第三个参数
+        // 旧版误把视频路径 path 当发送方传入，导致消息无法播放。
+        NSString *fromUsr = nil;
+        Class setCls = objc_getClass("SettingUtil");
+        if (setCls && [setCls respondsToSelector:@selector(getLocalUsrName:)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            fromUsr = [setCls getLocalUsrName:0];
+#pragma clang diagnostic pop
+        }
+        if (!fromUsr.length) { DDPShowSystemTip(@"发送失败"); return; }
+        if (!videoInfo) { DDPShowSystemTip(@"视频信息构造失败"); return; }
+        [msgMgr AddVideoMsg:fromUsr ToUsr:chatName VideoInfo:videoInfo];
     });
 }
 
