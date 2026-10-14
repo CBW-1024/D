@@ -123,13 +123,10 @@
 @interface MMMenuController : NSObject  // 长按菜单控制器（hook setMenuItems: 追加项）
 + (instancetype)sharedMenuController;
 - (void)setMenuItems:(id)menuItems;
-@property (readonly, nonatomic) NSArray *currentMenuItems;
 @end
 
 @interface MMMenuItem : NSObject  // 长按菜单项（NSObject 子类，无 title getter，靠 userInfo 标记）
-- (instancetype)initWithTitle:(NSString *)title icon:(UIImage *)icon target:(id)target action:(SEL)action;
 - (instancetype)initWithTitle:(NSString *)title svgName:(NSString *)svgName target:(id)target action:(SEL)action;
-@property (retain, nonatomic) UIImage *iconImage;
 @property (nonatomic, weak) id target;
 @property (nonatomic, retain) id userInfo;
 // 菜单项 ID：initWithTitle: 创建默认 0，须设唯一值，否则与其他插件注入项撞车被微信去重
@@ -1312,12 +1309,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         UINavigationController *nav = vc.navigationController;
         if (nav) { [nav pushViewController:player animated:YES]; return; }
         [vc presentViewController:player animated:YES completion:nil];
-        return;
     }
-    // 兜底：MMMoviePlayerController 不可用时退回系统播放器
-    AVPlayerViewController *player = [[AVPlayerViewController alloc] init];
-    player.player = [AVPlayer playerWithURL:[NSURL fileURLWithPath:path]];
-    [vc presentViewController:player animated:YES completion:^{ [player.player play]; }];
 }
 
 // 下载图片直链到本地缓存（供"直接观看"，不存相册；复用 MD5 缓存）
