@@ -168,12 +168,18 @@ static inline void DDDClearLog(void) {
 @property (readonly, nonatomic) NSArray *currentMenuItems;
 @end
 
-@interface MMMenuItem : NSObject  // 菜单项
+@interface MMMenuItem : NSObject  // 长按菜单项（NSObject 子类，无 title getter，靠 userInfo 标记）
 - (instancetype)initWithTitle:(NSString *)title icon:(UIImage *)icon target:(id)target action:(SEL)action;
 - (instancetype)initWithTitle:(NSString *)title svgName:(NSString *)svgName target:(id)target action:(SEL)action;
 @property (retain, nonatomic) UIImage *iconImage;
 @property (nonatomic, weak) id target;
+@property (nonatomic, retain) id userInfo;
+// 菜单项 ID：initWithTitle: 创建默认 0，须设唯一值，否则与其他插件注入项撞车被微信去重
+- (void)setMenuType:(long long)type;
 @end
+
+// 注入菜单项工具：userInfo 去重 + menuType 唯一 ID 防撞（参考 DD语音包做法）
+static NSArray *ddp_inject_item(NSArray *original, NSString *title, NSString *svgName, SEL action, long long menuType);
 
 // 微信原生提示面板（用于展示解析结果卡片）
 @interface MMTipsViewController : UIViewController
@@ -1628,44 +1634,37 @@ static __weak CMessageWrap *gDDPCurrentMsgWrap;
 %hook MMMenuController
 
 - (void)setMenuItems:(id)menuItems {
-    // 转可变数组追加
-    NSMutableArray *items;
-    if ([menuItems isKindOfClass:[NSMutableArray class]]) {
-        items = menuItems;
-    } else {
-        items = menuItems ? [NSMutableArray arrayWithArray:menuItems] : [NSMutableArray array];
-    }
-
-    DDDLog(@"setMenuItems: 触发 原类型=%@ 元素数=%lu", NSStringFromClass([menuItems class]), (unsigned long)[items count]);
-
-    // 开关关闭：原样下发
-    if (!DDPConfig.shared.enabled) { DDDLog(@"setMenuItems: 开关关闭，跳过"); %orig(items); return; }
-
-    // 检查当前长按消息是否含抖音链接
+    if (!DDPConfig.shared.enabled) { %orig; return; }
     NSString *content = [DDPMenuHandler currentContent];
-    if (!content.length) { DDDLog(@"setMenuItems: content 为空（消息未保存？）"); %orig(items); return; }
-    if (!DDPContainsDouyinLink(content)) { DDDLog(@"setMenuItems: content 不含抖音链接"); %orig(items); return; }
+    if (!content.length || !DDPContainsDouyinLink(content)) { %orig; return; }
 
-    Class itemCls = objc_getClass("MMMenuItem");
-    DDDLog(@"setMenuItems: MMMenuItem 类=%@", itemCls?@"存在":@"不存在");
-    if (!itemCls) { %orig(items); return; }
-
-    // 用微信内部 SVG 图标，避免 SF Symbol 色调不一致
-    id target = [DDPMenuHandler shared];
-
-    id parseItem = [itemCls alloc];
-    parseItem = [parseItem initWithTitle:@"解析" svgName:@"icons_filled_heart" target:target action:@selector(onDouyinParse:)];
-    if (parseItem) [items addObject:parseItem];
-
-    id previewItem = [itemCls alloc];
-    previewItem = [previewItem initWithTitle:@"预览" svgName:@"icons_filled_heart" target:target action:@selector(onDouyinPreview:)];
-    if (previewItem) [items addObject:previewItem];
-
-    DDDLog(@"setMenuItems: 已追加解析/预览，当前元素数=%lu", (unsigned long)[items count]);
-    %orig(items);   // 一次性下发（含新按钮），兼容 setter copy 语义
+    // 已注入则跳过，并通过 menuType 唯一 ID 防与其它插件注入项撞车被去重
+    NSArray *items = ddp_inject_item(menuItems, @"解析", @"icons_filled_heart", @selector(onDouyinParse:), 1010);
+    items = ddp_inject_item(items, @"预览", @"icons_filled_play", @selector(onDouyinPreview:), 1011);
+    %orig(items);
 }
 
 %end
+
+// 注入菜单项：先按 userInfo token 去重（避免菜单重建时重复追加），再设唯一 menuType（防与其它插件注入项撞车被微信去重）
+static NSArray *ddp_inject_item(NSArray *original, NSString *title, NSString *svgName, SEL action, long long menuType) {
+    NSString *token = [@"ddp:" stringByAppendingString:NSStringFromSelector(action)];
+    for (MMMenuItem *it in original) {
+        id ui = [it userInfo];
+        if ([ui isKindOfClass:[NSString class]] && [(NSString *)ui isEqualToString:token]) return original;
+    }
+    Class cls = objc_getClass("MMMenuItem");
+    MMMenuItem *item = [[cls alloc] initWithTitle:title
+                                          svgName:svgName
+                                           target:[DDPMenuHandler shared]
+                                           action:action];
+    if (!item) return original;
+    [item setUserInfo:token];
+    [item setMenuType:menuType];
+    NSMutableArray *items = [NSMutableArray arrayWithArray:original];
+    [items addObject:item];
+    return items;
+}
 
 #pragma mark - Hook：CMessageMgr AddMsg（弹面板的真正入口）
 
@@ -1947,16 +1946,13 @@ static __weak CMessageWrap *gDDPCurrentMsgWrap;
 
 @end
 
-#pragma mark - 注册
+#pragma mark - 注册入口
 
 %ctor {
-    @autoreleasepool {
-        DDDLog(@"%%ctor: DDDouyinParse 已加载");
-        Class mgr = objc_getClass("WCPluginsMgr");
-        if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
-            [[mgr sharedInstance] registerControllerWithTitle:@"DD抖音解析"
-                                                      version:@"1.0.0"
-                                                   controller:@"DDPDouyinParseSettingsViewController"];
-        }
+    Class mgrCls = objc_getClass("WCPluginsMgr");
+    if (mgrCls) {
+        [[mgrCls sharedInstance] registerControllerWithTitle:@"DD抖音解析"
+                                                     version:@"1.0.0"
+                                                  controller:@"DDPDouyinParseSettingsViewController"];
     }
 }
