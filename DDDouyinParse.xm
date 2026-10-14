@@ -139,10 +139,6 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
 @end
 
 // 视频信息构造（8.0.79 私有类，头文件已确认）
-@interface OpenApiMgrHelper : NSObject
-+ (id)genCaptureVideoInfoWithVideoData:(id)videoData mediaMessage:(id)mediaMessage param:(id)param;
-@end
-
 @interface CaptureVideoInfo : NSObject
 + (id)genVideoInfoWithVideoUrl:(id)url thumb:(id)thumb;
 - (void)setThumb_path:(id)path;
@@ -920,7 +916,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 }
 
 // 发视频消息（CMessageMgr AddVideoMsg:ToUsr:VideoInfo:）
-// 流程：主线程 → 取码率 → 生成缩略图 → 按码率分支构造 VideoInfo（≥5Mbps 走 OpenApiMgrHelper，否则 CaptureVideoInfo）→ 发送。
+// 流程：主线程 → 生成缩略图 → CaptureVideoInfo 构造 VideoInfo（只传文件路径，不读进内存）→ 发送。
 // 注意：AddVideoMsg: 第一个参数是【发送方】本机 wxid，不是视频路径（旧版误把路径当发送方导致无法播放）。
 + (void)sendVideoAtPath:(NSString *)path toUser:(NSString *)user {
     if (!path.length) return;
@@ -929,23 +925,10 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         if (!chatName.length) return;
 
         NSString *thumbPath = [self generateThumbnailForVideoPath:path];
-        // 码率按体积估算：>5MB 视为高码率（阈值 5 Mbps）
-        NSNumber *sz = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil][NSFileSize];
-        BOOL high = sz.longLongValue > 5 * 1024 * 1024;
-
-        id videoInfo;
-        if (high) {
-            // 高码率：OpenApiMgrHelper.genCaptureVideoInfoWithVideoData:mediaMessage:param:
-            NSData *videoData = [NSData dataWithContentsOfFile:path];
-            videoInfo = videoData ? [%c(OpenApiMgrHelper) genCaptureVideoInfoWithVideoData:videoData mediaMessage:nil param:nil] : nil;
-        } else {
-            // 低码率：CaptureVideoInfo.genVideoInfoWithVideoUrl:thumb: + setThumb_path:
-            videoInfo = [%c(CaptureVideoInfo) genVideoInfoWithVideoUrl:[NSURL fileURLWithPath:path] thumb:thumbPath];
-            if (thumbPath) [videoInfo setThumb_path:thumbPath];
-        }
+        id videoInfo = [%c(CaptureVideoInfo) genVideoInfoWithVideoUrl:[NSURL fileURLWithPath:path] thumb:thumbPath];
+        if (thumbPath) [videoInfo setThumb_path:thumbPath];
         if (!videoInfo) return;
 
-        // AddVideoMsg: 首参为发送方（本机 wxid），次参为接收方，三参为 VideoInfo。
         CMessageMgr *msgMgr = DDPMessageMgr();
         [msgMgr AddVideoMsg:[%c(SettingUtil) getLocalUsrName:0] ToUsr:chatName VideoInfo:videoInfo];
     });
