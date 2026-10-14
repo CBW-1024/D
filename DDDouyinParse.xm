@@ -77,8 +77,10 @@
 @end
 
 @interface BaseMsgContentLogicController : NSObject
+- (instancetype)init;
 - (void)SendTextMessage:(NSString *)text;
 - (NSString *)getCurrentChatName;
+- (CMessageWrap *)FormImageMsg:(NSString *)arg1 withImage:(UIImage *)arg2 withData:(NSData *)arg3;
 @end
 
 @interface MMServiceCenter : NSObject
@@ -106,11 +108,6 @@
 // CMessageWrap 扩展：通过 BaseMsgContentLogicController 生成图片消息
 @interface CMessageWrap (DDP)
 - (id<DDPMsgExtendOperation>)m_extendInfoWithMsgType;
-@end
-
-@interface BaseMsgContentLogicController : NSObject
-- (instancetype)init;
-- (CMessageWrap *)FormImageMsg:(NSString *)arg1 withImage:(UIImage *)arg2 withData:(NSData *)arg3;
 @end
 
 @interface CContactMgr : NSObject
@@ -1063,7 +1060,6 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 + (void)downloadAndSaveImages:(NSArray<NSString *> *)urls shareURL:(NSString *)shareURL finish:(void(^)(void))finish {
     if (!urls.count) { if (finish) finish(); return; }
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSInteger saved = 0;
         for (NSString *imgURL in urls) {
             NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL headers:nil];
             if (!data.length) continue;
@@ -1074,7 +1070,6 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
             if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
             if ([data writeToFile:path atomically:YES]) {
                 [DDPPanel saveImageToAlbumAtPath:path];
-                saved++;
             }
         }
         if (finish) finish();
@@ -1233,7 +1228,6 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 + (void)sendImagesForURLs:(NSArray<NSString *> *)urls shareURL:(NSString *)shareURL user:(NSString *)user force:(BOOL)force finish:(void(^)(void))finish {
     if (!urls.count) { if (finish) finish(); return; }
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSInteger sent = 0;
         for (NSString *imgURL in urls) {
             @autoreleasepool {
                 NSString *ext = @"jpg";
@@ -1241,7 +1235,6 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
                 NSString *path = DDPTempPathExt(imgURL, ext);
                 if (!force && DDPFileUsable(path)) {
                     [DDPPanel sendImageAtPath:path toUser:user];
-                    sent++;
                     continue;
                 }
                 NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL headers:nil];
@@ -1250,7 +1243,6 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
                 if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
                 if ([data writeToFile:path atomically:YES]) {
                     [DDPPanel sendImageAtPath:path toUser:user];
-                    sent++;
                 }
             }
         }
