@@ -480,7 +480,7 @@ static void DDPShowError(NSString *text) {
 
 // completion: (html, errCode)，DDPCodeGallery 表示图集
 static const NSInteger DDPCodeGallery = 0x4161;   // 16737
-static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次
+static const NSInteger DDPMaxRetries = 3;          // 最多重试 3 次（配合"HTML 未变化即停"，实测 1~2 轮足够）
 
 @interface DDPWebFetcher : NSObject <WKNavigationDelegate>
 @property (nonatomic, readonly) WKWebView *webView;
@@ -577,11 +577,10 @@ static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次
 
 // 加载完延迟取 outerHTML（等 JS 渲染）
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
-    DDDLog(@"[DDPWebFetcher] didFinishNavigation retries=%u 等待%ds取HTML 距开始%.1fs", self.retries, (int)(self.retries + 5), CFAbsoluteTimeGetCurrent() - self.fetchStart);
+    DDDLog(@"[DDPWebFetcher] didFinishNavigation retries=%u 距开始%.1fs", self.retries, CFAbsoluteTimeGetCurrent() - self.fetchStart);
     __weak typeof(self) wself = self;
-    // 延迟 (retries+5)s 等 JS 渲染
-    dispatch_time_t delay = dispatch_time(DISPATCH_TIME_NOW,
-                                          (int64_t)((self.retries * 1.0 + 5.0) * NSEC_PER_SEC));
+    // 固定延迟 5s 等 JS 渲染
+    dispatch_time_t delay = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC));
     dispatch_after(delay, dispatch_get_main_queue(), ^{
         [webView evaluateJavaScript:@"document.documentElement.outerHTML" completionHandler:^(id result, NSError *error) {
             if (error) { DDDLog(@"DDPWebFetcher: evalJS 失败 %@", error); [wself ddFinishWithHTML:nil code:-2]; return; }
@@ -630,36 +629,33 @@ static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次
     full = NSMakeRange(0, clean.length);
     [clean replaceOccurrencesOfString:@"\u001D" withString:@"" options:NSLiteralSearch range:full];       // 控制字符 0x1D
 
-        DDDLog(@"[DDPWebFetcher] 第%u轮 cleanLen=%lu playwm=%d gallery=%d video_id=%d 距开始%.1fs",
-               self.retries, (unsigned long)clean.length,
-               [clean containsString:@"playwm"],
-               [clean containsString:@"aweme-share-swiper-item"] || [clean containsString:@"aweme-slides-swiper-item"],
-               [clean containsString:@"video_id="],
-               CFAbsoluteTimeGetCurrent() - self.fetchStart);
-        if (self.lastCleanLen == clean.length && ![clean containsString:@"playwm"] &&
-            !([clean containsString:@"aweme-share-swiper-item"] || [clean containsString:@"aweme-slides-swiper-item"])) {
-            DDDLog(@"[DDPWebFetcher] ⚠️ 第%u轮与上一轮HTML长度相同(%lu)且无playwm，疑似冗余空转", self.retries, (unsigned long)clean.length);
-        }
-        self.lastCleanLen = clean.length;
-
     // 图集特征检测
-    NSInteger code = 0;
-    if ([clean containsString:@"aweme-share-swiper-item"] || [clean containsString:@"aweme-slides-swiper-item"]) {
-        code = DDPCodeGallery;
-    }
+    NSInteger code = ([clean containsString:@"aweme-share-swiper-item"] || [clean containsString:@"aweme-slides-swiper-item"])
+                   ? DDPCodeGallery : 0;
+    DDDLog(@"[DDPWebFetcher] 第%u轮 cleanLen=%lu playwm=%d gallery=%d 距开始%.1fs",
+           self.retries, (unsigned long)clean.length, [clean containsString:@"playwm"],
+           code == DDPCodeGallery, CFAbsoluteTimeGetCurrent() - self.fetchStart);
 
-    // 命中 playwm/图集即成功，否则重试
+    // 命中 playwm/图集即成功
     if (code == DDPCodeGallery || [clean containsString:@"playwm"]) {
         [self ddFinishWithHTML:clean code:code];
         return;
     }
+    // 重载拿回完全相同的 HTML：再试也不会有新内容，直接收尾。
+    // （实测：同一页面重载 11 次返回的是同一份 HTML，纯空转 150s 才失败）
+    if (self.lastCleanLen == clean.length) {
+        DDDLog(@"[DDPWebFetcher] 与上一轮 HTML 完全相同(%lu)且无 playwm，停止重试", (unsigned long)clean.length);
+        [self ddFinishWithHTML:clean code:500];
+        return;
+    }
+    self.lastCleanLen = clean.length;
     if (self.retries < DDPMaxRetries) {
         self.retries += 1;
-        DDDLog(@"[DDPWebFetcher] 未命中playwm，将第%u次重试(%u/%ld) 距开始%.1fs", self.retries, self.retries, (long)DDPMaxRetries, CFAbsoluteTimeGetCurrent() - self.fetchStart);
+        DDDLog(@"[DDPWebFetcher] 未命中，第%u次重试 距开始%.1fs", self.retries, CFAbsoluteTimeGetCurrent() - self.fetchStart);
         [self.webView loadRequest:self.ddpRequest];
         return;
     }
-    DDDLog(@"handleRenderedHTML: 重试耗尽仍未命中 playwm url=%@", self.ddpRequest.URL);
+    DDDLog(@"[DDPWebFetcher] 重试%ld次仍未命中 playwm url=%@", (long)DDPMaxRetries, self.ddpRequest.URL);
     [self ddFinishWithHTML:nil code:500];
 }
 
@@ -687,7 +683,7 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
 // 始终返回在线直链：视频→videoURL；图文/滑块→imageURLs。绝不返回本地缓存路径
 - (void)parseDouyinURL:(NSString *)url
             completion:(void (^)(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err))completion;
-- (NSData *)downloadVideoFromURL:(NSString *)url headers:(NSDictionary *)headers;
+- (NSData *)downloadVideoFromURL:(NSString *)url;
 @end
 
 @implementation DDPEngine
@@ -776,7 +772,7 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
 }
 
 // 同步下载（带信号量阻塞等待）
-- (NSData *)downloadVideoFromURL:(NSString *)url headers:(NSDictionary *)headers {
+- (NSData *)downloadVideoFromURL:(NSString *)url {
     if (!url.length) return nil;
 
     NSString *encoded = [url stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
@@ -786,20 +782,10 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:nsurl];
     request.HTTPMethod = @"GET";
 
-    // 传入 headers 时跳过 UA/Accept
-    if (headers.count) {
-        [headers enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSString *value, BOOL *stop) {
-            NSString *lower = key.lowercaseString;
-            if ([lower isEqualToString:@"user-agent"] || [lower isEqualToString:@"accept"]) return;
-            [request setValue:value forHTTPHeaderField:key];
-        }];
-    } else {
-        // 默认 headers
-        [request setValue:@"zh-CN,zh;q=0.9" forHTTPHeaderField:@"Accept-language"];
-        [request setValue:@"bytes=0-" forHTTPHeaderField:@"Range"];
-        [request setValue:url forHTTPHeaderField:@"Referer"];
-        [request setValue:@"strict-origin-when-cross-origin" forHTTPHeaderField:@"Referrer-Policy"];
-    }
+    [request setValue:@"zh-CN,zh;q=0.9" forHTTPHeaderField:@"Accept-language"];
+    [request setValue:@"bytes=0-" forHTTPHeaderField:@"Range"];
+    [request setValue:url forHTTPHeaderField:@"Referer"];
+    [request setValue:@"strict-origin-when-cross-origin" forHTTPHeaderField:@"Referrer-Policy"];
     [request setValue:@"*/*" forHTTPHeaderField:@"Accept"];
 
     // 微信 UA（CUtility GetMMUserAgent）
@@ -878,19 +864,19 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 @interface DDPPanel : NSObject
 + (BOOL)showForContent:(NSString *)content user:(NSString *)user;
 + (void)handleDirectSend:(NSString *)content user:(NSString *)user;
-+ (void)handleParseSend:(NSString *)url user:(NSString *)user force:(BOOL)force;
++ (void)handleParseSend:(NSString *)url user:(NSString *)user;
 + (void)handleParsePreview:(NSString *)url fromVC:(UIViewController *)vc;
 + (void)handleParseLink:(NSString *)url user:(NSString *)user;
 + (void)handleSaveAlbum:(NSString *)url;
 + (void)sendVideoAtPath:(NSString *)path toUser:(NSString *)user;
 + (NSString *)generateThumbnailForVideoPath:(NSString *)path;
 + (void)sendImageAtPath:(NSString *)path toUser:(NSString *)user;
-+ (void)sendImagesForURLs:(NSArray<NSString *> *)urls shareURL:(NSString *)shareURL user:(NSString *)user force:(BOOL)force finish:(void(^)(void))finish;
++ (void)sendImagesForURLs:(NSArray<NSString *> *)urls user:(NSString *)user finish:(void(^)(void))finish;
 + (void)playVideoAtPath:(NSString *)path fromVC:(UIViewController *)vc;
 + (void)saveVideoToAlbumAtPath:(NSString *)path;
 + (void)saveImageToAlbumAtPath:(NSString *)path;
-+ (void)downloadAndSaveImages:(NSArray<NSString *> *)urls shareURL:(NSString *)shareURL finish:(void(^)(void))finish;
-+ (void)sendVideoForURL:(NSString *)videoURL shareURL:(NSString *)shareURL user:(NSString *)user force:(BOOL)force finish:(void(^)(void))finish;
++ (void)downloadAndSaveImages:(NSArray<NSString *> *)urls finish:(void(^)(void))finish;
++ (void)sendVideoForURL:(NSString *)videoURL shareURL:(NSString *)shareURL user:(NSString *)user finish:(void(^)(void))finish;
 + (void)downloadImagesLocally:(NSArray<NSString *> *)urls completion:(void (^)(NSArray<NSString *> *paths))completion;
 + (void)presentImageViewer:(NSArray<NSString *> *)paths fromVC:(UIViewController *)vc;
 @end
@@ -932,7 +918,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 }
 
 // 解析发送
-+ (void)handleParseSend:(NSString *)url user:(NSString *)user force:(BOOL)force {
++ (void)handleParseSend:(NSString *)url user:(NSString *)user {
     DDPShowLoading(@"正在解析…");
     [[DDPEngine shared] parseDouyinURL:url completion:^(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err) {
         if (err || type == DDPMediaTypeUnknown) {
@@ -942,24 +928,24 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         // 转圈延续到下载完成：解析成功后不收起 loading，下载+发送结束再弹最终对勾
         void (^finish)(void) = ^{ DDPShowDone(@"解析成功"); };
         if (type == DDPMediaTypeVideo) {
-            [self sendVideoForURL:videoURL shareURL:url user:user force:force finish:finish];
+            [self sendVideoForURL:videoURL shareURL:url user:user finish:finish];
         } else {
-            [self sendImagesForURLs:imageURLs shareURL:url user:user force:force finish:finish];   // 图文/滑块：下载直链逐张发进聊天
+            [self sendImagesForURLs:imageURLs user:user finish:finish];   // 图文/滑块：下载直链逐张发进聊天
         }
     }];
 }
 
 // 下载视频直链并发到聊天（含本地缓存复用）
-+ (void)sendVideoForURL:(NSString *)videoURL shareURL:(NSString *)url user:(NSString *)user force:(BOOL)force finish:(void(^)(void))finish {
++ (void)sendVideoForURL:(NSString *)videoURL shareURL:(NSString *)url user:(NSString *)user finish:(void(^)(void))finish {
     if (!videoURL.length) { if (finish) finish(); return; }
     NSString *path = DDPTempPath(url);
-    if (!force && DDPFileUsable(path)) {
+    if (DDPFileUsable(path)) {
         [DDPPanel sendVideoAtPath:path toUser:user];
         if (finish) finish();
         return;
     }
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSData *data = [[DDPEngine shared] downloadVideoFromURL:videoURL headers:nil];
+        NSData *data = [[DDPEngine shared] downloadVideoFromURL:videoURL];
         BOOL ok = NO;
         if (data.length) {
             NSFileManager *fm = [NSFileManager defaultManager];
@@ -972,11 +958,11 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 }
 
 // 下载图片直链并批量存相册（图文/滑块，纯本机官方直链）
-+ (void)downloadAndSaveImages:(NSArray<NSString *> *)urls shareURL:(NSString *)shareURL finish:(void(^)(void))finish {
++ (void)downloadAndSaveImages:(NSArray<NSString *> *)urls finish:(void(^)(void))finish {
     if (!urls.count) { if (finish) finish(); return; }
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         for (NSString *imgURL in urls) {
-            NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL headers:nil];
+            NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL];
             if (!data.length) continue;
             NSString *ext = @"jpg";
             if ([[imgURL pathExtension].lowercaseString isEqualToString:@"png"]) ext = @"png";
@@ -1065,7 +1051,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 }
 
 // 下载图片直链并逐张发进聊天（图文/滑块，纯本机官方直链）
-+ (void)sendImagesForURLs:(NSArray<NSString *> *)urls shareURL:(NSString *)shareURL user:(NSString *)user force:(BOOL)force finish:(void(^)(void))finish {
++ (void)sendImagesForURLs:(NSArray<NSString *> *)urls user:(NSString *)user finish:(void(^)(void))finish {
     if (!urls.count) { if (finish) finish(); return; }
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         for (NSString *imgURL in urls) {
@@ -1073,11 +1059,11 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
                 NSString *ext = @"jpg";
                 if ([[imgURL pathExtension].lowercaseString isEqualToString:@"png"]) ext = @"png";
                 NSString *path = DDPTempPathExt(imgURL, ext);
-                if (!force && DDPFileUsable(path)) {
+                if (DDPFileUsable(path)) {
                     [DDPPanel sendImageAtPath:path toUser:user];
                     continue;
                 }
-                NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL headers:nil];
+                NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL];
                 if (!data.length) continue;
                 NSFileManager *fm = [NSFileManager defaultManager];
                 if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
@@ -1108,7 +1094,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
                 return;
             }
             dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                NSData *data = [[DDPEngine shared] downloadVideoFromURL:videoURL headers:nil];
+                NSData *data = [[DDPEngine shared] downloadVideoFromURL:videoURL];
                 if (data.length) {
                     NSFileManager *fm = [NSFileManager defaultManager];
                     if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
@@ -1147,7 +1133,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
             if ([[imgURL pathExtension].lowercaseString isEqualToString:@"png"]) ext = @"png";
             NSString *path = DDPTempPathExt(imgURL, ext);
             if (![fm fileExistsAtPath:path]) {
-                NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL headers:nil];
+                NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL];
                 if (data.length) {
                     if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
                     [data writeToFile:path atomically:YES];
@@ -1204,7 +1190,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
                 return;
             }
             dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                NSData *data = [[DDPEngine shared] downloadVideoFromURL:videoURL headers:nil];
+                NSData *data = [[DDPEngine shared] downloadVideoFromURL:videoURL];
                 BOOL ok = NO;
                 if (data.length) {
                     NSFileManager *fm = [NSFileManager defaultManager];
@@ -1215,7 +1201,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
                 finish();
             });
         } else {
-            [self downloadAndSaveImages:imageURLs shareURL:url finish:finish];
+            [self downloadAndSaveImages:imageURLs finish:finish];
         }
     }];
 }
@@ -1272,7 +1258,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 // 解析发送
 - (void)onParseSend:(id)sender {
     NSString *url = DDPExtractURL(self.content);
-    if (url.length) [DDPPanel handleParseSend:url user:self.user force:NO];
+    if (url.length) [DDPPanel handleParseSend:url user:self.user];
 }
 
 // 解析预览
@@ -1330,14 +1316,17 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     return items;
 }
 
-%hook BaseMessageCellView
+// 必须 hook 具体 cell 子类，不能 hook 基类：operationMenuItems 被 70+ 个 cell 子类
+// 各自实现且大多不调 super（TextMessageCellView.h:46 有自己的声明），
+// 挂在 BaseMessageCellView 上不会触发。参考 DD语音包 hook VoiceMessageCellView。
+%hook TextMessageCellView
 
-// 长按菜单：在微信原生 operationMenuItems 基础上追加「解析 / 预览」（参考 DD语音包）
 - (id)operationMenuItems {
     NSArray *items = %orig;
     NSString *content = ddp_cellContent(self);
     BOOL enabled = DDPConfig.shared.enabled && content.length
                    && DDPContainsDouyinLink(content) && !DDPIsDouyinLiveText(content);
+    DDDLog(@"operationMenuItems: 原生项=%lu 命中抖音=%d", (unsigned long)items.count, enabled);
     items = ddp_inject_item(self, items, enabled, @"解析", @"icons_filled_search", @selector(ddp_onParse:), 1010);
     items = ddp_inject_item(self, items, enabled, @"预览", @"icons_filled_play", @selector(ddp_onPreview:), 1011);
     return items;
@@ -1359,7 +1348,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     if (!DDPConfig.shared.enabled) return;
     NSString *url = DDPExtractURL(ddp_cellContent(self));
     if (!url.length) return;
-    [DDPPanel handleParseSend:url user:DDPCurrentChatName() force:NO];
+    [DDPPanel handleParseSend:url user:DDPCurrentChatName()];
 }
 
 %new
