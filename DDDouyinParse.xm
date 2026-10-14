@@ -11,6 +11,7 @@
 #import <Foundation/Foundation.h>
 #import <WebKit/WebKit.h>
 #import <Photos/Photos.h>
+#import <objc/runtime.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <string.h>
@@ -190,11 +191,9 @@ static inline void DDDClearLog(void) {
 #pragma mark - 配置
 
 static NSString * const kDDPEnabledKey   = @"DDDouyinParseEnabled";
-static NSString * const kDDPWebFetchKey   = @"DDDouyinParseWebFetch";
 
 @interface DDPConfig : NSObject
 @property (nonatomic, assign) BOOL enabled;
-@property (nonatomic, assign) BOOL webFetchEnable;   // 是否走 WKWebView 渲染
 + (instancetype)shared;
 @end
 
@@ -209,34 +208,16 @@ static NSString * const kDDPWebFetchKey   = @"DDDouyinParseWebFetch";
 
 - (instancetype)init {
     if (self = [super init]) {
-        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-        if ([ud objectForKey:kDDPEnabledKey] == nil) {
-            _enabled = YES;   // 首次默认开启
-            [ud setBool:YES forKey:kDDPEnabledKey];
-            DDDLog(@"首次启动，默认开启 enabled=YES");
-        } else {
-            _enabled = [ud boolForKey:kDDPEnabledKey];
-        }
-        // 网页渲染解析：持久化读取，默认开启（抖音页面需 JS 渲染）
-        if ([ud objectForKey:kDDPWebFetchKey] == nil) {
-            _webFetchEnable = YES;
-            [ud setBool:YES forKey:kDDPWebFetchKey];
-        } else {
-            _webFetchEnable = [ud boolForKey:kDDPWebFetchKey];
-        }
-        DDDLog(@"DDPConfig init enabled=%d webFetchEnable=%d", _enabled, _webFetchEnable);
+        // 不设默认开启：key 不存在即 NO，与 DD广告拦截一致
+        _enabled = [NSUserDefaults.standardUserDefaults boolForKey:kDDPEnabledKey];
+        DDDLog(@"DDPConfig init enabled=%d", _enabled);
     }
     return self;
 }
 
 - (void)setEnabled:(BOOL)enabled {
     _enabled = enabled;
-    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDPEnabledKey];
-}
-
-- (void)setWebFetchEnable:(BOOL)webFetchEnable {
-    _webFetchEnable = webFetchEnable;
-    [[NSUserDefaults standardUserDefaults] setBool:webFetchEnable forKey:kDDPWebFetchKey];
+    [NSUserDefaults.standardUserDefaults setBool:enabled forKey:kDDPEnabledKey];
 }
 
 @end
@@ -524,11 +505,6 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重试 3 次（配�
                                              cachePolicy:NSURLRequestUseProtocolCachePolicy
                                          timeoutInterval:30.0];
 
-    // 网页渲染解析开关：关闭则不抓取（抖音页面需 JS 渲染，无替代路径）
-    if (!DDPConfig.shared.webFetchEnable) {
-        if (completion) completion(nil, -1);
-        return;
-    }
     self.ddpRequest = request;
     self.retries = 0;
     self.lastCleanLen = 0;
@@ -1482,13 +1458,10 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     if (!_tableViewMgr) return;
     [self.tableViewMgr clearAllSection];
 
-    // 解析设置分组：总开关 + 子项（总开关开启时展开）
+    // 解析设置分组
     WCTableViewSectionManager *section = [%c(WCTableViewSectionManager) defaultSection];
     section.headerTitle = @"解析设置";
     [section addCell:[self switchCellWithTitle:@"启用抖音解析" on:DDPConfig.shared.enabled action:@selector(onEnabledSwitch:)]];
-    if (DDPConfig.shared.enabled) {
-        [section addCell:[self switchCellWithTitle:@"网页渲染解析" on:DDPConfig.shared.webFetchEnable action:@selector(onWebFetchSwitch:)]];
-    }
     [self.tableViewMgr addSection:section];
 
     // 日志分组（与总开关无关）
@@ -1504,8 +1477,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     return [%c(WCTableViewCellManager) switchCellForSel:action target:self title:title on:on];
 }
 
-- (void)onEnabledSwitch:(UISwitch *)sender   { DDPConfig.shared.enabled = sender.isOn; [self buildTable]; }
-- (void)onWebFetchSwitch:(UISwitch *)sender  { DDPConfig.shared.webFetchEnable = sender.isOn; }
+- (void)onEnabledSwitch:(UISwitch *)sender   { DDPConfig.shared.enabled = sender.isOn; }
 
 // 导出日志（另存 txt 分享）
 - (void)onExportLog:(id)sender {
@@ -1535,7 +1507,10 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
 #pragma mark - 注册入口
 
 %ctor {
-    [[%c(WCPluginsMgr) sharedInstance] registerControllerWithTitle:@"DD抖音解析"
+    Class mgrCls = objc_getClass("WCPluginsMgr");
+    if (mgrCls) {
+        [[mgrCls sharedInstance] registerControllerWithTitle:@"DD抖音解析"
                                                      version:@"1.0.0"
                                                   controller:@"DDPDouyinParseSettingsViewController"];
+    }
 }
