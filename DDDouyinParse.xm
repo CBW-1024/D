@@ -17,6 +17,11 @@
 
 #pragma mark - 微信私有类声明（仅声明插件用到的方法）
 
+// 注意：以下类只做声明、不参与链接。引用时一律用 Logos 的 %c(ClassName)
+// （展开为 objc_getClass，运行时解析）；若直接写 [ClassName method] 或
+// [ClassName alloc]，链接器会去找 _OBJC_CLASS_$_ClassName 并报
+// "Undefined symbols for architecture arm64/arm64e"。
+
 // 微信内置提示控件（方形带图标）：转圈 / ✓ / 错误 三态，运行时按类名取，编译期不产生链接符号
 @interface WeToast : NSObject
 + (instancetype)toast;
@@ -282,8 +287,8 @@ static inline BOOL DDPIsDouyinLiveText(NSString *text) {
 
 // 发送方判定：优先 isSenderFromMsgWrap:，缺失则比对本机 wxid，仍不定按已发送（保证面板能弹）
 static BOOL DDPIsOutgoing(CMessageWrap *wrap) {
-    if ([CMessageWrap isSenderFromMsgWrap:wrap]) return YES;
-    NSString *me = [SettingUtil getLocalUsrName:0];
+    if ([%c(CMessageWrap) isSenderFromMsgWrap:wrap]) return YES;
+    NSString *me = [%c(SettingUtil) getLocalUsrName:0];
     NSString *from = wrap.m_nsFromUsr;
     if (me.length && from.length) return [from isEqualToString:me];
     return YES;
@@ -438,7 +443,7 @@ static inline void DDPCopyToPasteboard(NSString *text) {
 static WeToast *gDDPBusyToast = nil;   // 进行中的 loading，出结果时收起
 
 static WeToast *DDPToast(void) {
-    return [WeToast toast];
+    return [%c(WeToast) toast];
 }
 
 // 同时只保留一个 loading 实例；起新的前先收掉旧的，否则上一个转圈会永远停在屏幕上
@@ -515,7 +520,7 @@ static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次
         _webView = [[WKWebView alloc] initWithFrame:CGRectZero configuration:config];
 
         // 微信 UA（CUtility GetMMUserAgent），让抖音返回含 playwm 的页面
-        NSString *ua = [CUtility GetMMUserAgent];
+        NSString *ua = [%c(CUtility) GetMMUserAgent];
         if (!ua.length) {
             ua = @"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.40(0x18004025) NetType/WIFI Language/zh_CN";
         }
@@ -798,7 +803,7 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
     [request setValue:@"*/*" forHTTPHeaderField:@"Accept"];
 
     // 微信 UA（CUtility GetMMUserAgent）
-    NSString *ua = [CUtility GetMMUserAgent];
+    NSString *ua = [%c(CUtility) GetMMUserAgent];
     [request setValue:(ua.length ? ua : @"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15") forHTTPHeaderField:@"User-Agent"];
 
     NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
@@ -826,9 +831,9 @@ static BOOL gDDPDyTcEnable;
 
 // 取 CMessageMgr（优先 activeUserContext）
 static CMessageMgr *DDPMessageMgr(void) {
-    MMContext *ctx = [MMContext activeUserContext];
-    if (ctx) return [ctx getService:[CMessageMgr class]];
-    return [[(MMContext *)[MMContext currentContext] serviceCenter] getService:[CMessageMgr class]];
+    MMContext *ctx = [%c(MMContext) activeUserContext];
+    if (ctx) return [ctx getService:%c(CMessageMgr)];
+    return [[(MMContext *)[%c(MMContext) currentContext] serviceCenter] getService:%c(CMessageMgr)];
 }
 
 // 取当前会话名（遍历 VC 响应 getCurrentChatName）
@@ -857,8 +862,8 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     if (!content.length || !user.length) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         gDDPDyTcEnable = NO;
-        CMessageWrap *wrap = [[CMessageWrap alloc] initWithMsgType:1];
-        wrap.m_nsFromUsr   = [SettingUtil getLocalUsrName:0];   // 本机 wxid
+        CMessageWrap *wrap = [[%c(CMessageWrap) alloc] initWithMsgType:1];
+        wrap.m_nsFromUsr   = [%c(SettingUtil) getLocalUsrName:0];   // 本机 wxid
         wrap.m_nsToUsr     = user;
         wrap.m_uiStatus    = 4;
         wrap.m_nsContent   = content;
@@ -905,7 +910,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     target.user = user;
     target.topVC = top;
 
-    MMTipsViewController *sheet = [[MMTipsViewController alloc] initWithTitle:@"抖音解析" content:content buttons:@[]];
+    MMTipsViewController *sheet = [[%c(MMTipsViewController) alloc] initWithTitle:@"抖音解析" content:content buttons:@[]];
     if (!sheet) return NO;
 
     [sheet addButtonWithTitle:@"直接发送" target:target sel:@selector(onDirectSend:)];
@@ -1021,17 +1026,17 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         if (high) {
             // 高码率：OpenApiMgrHelper.genCaptureVideoInfoWithVideoData:mediaMessage:param:
             NSData *videoData = [NSData dataWithContentsOfFile:path];
-            videoInfo = videoData ? [OpenApiMgrHelper genCaptureVideoInfoWithVideoData:videoData mediaMessage:nil param:nil] : nil;
+            videoInfo = videoData ? [%c(OpenApiMgrHelper) genCaptureVideoInfoWithVideoData:videoData mediaMessage:nil param:nil] : nil;
         } else {
             // 低码率：CaptureVideoInfo.genVideoInfoWithVideoUrl:thumb: + setThumb_path:
-            videoInfo = [CaptureVideoInfo genVideoInfoWithVideoUrl:[NSURL fileURLWithPath:path] thumb:thumbPath];
+            videoInfo = [%c(CaptureVideoInfo) genVideoInfoWithVideoUrl:[NSURL fileURLWithPath:path] thumb:thumbPath];
             if (thumbPath) [videoInfo setThumb_path:thumbPath];
         }
         if (!videoInfo) return;
 
         // AddVideoMsg: 首参为发送方（本机 wxid），次参为接收方，三参为 VideoInfo。
         CMessageMgr *msgMgr = DDPMessageMgr();
-        [msgMgr AddVideoMsg:[SettingUtil getLocalUsrName:0] ToUsr:chatName VideoInfo:videoInfo];
+        [msgMgr AddVideoMsg:[%c(SettingUtil) getLocalUsrName:0] ToUsr:chatName VideoInfo:videoInfo];
     });
 }
 
@@ -1047,7 +1052,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         NSData *data = UIImagePNGRepresentation(image);
         if (!data.length) return;
 
-        BaseMsgContentLogicController *ctrl = [[BaseMsgContentLogicController alloc] init];
+        BaseMsgContentLogicController *ctrl = [[%c(BaseMsgContentLogicController) alloc] init];
         CMessageWrap *wrap = [ctrl FormImageMsg:chatName withImage:image withData:data];
 
         // 写入原图扩展信息（m_extendInfoWithMsgType → setImage:withData:isOriginImage:YES）
@@ -1125,7 +1130,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 // 视频预览：用微信自带 MMMoviePlayerController 播放本地 mp4 并 push 到导航栈
 + (void)playVideoAtPath:(NSString *)path fromVC:(UIViewController *)vc {
     if (!path.length || !vc) return;
-    MMMoviePlayerController *player = [[MMMoviePlayerController alloc] initWithMsgWrap:nil VideoPath:path];
+    MMMoviePlayerController *player = [[%c(MMMoviePlayerController) alloc] initWithMsgWrap:nil VideoPath:path];
     UINavigationController *nav = vc.navigationController;
     if (nav) { [nav pushViewController:player animated:YES]; return; }
     [vc presentViewController:player animated:YES completion:nil];
@@ -1313,7 +1318,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
         id ui = [it userInfo];
         if ([ui isKindOfClass:[NSString class]] && [(NSString *)ui isEqualToString:token]) return original;
     }
-    MMMenuItem *item = [[MMMenuItem alloc] initWithTitle:title
+    MMMenuItem *item = [[%c(MMMenuItem) alloc] initWithTitle:title
                                                 svgName:svgName
                                                  target:cell
                                                  action:action];
@@ -1544,7 +1549,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
 
 - (void)ensureTableViewMgr {
     if (_tableViewMgr) return;
-    _tableViewMgr = [[WCTableViewManager alloc] initWithFrame:[UIScreen mainScreen].bounds style:UITableViewStyleInsetGrouped];
+    _tableViewMgr = [[%c(WCTableViewManager) alloc] initWithFrame:[UIScreen mainScreen].bounds style:UITableViewStyleInsetGrouped];
 }
 
 - (instancetype)init {
@@ -1578,7 +1583,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     [self.tableViewMgr clearAllSection];
 
     // 解析设置分组：总开关 + 子项（总开关开启时展开）
-    WCTableViewSectionManager *section = [WCTableViewSectionManager defaultSection];
+    WCTableViewSectionManager *section = [%c(WCTableViewSectionManager) defaultSection];
     section.headerTitle = @"解析设置";
     [section addCell:[self switchCellWithTitle:@"启用抖音解析" on:DDPConfig.shared.enabled action:@selector(onEnabledSwitch:)]];
     if (DDPConfig.shared.enabled) {
@@ -1587,16 +1592,16 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     [self.tableViewMgr addSection:section];
 
     // 日志分组（与总开关无关）
-    WCTableViewSectionManager *logSection = [WCTableViewSectionManager defaultSection];
+    WCTableViewSectionManager *logSection = [%c(WCTableViewSectionManager) defaultSection];
     logSection.headerTitle = @"日志";
-    [logSection addCell:[WCTableViewCellManager normalCellForSel:@selector(onExportLog:) target:self title:@"导出日志"]];
-    [logSection addCell:[WCTableViewCellManager normalCellForSel:@selector(onClearLog:) target:self title:@"清空日志"]];
+    [logSection addCell:[%c(WCTableViewCellManager) normalCellForSel:@selector(onExportLog:) target:self title:@"导出日志"]];
+    [logSection addCell:[%c(WCTableViewCellManager) normalCellForSel:@selector(onClearLog:) target:self title:@"清空日志"]];
     [self.tableViewMgr addSection:logSection];
     [self.tableViewMgr reloadTableView];
 }
 
 - (id)switchCellWithTitle:(NSString *)title on:(BOOL)on action:(SEL)action {
-    return [WCTableViewCellManager switchCellForSel:action target:self title:title on:on];
+    return [%c(WCTableViewCellManager) switchCellForSel:action target:self title:title on:on];
 }
 
 - (void)onEnabledSwitch:(UISwitch *)sender   { DDPConfig.shared.enabled = sender.isOn; [self buildTable]; }
@@ -1637,7 +1642,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
 #pragma mark - 注册入口
 
 %ctor {
-    [[WCPluginsMgr sharedInstance] registerControllerWithTitle:@"DD抖音解析"
+    [[%c(WCPluginsMgr) sharedInstance] registerControllerWithTitle:@"DD抖音解析"
                                                      version:@"1.0.0"
                                                   controller:@"DDPDouyinParseSettingsViewController"];
 }
