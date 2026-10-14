@@ -645,7 +645,7 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重试 3 次（配�
     // （实测：同一页面重载 11 次返回的是同一份 HTML，纯空转 150s 才失败）
     if (self.lastCleanLen == clean.length) {
         DDDLog(@"[DDPWebFetcher] 与上一轮 HTML 完全相同(%lu)且无 playwm，停止重试", (unsigned long)clean.length);
-        [self ddFinishWithHTML:clean code:500];
+        [self ddFinishWithHTML:nil code:500];   // 已判定拿不到直链，传 nil 免得下游再跑一遍正则
         return;
     }
     self.lastCleanLen = clean.length;
