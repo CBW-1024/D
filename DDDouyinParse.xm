@@ -498,6 +498,8 @@ static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次
 @property (nonatomic, assign) unsigned int retries;
 @property (nonatomic, assign) BOOL hasCompleted;
 @property (nonatomic, strong) NSURLRequest *ddpRequest;   // 当前请求（重试复用）
+@property (nonatomic, assign) NSTimeInterval fetchStart;    // 解析开始时间（诊断用）
+@property (nonatomic, assign) NSUInteger lastCleanLen;      // 上一轮 HTML 长度（空转检测）
 @property (nonatomic, copy) void (^completion)(NSString *html, NSInteger errCode);
 - (void)fetchHTMLFromURL:(NSString *)url completion:(void (^)(NSString *html, NSInteger errCode))completion;
 - (void)cleanupWebView;
@@ -586,6 +588,9 @@ static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次
 
     self.ddpRequest = request;
     self.retries = 0;
+    self.lastCleanLen = 0;
+    self.fetchStart = CFAbsoluteTimeGetCurrent();
+    DDDLog(@"[DDPWebFetcher] 开始解析 url=%@ (webFetch=%d)", request.URL.absoluteString, webFetch);
     // 首次加载，未命中 playwm 则重试
     dispatch_async(dispatch_get_main_queue(), ^{
         [self.webView loadRequest:request];
@@ -594,7 +599,7 @@ static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次
 
 // 加载完延迟取 outerHTML（等 JS 渲染）
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
-    DDDLog(@"DDPWebFetcher: didFinishNavigation retries=%u", self.retries);
+    DDDLog(@"[DDPWebFetcher] didFinishNavigation retries=%u 等待%ds取HTML 距开始%.1fs", self.retries, (int)(self.retries + 5), CFAbsoluteTimeGetCurrent() - self.fetchStart);
     __weak typeof(self) wself = self;
     // 延迟 (retries+5)s 等 JS 渲染
     dispatch_time_t delay = dispatch_time(DISPATCH_TIME_NOW,
@@ -628,7 +633,7 @@ static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次
 
 // 统一收尾，仅触发一次
 - (void)ddFinishWithHTML:(NSString *)html code:(NSInteger)code {
-    DDDLog(@"ddFinishWithHTML: code=%ld htmlLen=%lu", (long)code, (unsigned long)(html ? html.length : 0));
+    DDDLog(@"[DDPWebFetcher] 收尾 code=%ld htmlLen=%lu 总重试=%u 总耗时%.1fs", (long)code, (unsigned long)(html ? html.length : 0), self.retries, CFAbsoluteTimeGetCurrent() - self.fetchStart);
     if (self.hasCompleted) return;
     self.hasCompleted = YES;
     if (self.completion) self.completion(html, code);
@@ -652,11 +657,17 @@ static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次
     full = NSMakeRange(0, clean.length);
     [clean replaceOccurrencesOfString:@"\u001D" withString:@"" options:NSLiteralSearch range:full];       // 控制字符 0x1D
 
-        DDDLog(@"handleRenderedHTML: cleanLen=%lu 含playwm=%d 含video_id=%d 含swiper=%d",
-               (unsigned long)clean.length,
+        DDDLog(@"[DDPWebFetcher] 第%u轮 cleanLen=%lu playwm=%d gallery=%d video_id=%d 距开始%.1fs",
+               self.retries, (unsigned long)clean.length,
                [clean containsString:@"playwm"],
+               [clean containsString:@"aweme-share-swiper-item"] || [clean containsString:@"aweme-slides-swiper-item"],
                [clean containsString:@"video_id="],
-               [clean containsString:@"aweme-share-swiper-item"] || [clean containsString:@"aweme-slides-swiper-item"]);
+               CFAbsoluteTimeGetCurrent() - self.fetchStart);
+        if (self.lastCleanLen == clean.length && ![clean containsString:@"playwm"] &&
+            !([clean containsString:@"aweme-share-swiper-item"] || [clean containsString:@"aweme-slides-swiper-item"])) {
+            DDDLog(@"[DDPWebFetcher] ⚠️ 第%u轮与上一轮HTML长度相同(%lu)且无playwm，疑似冗余空转", self.retries, (unsigned long)clean.length);
+        }
+        self.lastCleanLen = clean.length;
 
     // 图集特征检测
     NSInteger code = 0;
@@ -671,7 +682,7 @@ static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次
     }
     if (self.retries < DDPMaxRetries) {
         self.retries += 1;
-        DDDLog(@"handleRenderedHTML: 未命中 playwm，重试 (%u/%ld) url=%@", self.retries, (long)DDPMaxRetries, self.ddpRequest.URL);
+        DDDLog(@"[DDPWebFetcher] 未命中playwm，将第%u次重试(%u/%ld) 距开始%.1fs", self.retries, self.retries, (long)DDPMaxRetries, CFAbsoluteTimeGetCurrent() - self.fetchStart);
         [self.webView loadRequest:self.ddpRequest];
         return;
     }
@@ -1568,7 +1579,7 @@ static __weak CMessageWrap *gDDPCurrentMsgWrap;
 - (void)setMenuItems:(id)menuItems {
     if (!DDPConfig.shared.enabled) { %orig; return; }
     NSString *content = [DDPMenuHandler currentContent];
-    if (!content.length || !DDPContainsDouyinLink(content)) { %orig; return; }
+    if (!content.length || !DDPContainsDouyinLink(content) || DDPIsDouyinLiveText(content)) { %orig; return; }
 
     // 已注入则跳过，并通过 menuType 唯一 ID 防与其它插件注入项撞车被去重
     NSArray *items = ddp_inject_item(menuItems, @"解析", @"icons_filled_heart", @selector(onDouyinParse:), 1010);
