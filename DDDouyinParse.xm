@@ -1,8 +1,12 @@
 
-// DDDouyinParse：微信抖音链接解析（复刻 PKCWeChatTools 混淆类 GXYeazddpmkzikglugu）。
-// 流程：识别消息 → 隐藏 WKWebView 抓分享页 HTML → 正则提取/去水印 → 面板发送/预览/保存。
-// 面板复刻 PKC 灰色圆角卡片（微信原生 MMTipsViewController，addButtonWithTitle:target:sel: + show）；
-// 长按菜单 hook MMMenuController 追加"解析/预览"。去水印不依赖微信私有 API。
+// DDDouyinParse —— 微信内抖音分享链接解析插件（Theos / Logos 单文件）
+//
+// 处理管线：
+//   1. 在聊天中识别抖音分享链接（消息发送时触发）
+//   2. 用隐藏的 WKWebView 抓取官方分享页 HTML（不注入脚本，仅渲染后取 outerHTML）
+//   3. 正则提取去水印直链（视频 / 图文图集 / 幻灯片）
+//   4. 弹面板让用户「发送 / 预览 / 保存」（微信原生 MMTipsViewController）
+//
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <WebKit/WebKit.h>
@@ -24,7 +28,7 @@
 @property (nonatomic, assign) NSInteger currentIndex;
 @end
 
-// 微信自带视频播放器（PKC 预览用它播放本地 mp4，对齐 pkcDyVideoJxYl → MMMoviePlayerController）
+// 微信自带视频播放器（用于播放本地 mp4）
 @interface MMMoviePlayerController : UIViewController
 - (instancetype)initWithMsgWrap:(id)arg1 VideoPath:(NSString *)arg2;
 @end
@@ -48,7 +52,6 @@ static void DDDWriteLog(NSString *msg) {
         if (fh) { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
     } @catch (...) {}
 }
-// 读取日志全文
 static inline NSString *DDDReadLog(void) {
     @try {
         NSString *path = DDDLogPath();
@@ -56,7 +59,6 @@ static inline NSString *DDDReadLog(void) {
         return [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
     } @catch (...) { return nil; }
 }
-// 清空日志
 static inline void DDDClearLog(void) {
     @try {
         NSString *path = DDDLogPath();
@@ -102,7 +104,7 @@ static inline void DDDClearLog(void) {
 @property (nonatomic) unsigned int m_uiStatus;
 @property (nonatomic) unsigned int m_uiCreateTime;
 - (id)initWithMsgType:(long long)type;
-+ (BOOL)isSenderFromMsgWrap:(id)wrap;   // 判断消息是否自己发出（PKC AddMsg 区分收发）
++ (BOOL)isSenderFromMsgWrap:(id)wrap;   // 判断消息是否自己发出（区分收发方）
 @end
 
 @interface SettingUtil : NSObject  // 取本机 wxid（getLocalUsrName:0）
@@ -124,7 +126,7 @@ static inline void DDDClearLog(void) {
 
 @interface MMContext : NSObject
 + (id)currentContext;
-+ (id)activeUserContext;   // PKC 用 activeUserContext 取服务
++ (id)activeUserContext;   // 取当前登录用户上下文
 - (id)getService:(Class)arg1;
 @property (readonly, nonatomic) MMServiceCenter *serviceCenter;
 @end
@@ -135,12 +137,12 @@ static inline void DDDClearLog(void) {
 - (void)AddMsg:(NSString *)usr MsgWrap:(CMessageWrap *)wrap;
 @end
 
-// 图片消息扩展操作（对齐 PKC sendImg:image: 调用 IMsgExtendOperation.set外界）
+// 图片消息扩展操作（写入原图扩展信息）
 @protocol DDPMsgExtendOperation <NSObject>
 - (void)setImage:(UIImage *)arg1 withData:(NSData *)arg2 isOriginImage:(BOOL)arg3;
 @end
 
-// 图片消息构造（CMessageWrap 由 WeixinContentLogicController.FormImageMsg:withImage:withData: 生成；签名对齐 MsgDelegate-Protocol.h:28）
+// CMessageWrap 扩展：通过 WeixinContentLogicController 生成图片消息
 @interface CMessageWrap (DDP)
 - (id<DDPMsgExtendOperation>)m_extendInfoWithMsgType;
 @end
@@ -158,7 +160,7 @@ static inline void DDDClearLog(void) {
 + (NSString *)GetMMUserAgent;
 @end
 
-// 面板用微信原生 MMTipsViewController（复刻 PKC 灰色圆角卡片：addButtonWithTitle:target:sel: + show）
+// 面板用微信原生 MMTipsViewController（灰色圆角卡片）
 
 @interface MMMenuController : NSObject  // 长按菜单控制器（hook setMenuItems: 追加项）
 + (instancetype)sharedMenuController;
@@ -173,11 +175,7 @@ static inline void DDDClearLog(void) {
 @property (nonatomic, weak) id target;
 @end
 
-// 微信原生提示面板（PKC 抖音面板的真实控件，复刻 pkc tipsTitle:Msg:Type:Hidden:CancelTitle:Data: Type==8 分支）
-// PKC 抖音面板 = UIAlertController 子类 DTXcjsghusskmsktjxjkusyvmqnqkzs（alertControllerWithTitle:message:preferredStyle:）。
-// Type==8 抖音分支（-[GXYeazddpmkzikglugu tipsTitle:Msg:Type:Hidden:CancelTitle:Data:] 89498→0x89e30）：
-//   message 纯展示内容 + addButtonWithTitle:target:sel: ×6(dyzzfs:..dyjxSave:) + 取消 + show，无任何输入框。
-// 本插件沿用微信原生 MMTipsViewController 面板（用户确认外观一致），content 经 initWithTitle:content:buttons: 展示。
+// 微信原生提示面板（用于展示解析结果卡片）
 @interface MMTipsViewController : UIViewController
 - (instancetype)initWithTitle:(NSString *)title content:(NSString *)content buttons:(NSArray *)buttons;  // MMTipsViewController.h:150
 - (void)addTextViewWithMaxLen:(unsigned int)maxLen;                                                       // MMTipsViewController.h:129
@@ -189,9 +187,8 @@ static inline void DDDClearLog(void) {
 @property (retain, nonatomic) id m_userData;                  // MMTipsViewController.h:67
 @end
 
-// 面板按钮适配器：MMTipsViewController 的 addButtonWithTitle:target:sel: 需要「实例对象 + 单参 sel」
-// 对齐 PKC 的 dyzzfs:/dyjxfs:/dyjxyl:/dyjxlj:/dyjxzq:/dyjxSave:（receiver=GXY.. 实例）。这里用单例持有
-// 当前 content/user/topVC，每个按钮 sel 分发到 DDPPanel 对应多参类方法。
+// 面板按钮适配器：MMTipsViewController 按钮回调只需「实例 + 单参 sel」，
+// 这里用单例持有当前 content/user/topVC，把按钮 sel 分发到 DDPPanel 对应类方法。
 @interface DDPPanelTarget : NSObject
 + (instancetype)shared;
 @property (nonatomic, copy) NSString *content;
@@ -202,7 +199,7 @@ static inline void DDDClearLog(void) {
 - (void)onParsePreview:(id)sender;
 - (void)onParseLink:(id)sender;
 - (void)onSaveAlbum:(id)sender;
-- (void)onCancel:(id)sender;   // 取消（对齐 PKC getTipsCancel:，仅关闭面板）
+- (void)onCancel:(id)sender;   // 取消（面板自带关闭）
 @end
 
 #pragma mark - 配置
@@ -212,7 +209,7 @@ static NSString * const kDDPWebFetchKey   = @"DDDouyinParseWebFetch";
 
 @interface DDPConfig : NSObject
 @property (nonatomic, assign) BOOL enabled;
-@property (nonatomic, assign) BOOL webFetchEnable;   // 是否走 WKWebView 渲染（对应 PKC pkcDyJxHtEnable）
+@property (nonatomic, assign) BOOL webFetchEnable;   // 是否走 WKWebView 渲染
 + (instancetype)shared;
 @end
 
@@ -261,7 +258,7 @@ static NSString * const kDDPWebFetchKey   = @"DDDouyinParseWebFetch";
 
 #pragma mark - 工具函数
 
-// 抖音链接检测：仅认这三类（对齐 PKC 0xfb2d4）
+// 抖音链接检测：仅认这三类官方分享链接
 static inline BOOL DDPContainsDouyinLink(NSString *text) {
     if (!text.length) return NO;
     return [text containsString:@"douyin.com/video"]
@@ -269,7 +266,7 @@ static inline BOOL DDPContainsDouyinLink(NSString *text) {
         || [text containsString:@"douyin.com/note"];
 }
 
-// 排除"正在直播"（对齐 PKC 0xfb310）
+// 排除"正在直播"的直播间分享文本
 static inline BOOL DDPIsDouyinLiveText(NSString *text) {
     return text.length && [text containsString:@"正在直播"];
 }
@@ -292,7 +289,7 @@ static BOOL DDPIsOutgoing(CMessageWrap *wrap) {
     return YES;
 }
 
-// 正则提取 URL（对齐 PKC getDyUrlFromString:）
+// 正则提取链接中的 URL
 static inline NSString *DDPExtractURL(NSString *text) {
     if (!text.length) return nil;
     NSError *err = nil;
@@ -305,7 +302,7 @@ static inline NSString *DDPExtractURL(NSString *text) {
     return [text substringWithRange:match.range];
 }
 
-// 去水印：/playwm/→/play/ + ratio=1080p（对齐 PKC removeWatermarkFromVideoURL:）
+// 去水印：/playwm/ → /play/ 并统一 ratio=1080p
 static inline NSString *DDPRemoveWatermark(NSString *url) {
     if (!url.length) return nil;
     NSString *clean = [url stringByReplacingOccurrencesOfString:@"/playwm/" withString:@"/play/"];
@@ -395,7 +392,7 @@ static inline NSString *DDPMD5(NSString *str) {
     return out;
 }
 
-// 缓存路径 MD5_1.mp4（对齐 PKC）
+// 缓存路径：MD5_1.mp4
 static inline NSString *DDPTempPath(NSString *url) {
     NSString *md5 = DDPMD5(url);
     if (!md5) return nil;
@@ -435,7 +432,7 @@ static inline void DDPCopyToPasteboard(NSString *text) {
     UIPasteboard.generalPasteboard.string = text;
 }
 
-// PKC 风格提示气泡：纯文字药丸，屏幕顶部居中，2 秒后淡出；颜色跟随系统深浅模式
+// 轻量提示气泡：纯文字药丸，屏幕顶部居中，2 秒后淡出，跟随系统深浅模式
 static inline void DDPShowPKCTip(NSString *msg) {
     if (!msg.length) return;
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -509,16 +506,16 @@ static inline void DDPShowPKCTip(NSString *msg) {
     });
 }
 
-// 系统提示（统一走 PKC 风格药丸提示）
+// 系统提示（统一走药丸提示）
 static inline void DDPShowSystemTip(NSString *msg) {
     DDPShowPKCTip(msg);
 }
 
-#pragma mark - DDPWebFetcher（复刻 PKC ORZeljybnjfw：WKWebView 渲染抓取）
+#pragma mark - 解析抓取（WKWebView 渲染）
 
 // completion: (html, errCode)，DDPCodeGallery 表示图集
 static const NSInteger DDPCodeGallery = 0x4161;   // 16737
-static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次（对齐 PKC）
+static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次
 
 @interface DDPWebFetcher : NSObject <WKNavigationDelegate>
 @property (nonatomic, readonly) WKWebView *webView;
@@ -569,7 +566,6 @@ static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次（对�
 
         _webView.navigationDelegate = self;
 
-        // 加 keyWindow、全屏、隐藏
         UIWindow *keyWindow = DDPKeyWindow();
         if (keyWindow) {
             [keyWindow addSubview:_webView];
@@ -580,7 +576,7 @@ static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次（对�
     return self;
 }
 
-// 开始抓取（对齐 PKC fetchHTMLFromURL:completion:）
+// 开始抓取
 - (void)fetchHTMLFromURL:(NSString *)url completion:(void (^)(NSString *html, NSInteger errCode))completion {
     DDDLog(@"fetchHTMLFromURL: 开始 url=%@ webView=%p delegate=%@ keyWindow=%@",
            url, _webView, _webView.navigationDelegate ? @"Y" : @"N", DDPKeyWindow() ? @"Y" : @"N");
@@ -594,7 +590,7 @@ static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次（对�
         return;
     }
 
-    // 对齐 PKC（main_parser.asm:42d74）：cachePolicy=0（NSURLRequestUseProtocolCachePolicy 默认协议缓存）、timeout=30s
+    // cachePolicy 用默认协议缓存，超时 30s
     NSURLRequest *request = [NSURLRequest requestWithURL:nsurl
                                              cachePolicy:NSURLRequestUseProtocolCachePolicy
                                          timeoutInterval:30.0];
@@ -620,7 +616,7 @@ static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次（对�
     });
 }
 
-// 加载完延迟取 outerHTML（对齐 PKC webView:didFinishNavigation:）
+// 加载完延迟取 outerHTML（等 JS 渲染）
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
     DDDLog(@"DDPWebFetcher: didFinishNavigation retries=%u", self.retries);
     __weak typeof(self) wself = self;
@@ -707,7 +703,6 @@ static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次（对�
     [self ddFinishWithHTML:nil code:500];
 }
 
-// 清理 webView
 - (void)cleanupWebView {
     _webView.hidden = YES;
 }
@@ -744,7 +739,7 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
     return instance;
 }
 
-// 视频：正则抠 playwm 直链并去水印、去重（对齐 PKC extractVideoLinksFromHTML:）
+// 视频：正则抠 playwm 直链并去水印、去重
 - (NSArray<NSString *> *)extractVideoLinksFromHTML:(NSString *)html {
     if (!html.length) return @[];
 
@@ -755,7 +750,7 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
     NSMutableArray *result = [NSMutableArray array];
     for (NSTextCheckingResult *m in matches) {
         NSString *u = [html substringWithRange:m.range];
-        u = [u stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];   // &amp;→&
+        u = [u stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
         if ([u containsString:@"video_id=https:"]) continue;                     // 跳过 video_id=https:
         NSString *clean = DDPRemoveWatermark(u);                                  // 去水印
         if (clean.length && ![result containsObject:clean]) [result addObject:clean];
@@ -764,7 +759,7 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
     return [result copy];
 }
 
-// 图文/滑块：抠图集与幻灯片图片（对齐 PKC extractGalleryImagesFromHTML: 两段正则）
+// 图文/滑块：抠图集与幻灯片图片（两段正则）
 - (NSArray<NSString *> *)extractGalleryImagesFromHTML:(NSString *)html {
     if (!html.length) return @[];
     NSMutableArray *result = [NSMutableArray array];
@@ -807,7 +802,6 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
                 if (completion) completion(DDPMediaTypeUnknown, nil, nil, [NSError errorWithDomain:@"DDP" code:-2 userInfo:nil]);
                 return;
             }
-            // 视频优先；否则图文/滑块
             NSArray *videos = [sself extractVideoLinksFromHTML:html];
             if (videos.count) {
                 if (completion) completion(DDPMediaTypeVideo, videos.firstObject, nil, nil);
@@ -826,7 +820,7 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
     }];
 }
 
-// 同步下载（对齐 PKC downloadVideoFromURL:headers:）
+// 同步下载（带信号量阻塞等待）
 - (NSData *)downloadVideoFromURL:(NSString *)url headers:(NSDictionary *)headers {
     if (!url.length) return nil;
 
@@ -881,7 +875,7 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
 
 #pragma mark - 面板展示
 
-// 一次性放行标志（对应 PKC pkcDyTcEnable）
+// 一次性放行标志：防「直接发送」重发被自己拦截
 static BOOL gDDPDyTcEnable;
 
 // 取 CMessageMgr（优先 activeUserContext）
@@ -924,7 +918,7 @@ static NSString *DDPCurrentChatName(void) {
     return nil;
 }
 
-// 自建 CMessageWrap 走 AddMsg 发送（对齐 PKC sendMsg:toUser:）
+// 自建 CMessageWrap 走 AddMsg 发送
 static void DDPSendTextMsg(NSString *content, NSString *user) {
     if (!content.length || !user.length) return;
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -947,7 +941,6 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         wrap.m_nsContent    = content;
         wrap.m_uiCreateTime = (unsigned int)[[NSDate date] timeIntervalSince1970];
 
-        // 取服务
         CMessageMgr *mgr = nil;
         if ([ctxCls respondsToSelector:@selector(activeUserContext)]) {
             id ctx = [ctxCls activeUserContext];
@@ -988,14 +981,12 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 
 @implementation DDPPanel
 
-// 复刻 PKC 抖音面板：微信原生 MMTipsViewController 灰色圆角卡片。
-// 反汇编锚点 tipsTitle:Msg:Type:Hidden:CancelTitle:Data: Type==8（main_parser.asm:89e30-89f3c）
+// 用微信原生 MMTipsViewController 展示灰色圆角解析面板。
 + (BOOL)showForContent:(NSString *)content user:(NSString *)user {
     if (!content.length) return NO;
 
     @try {
-        // 复刻 PKC 抖音面板：微信原生 MMTipsViewController（灰色圆角卡片）。
-        // 反汇编锚点：tipsTitle:Msg:Type:Hidden:CancelTitle:Data: Type==8（main_parser.asm:89e30-89f3c）
+        // 优先使用微信原生 MMTipsViewController
         Class tipsCls = objc_getClass("MMTipsViewController");
         if (!tipsCls) { DDDLog(@"DDPanel: MMTipsViewController 不存在，回退系统面板"); return NO; }
         if (![tipsCls instancesRespondToSelector:@selector(addButtonWithTitle:target:sel:)]) {
@@ -1018,22 +1009,17 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         MMTipsViewController *sheet = [[(id)tipsCls alloc] initWithTitle:@"抖音解析" content:content buttons:@[]];
         if (!sheet) { DDDLog(@"DDPanel: MMTipsViewController 初始化失败"); return NO; }
 
-        // 对齐 PKC：Type==8（抖音）分支【不调用 addTextViewWithMaxLen:】，内容经 message 纯展示 + 按钮，无输入框。
-        // 反汇编锚点：-[GXYeazddpmkzikglugu tipsTitle:Msg:Type:Hidden:CancelTitle:Data:] 8949c cmp w26,#0x8
-        //   → b.eq 0x89e30（Type==8 抖音分支：直接 addButtonWithTitle: dyzzfs:/dyjxfs:/dyjxyl:/dyjxlj:/dyjxzq:/dyjxSave: → show）
-        //   addTextViewWithMaxLen:0xbb8(89d54) 属于 Type==7 分支（msgAI/朋友圈），并非抖音面板。
-        // 故 content 由 initWithTitle:content:buttons: 的 content 参数展示（m_tipsContentLabel），不额外加输入框。
-        // （曾误加 addTextViewWithMaxLen:3000 + KVC textFieldDefaultText/tipsTextPlaceholder，
-        //   导致面板上多出一个可编辑 UITextView 输入框，已按 PKC 移除。）
+        // 抖音面板：内容经 content 参数纯展示（m_tipsContentLabel），不额外加输入框；
+        // 曾误加 addTextViewWithMaxLen: 导致面板上多出可编辑文本框，故此处不调用。
 
-        // 5 个操作按钮（对齐 PKC dyzzfs:/dyjxfs:/dyjxyl:/dyjxlj:/dyjxSave:；去掉解析转圈 dyjxzq:）
+        // 5 个操作按钮
         [sheet addButtonWithTitle:@"直接发送" target:target sel:@selector(onDirectSend:)];
         [sheet addButtonWithTitle:@"解析发送" target:target sel:@selector(onParseSend:)];
         [sheet addButtonWithTitle:@"解析预览" target:target sel:@selector(onParsePreview:)];
         [sheet addButtonWithTitle:@"解析链接" target:target sel:@selector(onParseLink:)];
         [sheet addButtonWithTitle:@"保存相册" target:target sel:@selector(onSaveAlbum:)];
 
-        // 取消（对齐 PKC addButtonWithCancelTitle:target:sel:；该方法是 PKC 私有 category，动态调用，缺则回退）
+        // 取消按钮（优先微信原生取消方法，缺则回退）
         if ([sheet respondsToSelector:@selector(addButtonWithCancelTitle:target:sel:)]) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wcast-function-type"
@@ -1053,7 +1039,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     }
 }
 
-// 直接发送（对齐 PKC dyzzfs:）
+// 直接发送
 + (void)handleDirectSend:(NSString *)content user:(NSString *)user {
     if (!content.length) return;
     if (!user.length) { DDPShowSystemTip(@"发送失败"); return; }
@@ -1061,7 +1047,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     DDPSendTextMsg(content, user);
 }
 
-// 解析发送（对齐 PKC pkcDyVideoJx:to:flag:type:，type=0 发视频）
+// 解析发送
 + (void)handleParseSend:(NSString *)url user:(NSString *)user force:(BOOL)force {
     DDDLog(@"handleParseSend: 开始 url=%@ user=%@", url, user);
     DDPShowSystemTip(@"抖音解析后台任务开始");
@@ -1131,8 +1117,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     });
 }
 
-// 生成视频缩略图（对齐 PKC generateThumbnailForVideo:，main_parser.asm:128727）：
-// AVAssetImageGenerator 取第 0.5s 帧 → JPEG 写临时目录 thumb_<UUID>.jpg → 返回路径
+// 生成视频缩略图：AVAssetImageGenerator 取第 0.5s 帧 → JPEG 写临时目录 thumb_<UUID>.jpg → 返回路径
 + (NSString *)generateThumbnailForVideoPath:(NSString *)path {
     if (!path.length) return nil;
     NSString *thumbPath = nil;
@@ -1142,13 +1127,13 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         if (!asset) return nil;
         AVAssetImageGenerator *gen = [AVAssetImageGenerator assetImageGeneratorWithAsset:asset];
         gen.appliesPreferredTrackTransform = YES;
-        // CMTimeMake(1,2) = 0.5s（对齐 PKC）
+        // CMTimeMake(1,2) = 0.5s
         CGImageRef cg = [gen copyCGImageAtTime:CMTimeMake(1, 2)
                                     actualTime:NULL error:NULL];
         if (!cg) return nil;
         UIImage *img = [UIImage imageWithCGImage:cg];
         CGImageRelease(cg);
-        NSData *jpg = UIImageJPEGRepresentation(img, 0.5);   // 对齐 PKC 压缩质量 0.5
+        NSData *jpg = UIImageJPEGRepresentation(img, 0.5);   // 压缩质量 0.5
         if (jpg.length) {
             thumbPath = [NSTemporaryDirectory()
                 stringByAppendingPathComponent:[NSString stringWithFormat:@"thumb_%@.jpg",
@@ -1163,12 +1148,8 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 }
 
 // 发视频消息（CMessageMgr AddVideoMsg:ToUsr:VideoInfo:）
-// 完整对齐 PKC sendVideo:videoPath:（main_parser.asm:129031）：
-//   主线程执行 → fileExistsAtPath: 检查 → 取码率(getVideoBitrateFromFilePath:)→
-//   生成缩略图(generateThumbnailForVideo:)→ 码率≥5Mbps(0x4c4b40)走 OpenApiMgrHelper.genCaptureVideoInfoWithVideoData:，
-//   <5Mbps 走 CaptureVideoInfo.genVideoInfoWithVideoUrl:thumb: → setThumb_path: →
-//   AddVideoMsg:[SettingUtil getLocalUsrName:0] ToUsr:target VideoInfo:info
-// 注意：AddVideoMsg: 第一个参数是【发送方】（本机 wxid），不是视频路径。
+// 流程：主线程 → 取码率 → 生成缩略图 → 按码率分支构造 VideoInfo（≥5Mbps 走 OpenApiMgrHelper，否则 CaptureVideoInfo）→ 发送。
+// 注意：AddVideoMsg: 第一个参数是【发送方】本机 wxid，不是视频路径（旧版误把路径当发送方导致无法播放）。
 + (void)sendVideoAtPath:(NSString *)path toUser:(NSString *)user {
     if (!path.length) return;
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1184,12 +1165,12 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         }
         id videoInfo = nil;
         @try {
-            // 1) 生成缩略图（对齐 PKC generateThumbnailForVideo:）
+            // 1) 生成缩略图
             NSString *thumbPath = [self generateThumbnailForVideoPath:path];
 
-            // 2) 取码率（对齐 PKC getVideoBitrateFromFilePath: → videoBitrate 字典 → longLongValue）
+            // 2) 取码率
             long long bitrate = 0;
-            Class pkcCls = objc_getClass("GXYeazddpmkzikglugu");   // 混淆类，暴露 getVideoBitrateFromFilePath:
+            Class pkcCls = objc_getClass("GXYeazddpmkzikglugu");   // 暴露 getVideoBitrateFromFilePath: 的私有类
             if (pkcCls && [pkcCls respondsToSelector:@selector(getVideoBitrateFromFilePath:)]) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
@@ -1200,14 +1181,14 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
                     if ([v respondsToSelector:@selector(longLongValue)]) bitrate = [v longLongValue];
                 }
             }
-            // 码率拿不到时按体积兜底：PKC 在码率为 0 时直接报错，但这里保留兜底避免私有方法失效导致完全不能发。
-            // 对齐 PKC 阈值 0x4c4b40 = 5,000,000 bps（5 Mbps）。
+            // 码率拿不到时按体积兜底：私有方法失效时仍可发送，避免完全不能发。
+            // 阈值 5,000,000 bps（5 Mbps）。
             if (bitrate == 0) {
                 NSNumber *sz = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil][NSFileSize];
                 if (sz.longLongValue > 5 * 1024 * 1024) bitrate = 5000000;   // >5MB 视为 ≥5Mbps
             }
 
-            // 3) 分支构造 VideoInfo（对齐 PKC：0x4c4b40 = 5,000,000 bps）
+            // 3) 分支构造 VideoInfo（阈值 5,000,000 bps）
             if (bitrate >= 5000000) {
                 // 高码率分支：OpenApiMgrHelper.genCaptureVideoInfoWithVideoData:mediaMessage:nil param:nil
                 Class ohCls = objc_getClass("OpenApiMgrHelper");
@@ -1248,10 +1229,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
             videoInfo = nil;
         }
         DDPShowSystemTip(@"解析成功，正在发送");
-        // 对齐 PKC sendVideo:videoPath:（main_parser.asm:80b74-80b84）：
-        // AddVideoMsg: 第一个参数是发送方（本机 wxid，[SettingUtil getLocalUsrName:0]）
-        // ToUsr: 第二个参数是接收方（chatName）
-        // VideoInfo: 第三个参数
+        // AddVideoMsg: 首参为发送方（本机 wxid），次参为接收方，三参为 VideoInfo。
         // 旧版误把视频路径 path 当发送方传入，导致消息无法播放。
         NSString *fromUsr = nil;
         Class setCls = objc_getClass("SettingUtil");
@@ -1267,7 +1245,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     });
 }
 
-// 发图片消息（CMessageMgr AddMsg:MsgWrap:；wrap 由 WeixinContentLogicController.FormImageMsg:withImage:withData: 构造，对齐 PKC sendImg:image:）
+// 发图片消息（CMessageMgr AddMsg:MsgWrap:；wrap 由 WeixinContentLogicController.FormImageMsg:withImage:withData: 构造）
 + (void)sendImageAtPath:(NSString *)path toUser:(NSString *)user {
     if (!path.length) return;
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1288,7 +1266,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         CMessageWrap *wrap = [ctrl FormImageMsg:chatName withImage:image withData:data];
         if (!wrap) { DDPShowSystemTip(@"发送失败"); return; }
 
-        // 写入原图扩展信息（对齐 PKC：m_extendInfoWithMsgType → setImage:withData:isOriginImage:YES）
+        // 写入原图扩展信息（m_extendInfoWithMsgType → setImage:withData:isOriginImage:YES）
         id<DDPMsgExtendOperation> ext = [wrap m_extendInfoWithMsgType];
         if (ext && [ext respondsToSelector:@selector(setImage:withData:isOriginImage:)]) {
             [ext setImage:image withData:data isOriginImage:YES];
@@ -1304,7 +1282,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     });
 }
 
-// 下载图片直链并逐张发进聊天（图文/滑块，纯本机官方直链；对齐 PKC sendImg:image:）
+// 下载图片直链并逐张发进聊天（图文/滑块，纯本机官方直链）
 + (void)sendImagesForURLs:(NSArray<NSString *> *)urls shareURL:(NSString *)shareURL user:(NSString *)user force:(BOOL)force {
     if (!urls.count) { DDPShowSystemTip(@"未找到图片"); return; }
     DDPShowSystemTip(@"抖音解析后台任务开始");
@@ -1364,7 +1342,6 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
                     }
                 });
             } else {
-                // 图文/滑块：下载到本地后直接观看（多图横向滑动 + 捏合缩放）
                 [DDPPanel downloadImagesLocally:imageURLs completion:^(NSArray<NSString *> *paths) {
                     if (!paths.count) { DDPShowSystemTip(@"下载失败"); return; }
                     [DDPPanel presentImageViewer:paths fromVC:vc];
@@ -1377,7 +1354,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     }];
 }
 
-// 视频预览：对齐 PKC pkcDyVideoJxYl —— 用微信自带 MMMoviePlayerController 播放本地 mp4 并 push 到导航栈
+// 视频预览：用微信自带 MMMoviePlayerController 播放本地 mp4 并 push 到导航栈
 + (void)playVideoAtPath:(NSString *)path fromVC:(UIViewController *)vc {
     if (!path.length || !vc) return;
     Class cls = objc_getClass("MMMoviePlayerController");
@@ -1425,8 +1402,8 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     [vc presentViewController:ivc animated:YES completion:nil];
 }
 
-// 解析链接（对齐 PKC dyjxlj:，type=1 以文本消息发送原始直链）
-// 视频→发 aweme 无水管直链；图文/滑块→发图片直链（每行一张）
+// 解析链接：把提取到的直链以文本消息发出
+// 视频→发无水印直链；图文/滑块→发图片直链（每行一张）
 + (void)handleParseLink:(NSString *)url user:(NSString *)user {
     DDPShowSystemTip(@"抖音解析后台任务开始");
     [[DDPEngine shared] parseDouyinURL:url completion:^(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err) {
@@ -1505,8 +1482,8 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     }];
 }
 
-// 保存到相册（图片，图文/滑块）——对齐 PKC saveImageToPhotoAlbum:（main_parser.asm:ebd48-ebd78）
-// PKC：imageWithData: 转 UIImage → requestAuthorization: → block 里 creationRequestForAssetFromImage:(UIImage) + setCreationDate:[NSDate date]
+// 保存到相册（图片，图文/滑块）
+// 流程：imageWithData: 转 UIImage → 请求相册授权 → 在变更块里 creationRequestForAssetFromImage: + 写入创建时间
 + (void)saveImageToAlbumAtPath:(NSString *)path {
     if (!path.length) return;
     UIImage *image = [UIImage imageWithContentsOfFile:path];
@@ -1518,7 +1495,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         }
         [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
             PHAssetCreationRequest *req = [PHAssetCreationRequest creationRequestForAssetFromImage:image];
-            req.creationDate = [NSDate date];   // 对齐 PKC：写入创建时间为当前时间
+            req.creationDate = [NSDate date];   // 写入创建时间为当前时间
         } completionHandler:^(BOOL success, NSError *error) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (success) DDPShowSystemTip(@"已保存到相册");
@@ -1540,42 +1517,42 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     return instance;
 }
 
-// 直接发送（对齐 PKC dyzzfs:）
+// 直接发送
 - (void)onDirectSend:(id)sender {
     [DDPPanel handleDirectSend:self.content user:self.user];
 }
 
-// 解析发送（对齐 PKC dyjxfs:）
+// 解析发送
 - (void)onParseSend:(id)sender {
     NSString *url = DDPExtractURL(self.content);
     if (url.length) [DDPPanel handleParseSend:url user:self.user force:NO];
 }
 
-// 解析预览（对齐 PKC dyjxyl:）
+// 解析预览
 - (void)onParsePreview:(id)sender {
     NSString *url = DDPExtractURL(self.content);
     if (url.length) [DDPPanel handleParsePreview:url fromVC:self.topVC];
 }
 
-// 解析链接（对齐 PKC dyjxlj:）
+// 解析链接
 - (void)onParseLink:(id)sender {
     NSString *url = DDPExtractURL(self.content);
     if (url.length) [DDPPanel handleParseLink:url user:self.user];
 }
 
-// 保存相册（对齐 PKC dyjxSave:）
+// 保存相册
 - (void)onSaveAlbum:(id)sender {
     NSString *url = DDPExtractURL(self.content);
     if (url.length) [DDPPanel handleSaveAlbum:url];
 }
 
-// 取消（对齐 PKC getTipsCancel:；MMTipsViewController 取消按钮点击后自会关闭，无需额外动作）
+// 取消（MMTipsViewController 取消按钮点击后自会关闭，无需额外动作）
 - (void)onCancel:(id)sender {
 }
 
 @end
 
-#pragma mark - Hook：长按菜单（canShowForwardMenuItem 存消息 + setMenuItems 加项）
+#pragma mark - Hook：长按菜单
 
 // 当前长按消息（供菜单回调）
 static __weak CMessageWrap *gDDPCurrentMsgWrap;
@@ -1700,10 +1677,8 @@ static __weak CMessageWrap *gDDPCurrentMsgWrap;
 
 #pragma mark - Hook：CMessageMgr AddMsg（弹面板的真正入口）
 
-// 对齐 PKC CMessageMgr AddMsg:MsgWrap: hook：
-//   1. 仅处理自己发出的消息；2. 文本(type 1)/链接卡片(49)/其他(62)；
-//   3. 三串抖音检测 + 排除"正在直播"，命中弹面板并拦截（不调 %orig）；
-//   4. 「直接发送」先置 pkcDyTcEnable 重发，入口见该标志即一次性放行。
+// 弹面板真正入口：仅处理自己发出的消息，命中抖音链接则弹面板并拦截（不调 %orig）；
+// 「直接发送」先置 gDDPDyTcEnable，入口见该标志即一次性放行。
 %hook CMessageMgr
 
 - (void)AddMsg:(NSString *)usr MsgWrap:(CMessageWrap *)wrap {
@@ -1724,7 +1699,7 @@ static __weak CMessageWrap *gDDPCurrentMsgWrap;
         unsigned int ddMT = wrap.m_uiMessageType;
         if (ddMT != 1 && ddMT != 49 && ddMT != 62) break;
 
-        // 一次性放行标志（pkcDyTcEnable）：入口闸门前读取并复位，再判抖音（复位须在检测前，否则会残留）
+        // 一次性放行标志：入口闸门前读取并复位，再判抖音（复位须在检测前，否则会残留）
         BOOL bypassOnce = gDDPDyTcEnable;
         gDDPDyTcEnable = NO;
         if (bypassOnce) {
@@ -1908,7 +1883,7 @@ static __weak CMessageWrap *gDDPCurrentMsgWrap;
         [zoom addSubview:iv];
         zoom.contentSize = CGSizeMake(w, h);
         [self.pager addSubview:zoom];
-        // 单击关闭 / 双击放大（对齐 PKCShowImgVC handleDoubleTap:）
+        // 单击关闭 / 双击放大
         UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(dismissSelf)];
         tap.numberOfTapsRequired = 1;
         UITapGestureRecognizer *dtap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(onDoubleTap:)];
@@ -1918,7 +1893,7 @@ static __weak CMessageWrap *gDDPCurrentMsgWrap;
         [zoom addGestureRecognizer:dtap];
     }
 
-    // 关闭按钮（右上，对齐 PKCShowImgVC closeView）
+    // 关闭按钮（右上）
     UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
     [close setTitle:@"关闭" forState:UIControlStateNormal];
     [close setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
@@ -1926,7 +1901,7 @@ static __weak CMessageWrap *gDDPCurrentMsgWrap;
     [close addTarget:self action:@selector(dismissSelf) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:close];
 
-    // 保存到相册按钮（左上，对齐 PKCShowImgVC saveImageToCameraRoll:）
+    // 保存到相册按钮（左上）
     UIButton *save = [UIButton buttonWithType:UIButtonTypeSystem];
     [save setTitle:@"保存" forState:UIControlStateNormal];
     [save setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
@@ -1961,14 +1936,14 @@ static __weak CMessageWrap *gDDPCurrentMsgWrap;
     return scrollView.subviews.firstObject;
 }
 
-// 双击放大/还原（对齐 PKCShowImgVC handleDoubleTap:）
+// 双击放大/还原
 - (void)onDoubleTap:(UITapGestureRecognizer *)gesture {
     UIScrollView *zoom = (UIScrollView *)gesture.view;
     CGFloat scale = (zoom.zoomScale > 1.0) ? 1.0 : 2.0;
     [zoom setZoomScale:scale animated:YES];
 }
 
-// 保存当前图片到相册（对齐 PKCShowImgVC saveImageToCameraRoll:）
+// 保存当前图片到相册
 - (void)onSaveCurrent {
     if (self.currentIndex < 0 || self.currentIndex >= self.imagePaths.count) return;
     [DDPPanel saveImageToAlbumAtPath:self.imagePaths[self.currentIndex]];
