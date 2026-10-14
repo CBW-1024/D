@@ -5,7 +5,7 @@
 //   1. 在聊天中识别抖音分享链接（消息发送时触发）
 //   2. 用隐藏的 WKWebView 抓取官方分享页 HTML（不注入脚本，仅渲染后取 outerHTML）
 //   3. 正则提取去水印直链（视频 / 图文图集 / 幻灯片）
-//   4. 弹面板让用户「发送 / 预览 / 保存」（微信原生 MMTipsViewController）
+//   4. 弹面板让用户「发送 / 预览 / 保存」（微信原生 WCActionSheet）
 //
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -79,8 +79,6 @@
 
 @interface BaseMsgContentLogicController : NSObject
 - (instancetype)init;
-- (void)SendTextMessage:(NSString *)text;
-- (NSString *)getCurrentChatName;
 - (CMessageWrap *)FormImageMsg:(NSString *)arg1 withImage:(UIImage *)arg2 withData:(NSData *)arg3;
 @end
 
@@ -111,15 +109,9 @@
 - (id<DDPMsgExtendOperation>)m_extendInfoWithMsgType;
 @end
 
-@interface CContactMgr : NSObject
-- (id)getSelfContact;
-@end
-
 @interface CUtility : NSObject  // 微信 UA（GetMMUserAgent）
 + (NSString *)GetMMUserAgent;
 @end
-
-// 面板用微信原生 MMTipsViewController（灰色圆角卡片）
 
 // 微信头文件里 MMMenuItem 直接继承 NSObject（不是 UIMenuItem），且没有 title 的 getter，
 // 所以识别菜单项一律走 userInfo 打标记，不要读 title（会 unrecognized selector）。参考 DD语音包。
@@ -133,16 +125,11 @@
 // 注入菜单项（参考 DD语音包 ddvp_inject_item：svg 图标 + 标题，一级平铺项）。已注入则跳过。
 static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSString *title, NSString *svgName, SEL action, long long menuType);
 
-// 微信原生提示面板（用于展示解析结果卡片）
-@interface MMTipsViewController : UIViewController
-- (instancetype)initWithTitle:(NSString *)title content:(NSString *)content buttons:(NSArray *)buttons;  // MMTipsViewController.h:150
-- (void)addTextViewWithMaxLen:(unsigned int)maxLen;                                                       // MMTipsViewController.h:129
-- (void)addButtonWithTitle:(NSString *)title target:(id)target sel:(SEL)sel;                              // MMTipsViewController.h:135
-- (void)addCancelButtonWithTitle:(NSString *)title handler:(void (^)(void))handler;                       // MMTipsViewController.h:132
-- (void)show;                                                                                             // MMTipsViewController.h:121
-@property (copy, nonatomic) NSString *textFieldDefaultText;   // MMTipsViewController.h:65（KVC 读写）
-@property (copy, nonatomic) NSString *tipsTextPlaceholder;    // MMTipsViewController.h:66
-@property (retain, nonatomic) id m_userData;                  // MMTipsViewController.h:67
+// 面板用微信原生 WCActionSheet（底部弹出动作面板）
+@interface WCActionSheet : NSObject
+- (instancetype)initWithTitle:(NSString *)title cancelButtonTitle:(NSString *)cancelTitle;
+- (long long)addButtonWithTitle:(NSString *)title eventAction:(void (^)(void))action;
+- (void)showInView:(UIView *)view;
 @end
 
 // 微信自带视频播放器（用于播放本地 mp4）
@@ -169,22 +156,6 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
 @property (nonatomic, strong) UIPageControl *pageCtl;
 @property (nonatomic, assign) NSInteger currentIndex;
 @end
-
-// 面板按钮适配器：MMTipsViewController 按钮回调只需「实例 + 单参 sel」，
-// 这里用单例持有当前 content/user/topVC，把按钮 sel 分发到 DDPPanel 对应类方法。
-@interface DDPPanelTarget : NSObject
-+ (instancetype)shared;
-@property (nonatomic, copy) NSString *content;
-@property (nonatomic, copy) NSString *user;
-@property (nonatomic, weak) UIViewController *topVC;
-- (void)onDirectSend:(id)sender;
-- (void)onParseSend:(id)sender;
-- (void)onParsePreview:(id)sender;
-- (void)onParseLink:(id)sender;
-- (void)onSaveAlbum:(id)sender;
-- (void)onCancel:(id)sender;   // 取消（面板自带关闭）
-@end
-
 
 #pragma mark - 文件日志
 
@@ -437,7 +408,6 @@ static inline void DDPCopyToPasteboard(NSString *text) {
     UIPasteboard.generalPasteboard.string = text;
 }
 
-
 // 解析过程提示：参考 DD语音包的方形 WeToast 三态（转圈 / ✓ / 错误）。
 // loading 与结果提示共用同一控件，出结果前必须先收起 loading。
 static WeToast *gDDPBusyToast = nil;   // 进行中的 loading，出结果时收起
@@ -491,7 +461,6 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重试 3 次（配�
 @property (nonatomic, assign) NSUInteger lastCleanLen;      // 上一轮 HTML 长度（空转检测）
 @property (nonatomic, copy) void (^completion)(NSString *html, NSInteger errCode);
 - (void)fetchHTMLFromURL:(NSString *)url completion:(void (^)(NSString *html, NSInteger errCode))completion;
-- (void)cleanupWebView;
 - (void)ddFinishWithHTML:(NSString *)html code:(NSInteger)code;   // 统一收尾（仅触发一次）
 + (instancetype)sharedFetcher;
 @end
@@ -540,8 +509,6 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重试 3 次（配�
 
 // 开始抓取
 - (void)fetchHTMLFromURL:(NSString *)url completion:(void (^)(NSString *html, NSInteger errCode))completion {
-    DDDLog(@"fetchHTMLFromURL: 开始 url=%@ webView=%p delegate=%@ keyWindow=%@",
-           url, _webView, _webView.navigationDelegate ? @"Y" : @"N", DDPKeyWindow() ? @"Y" : @"N");
     self.completion = completion;
     self.hasCompleted = NO;
 
@@ -562,8 +529,6 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重试 3 次（配�
         if (completion) completion(nil, -1);
         return;
     }
-    _webView.hidden = YES;
-
     self.ddpRequest = request;
     self.retries = 0;
     self.lastCleanLen = 0;
@@ -610,7 +575,6 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重试 3 次（配�
     self.hasCompleted = YES;
     if (self.completion) self.completion(html, code);
     self.retries = 0;
-    [self cleanupWebView];
 }
 
 - (void)handleRenderedHTML:(NSString *)html {
@@ -657,10 +621,6 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重试 3 次（配�
     }
     DDDLog(@"[DDPWebFetcher] 重试%ld次仍未命中 playwm url=%@", (long)DDPMaxRetries, self.ddpRequest.URL);
     [self ddFinishWithHTML:nil code:500];
-}
-
-- (void)cleanupWebView {
-    _webView.hidden = YES;
 }
 
 - (WKWebView *)webView {
@@ -883,30 +843,26 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 
 @implementation DDPPanel
 
-// 用微信原生 MMTipsViewController 展示灰色圆角解析面板。
+// 用微信原生 WCActionSheet 展示解析选项（底部动作面板，按钮回调走 block）
 + (BOOL)showForContent:(NSString *)content user:(NSString *)user {
     if (!content.length) return NO;
+    NSString *url = DDPExtractURL(content);
+    if (!url.length) return NO;
 
     UIViewController *top = DDPKeyWindow().rootViewController;
     while (top.presentedViewController) top = top.presentedViewController;
     if (!top) return NO;
 
-    DDPPanelTarget *target = [DDPPanelTarget shared];
-    target.content = content;
-    target.user = user;
-    target.topVC = top;
-
-    MMTipsViewController *sheet = [[%c(MMTipsViewController) alloc] initWithTitle:@"抖音解析" content:content buttons:@[]];
+    WCActionSheet *sheet = [[%c(WCActionSheet) alloc] initWithTitle:@"抖音解析" cancelButtonTitle:@"取消"];
     if (!sheet) return NO;
 
-    [sheet addButtonWithTitle:@"直接发送" target:target sel:@selector(onDirectSend:)];
-    [sheet addButtonWithTitle:@"解析发送" target:target sel:@selector(onParseSend:)];
-    [sheet addButtonWithTitle:@"解析预览" target:target sel:@selector(onParsePreview:)];
-    [sheet addButtonWithTitle:@"解析链接" target:target sel:@selector(onParseLink:)];
-    [sheet addButtonWithTitle:@"保存相册" target:target sel:@selector(onSaveAlbum:)];
-    [sheet addCancelButtonWithTitle:@"取消" handler:nil];
+    [sheet addButtonWithTitle:@"直接发送" eventAction:^{ [DDPPanel handleDirectSend:content user:user]; }];
+    [sheet addButtonWithTitle:@"解析发送" eventAction:^{ [DDPPanel handleParseSend:url user:user]; }];
+    [sheet addButtonWithTitle:@"解析预览" eventAction:^{ [DDPPanel handleParsePreview:url fromVC:top]; }];
+    [sheet addButtonWithTitle:@"解析链接" eventAction:^{ [DDPPanel handleParseLink:url user:user]; }];
+    [sheet addButtonWithTitle:@"保存相册" eventAction:^{ [DDPPanel handleSaveAlbum:url]; }];
 
-    [sheet show];
+    [sheet showInView:DDPKeyWindow()];
     return YES;
 }
 
@@ -1240,51 +1196,6 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 
 @end
 
-// DDPPanelTarget 实现：单参 sel 分发给 DDPPanel 多参类方法
-@implementation DDPPanelTarget
-
-+ (instancetype)shared {
-    static DDPPanelTarget *instance;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ instance = [[self alloc] init]; });
-    return instance;
-}
-
-// 直接发送
-- (void)onDirectSend:(id)sender {
-    [DDPPanel handleDirectSend:self.content user:self.user];
-}
-
-// 解析发送
-- (void)onParseSend:(id)sender {
-    NSString *url = DDPExtractURL(self.content);
-    if (url.length) [DDPPanel handleParseSend:url user:self.user];
-}
-
-// 解析预览
-- (void)onParsePreview:(id)sender {
-    NSString *url = DDPExtractURL(self.content);
-    if (url.length) [DDPPanel handleParsePreview:url fromVC:self.topVC];
-}
-
-// 解析链接
-- (void)onParseLink:(id)sender {
-    NSString *url = DDPExtractURL(self.content);
-    if (url.length) [DDPPanel handleParseLink:url user:self.user];
-}
-
-// 保存相册
-- (void)onSaveAlbum:(id)sender {
-    NSString *url = DDPExtractURL(self.content);
-    if (url.length) [DDPPanel handleSaveAlbum:url];
-}
-
-// 取消（MMTipsViewController 取消按钮点击后自会关闭，无需额外动作）
-- (void)onCancel:(id)sender {
-}
-
-@end
-
 #pragma mark - Hook：长按菜单「解析 / 预览」（参考 DD语音包：hook 单元格 operationMenuItems）
 
 // 从 cell 取当前消息内容（type 1 用 m_nsContent，否则 m_nsTitle）
@@ -1614,16 +1525,9 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     [self presentViewController:avc animated:YES completion:nil];
 }
 
-// 清空日志（二次确认）
+// 清空日志
 - (void)onClearLog:(id)sender {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"清空日志"
-                                                                   message:@"确定要清空 DDDParse.log 吗？"
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"清空" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a){
-        DDDClearLog();
-    }]];
-    [self presentViewController:alert animated:YES completion:nil];
+    DDDClearLog();
 }
 
 @end
