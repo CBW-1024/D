@@ -142,12 +142,12 @@ static inline void DDDClearLog(void) {
 - (void)setImage:(UIImage *)arg1 withData:(NSData *)arg2 isOriginImage:(BOOL)arg3;
 @end
 
-// CMessageWrap 扩展：通过 WeixinContentLogicController 生成图片消息
+// CMessageWrap 扩展：通过 BaseMsgContentLogicController 生成图片消息
 @interface CMessageWrap (DDP)
 - (id<DDPMsgExtendOperation>)m_extendInfoWithMsgType;
 @end
 
-@interface WeixinContentLogicController : NSObject
+@interface BaseMsgContentLogicController : NSObject
 - (instancetype)init;
 - (CMessageWrap *)FormImageMsg:(NSString *)arg1 withImage:(UIImage *)arg2 withData:(NSData *)arg3;
 @end
@@ -433,11 +433,11 @@ static inline void DDPCopyToPasteboard(NSString *text) {
 }
 
 // 轻量提示气泡：纯文字药丸，屏幕顶部居中，2 秒后淡出，跟随系统深浅模式
-static inline void DDPShowPKCTip(NSString *msg) {
+static inline void DDPShowToast(NSString *msg) {
     if (!msg.length) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         UIWindow *win = DDPKeyWindow();
-        if (!win) { DDDLog(@"DDPShowPKCTip: 无 keyWindow"); return; }
+        if (!win) { DDDLog(@"DDPShowToast: 无 keyWindow"); return; }
 
         // 文字尺寸
         UILabel *textLbl = [[UILabel alloc] init];
@@ -502,13 +502,13 @@ static inline void DDPShowPKCTip(NSString *msg) {
             }];
         });
 
-        DDDLog(@"DDPShowPKCTip: msg=%@", msg);
+        DDDLog(@"DDPShowToast: msg=%@", msg);
     });
 }
 
 // 系统提示（统一走药丸提示）
 static inline void DDPShowSystemTip(NSString *msg) {
-    DDPShowPKCTip(msg);
+    DDPShowToast(msg);
 }
 
 #pragma mark - 解析抓取（WKWebView 渲染）
@@ -926,10 +926,8 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         gDDPDyTcEnable = NO;
 
         Class wrapCls = objc_getClass("CMessageWrap");
-        Class mgrCls  = objc_getClass("CMessageMgr");
-        Class ctxCls  = objc_getClass("MMContext");
         Class setCls  = objc_getClass("SettingUtil");
-        if (!wrapCls || !mgrCls || !ctxCls) { DDPShowSystemTip(@"发送失败"); return; }
+        if (!wrapCls) { DDPShowSystemTip(@"发送失败"); return; }
 
         CMessageWrap *wrap = [[wrapCls alloc] initWithMsgType:1];
         if (!wrap) { DDPShowSystemTip(@"发送失败"); return; }
@@ -941,15 +939,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         wrap.m_nsContent    = content;
         wrap.m_uiCreateTime = (unsigned int)[[NSDate date] timeIntervalSince1970];
 
-        CMessageMgr *mgr = nil;
-        if ([ctxCls respondsToSelector:@selector(activeUserContext)]) {
-            id ctx = [ctxCls activeUserContext];
-            if ([ctx respondsToSelector:@selector(getService:)]) mgr = [ctx getService:mgrCls];
-        }
-        if (!mgr && [ctxCls respondsToSelector:@selector(currentContext)]) {
-            MMContext *ctx = [ctxCls currentContext];
-            mgr = [ctx.serviceCenter getService:mgrCls];
-        }
+        CMessageMgr *mgr = DDPMessageMgr();
         if (!mgr) { DDPShowSystemTip(@"发送失败"); return; }
 
         gDDPDyTcEnable = YES;                                // 一次性放行，避免重发被拦截
@@ -1170,11 +1160,11 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 
             // 2) 取码率
             long long bitrate = 0;
-            Class pkcCls = objc_getClass("GXYeazddpmkzikglugu");   // 暴露 getVideoBitrateFromFilePath: 的私有类
-            if (pkcCls && [pkcCls respondsToSelector:@selector(getVideoBitrateFromFilePath:)]) {
+            Class bitrateCls = objc_getClass("GXYeazddpmkzikglugu");   // 暴露 getVideoBitrateFromFilePath: 的私有类
+            if (bitrateCls && [bitrateCls respondsToSelector:@selector(getVideoBitrateFromFilePath:)]) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                id bd = [pkcCls performSelector:@selector(getVideoBitrateFromFilePath:) withObject:path];
+                id bd = [bitrateCls performSelector:@selector(getVideoBitrateFromFilePath:) withObject:path];
 #pragma clang diagnostic pop
                 if ([bd respondsToSelector:@selector(objectForKeyedSubscript:)]) {
                     id v = [bd objectForKeyedSubscript:@"videoBitrate"];
@@ -1245,7 +1235,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     });
 }
 
-// 发图片消息（CMessageMgr AddMsg:MsgWrap:；wrap 由 WeixinContentLogicController.FormImageMsg:withImage:withData: 构造）
+// 发图片消息（CMessageMgr AddMsg:MsgWrap:；wrap 由 BaseMsgContentLogicController.FormImageMsg:withImage:withData: 构造）
 + (void)sendImageAtPath:(NSString *)path toUser:(NSString *)user {
     if (!path.length) return;
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1257,7 +1247,9 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         NSData *data = UIImagePNGRepresentation(image);
         if (!data.length) { DDPShowSystemTip(@"发送失败"); return; }
 
-        Class ctrlCls = objc_getClass("WeixinContentLogicController");
+        // 8.0.79 头文件中 FormImageMsg:withImage:withData: 仅声明于 BaseMsgContentLogicController 及其兄弟类，
+        // WeixinContentLogicController 本身未声明该方法，用错类会使图片发送始终失败。
+        Class ctrlCls = objc_getClass("BaseMsgContentLogicController");
         if (!ctrlCls) { DDPShowSystemTip(@"发送失败"); return; }
         id ctrl = [[ctrlCls alloc] init];
         if (!ctrl || ![ctrl respondsToSelector:@selector(FormImageMsg:withImage:withData:)]) {
@@ -1560,8 +1552,8 @@ static __weak CMessageWrap *gDDPCurrentMsgWrap;
 // 菜单回调单例
 @interface DDPMenuHandler : NSObject
 + (instancetype)shared;
-- (void)onPkcDyVideoJx:(id)sender;    // 解析发送
-- (void)onPkcDyVideoJxYl:(id)sender;  // 解析预览
+- (void)onDouyinParse:(id)sender;    // 解析发送
+- (void)onDouyinPreview:(id)sender;  // 解析预览
 @end
 
 @implementation DDPMenuHandler
@@ -1580,23 +1572,23 @@ static __weak CMessageWrap *gDDPCurrentMsgWrap;
     return (wrap.m_uiMessageType == 1) ? wrap.m_nsContent : wrap.m_nsTitle;
 }
 
-- (void)onPkcDyVideoJx:(id)sender {
+- (void)onDouyinParse:(id)sender {
     if (!DDPConfig.shared.enabled) return;
     @try {
         NSString *content = [DDPMenuHandler currentContent];
-        if (!content.length) { DDDLog(@"onPkcDyVideoJx: content 为空（长按消息未保存？）"); return; }
+        if (!content.length) { DDDLog(@"onDouyinParse: content 为空（长按消息未保存？）"); return; }
         NSString *url = DDPExtractURL(content);
-        if (!url.length) { DDDLog(@"onPkcDyVideoJx: 未提取到 URL content=%@", content); DDPShowSystemTip(@"未提取到链接"); return; }
+        if (!url.length) { DDDLog(@"onDouyinParse: 未提取到 URL content=%@", content); DDPShowSystemTip(@"未提取到链接"); return; }
         NSString *chat = DDPCurrentChatName();
-        DDDLog(@"onPkcDyVideoJx: 解析发送 url=%@ chat=%@", url, chat);
+        DDDLog(@"onDouyinParse: 解析发送 url=%@ chat=%@", url, chat);
         [DDPPanel handleParseSend:url user:chat force:NO];   // 解析发送（to 取当前会话）
     } @catch (NSException *e) {
-        DDDLog(@"onPkcDyVideoJx 异常 %@", e);
+        DDDLog(@"onDouyinParse 异常 %@", e);
         DDPShowSystemTip(@"解析失败");
     }
 }
 
-- (void)onPkcDyVideoJxYl:(id)sender {
+- (void)onDouyinPreview:(id)sender {
     if (!DDPConfig.shared.enabled) return;
     @try {
         NSString *content = [DDPMenuHandler currentContent];
@@ -1609,7 +1601,7 @@ static __weak CMessageWrap *gDDPCurrentMsgWrap;
         while (topVC.presentedViewController) topVC = topVC.presentedViewController;
         if (topVC) [DDPPanel handleParsePreview:url fromVC:topVC];
     } @catch (NSException *e) {
-        DDDLog(@"onPkcDyVideoJxYl 异常 %@", e);
+        DDDLog(@"onDouyinPreview 异常 %@", e);
         DDPShowSystemTip(@"解析失败");
     }
 }
@@ -1662,11 +1654,11 @@ static __weak CMessageWrap *gDDPCurrentMsgWrap;
     id target = [DDPMenuHandler shared];
 
     id parseItem = [itemCls alloc];
-    parseItem = [parseItem initWithTitle:@"解析" svgName:@"icons_filled_heart" target:target action:@selector(onPkcDyVideoJx:)];
+    parseItem = [parseItem initWithTitle:@"解析" svgName:@"icons_filled_heart" target:target action:@selector(onDouyinParse:)];
     if (parseItem) [items addObject:parseItem];
 
     id previewItem = [itemCls alloc];
-    previewItem = [previewItem initWithTitle:@"预览" svgName:@"icons_filled_heart" target:target action:@selector(onPkcDyVideoJxYl:)];
+    previewItem = [previewItem initWithTitle:@"预览" svgName:@"icons_filled_heart" target:target action:@selector(onDouyinPreview:)];
     if (previewItem) [items addObject:previewItem];
 
     DDDLog(@"setMenuItems: 已追加解析/预览，当前元素数=%lu", (unsigned long)[items count]);
