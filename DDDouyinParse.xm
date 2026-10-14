@@ -237,13 +237,9 @@ static inline BOOL DDPIsDouyinLiveText(NSString *text) {
     return text.length && [text containsString:@"正在直播"];
 }
 
-// 发送方判定：优先 isSenderFromMsgWrap:，缺失则比对本机 wxid，仍不定按已发送（保证面板能弹）
+// 发送方判定：微信原生类方法（CMessageWrap.h:19）
 static BOOL DDPIsOutgoing(CMessageWrap *wrap) {
-    if ([%c(CMessageWrap) isSenderFromMsgWrap:wrap]) return YES;
-    NSString *me = [%c(SettingUtil) getLocalUsrName:0];
-    NSString *from = wrap.m_nsFromUsr;
-    if (me.length && from.length) return [from isEqualToString:me];
-    return YES;
+    return [%c(CMessageWrap) isSenderFromMsgWrap:wrap];
 }
 
 // 正则提取链接中的 URL
@@ -259,7 +255,9 @@ static inline NSString *DDPExtractURL(NSString *text) {
     return [text substringWithRange:match.range];
 }
 
-// 去水印：/playwm/ → /play/ 并统一 ratio=1080p
+// 去水印：/playwm/ → /play/，清晰度固定 720p
+// 实测：抖音 play 接口可用档位只有 1080p(≈25.3MB) / 720p(≈21.6MB) / 540p(≈15.0MB)；
+// 480p、360p 不被支持（会返回 1080p），不带 ratio 时默认也是 720p。
 static inline NSString *DDPRemoveWatermark(NSString *url) {
     if (!url.length) return nil;
     NSString *clean = [url stringByReplacingOccurrencesOfString:@"/playwm/" withString:@"/play/"];
@@ -267,7 +265,7 @@ static inline NSString *DDPRemoveWatermark(NSString *url) {
                                                                           options:0
                                                                             error:nil];
     if (re) {
-        clean = [re stringByReplacingMatchesInString:clean options:0 range:NSMakeRange(0, clean.length) withTemplate:@"ratio=1080p"];
+        clean = [re stringByReplacingMatchesInString:clean options:0 range:NSMakeRange(0, clean.length) withTemplate:@"ratio=720p"];
     }
     return clean;
 }
@@ -382,11 +380,6 @@ static inline BOOL DDPFileUsable(NSString *path) {
     if (![fm fileExistsAtPath:path]) return NO;
     NSDictionary *attr = [fm attributesOfItemAtPath:path error:nil];
     return attr.fileSize > 2;
-}
-
-static inline void DDPCopyToPasteboard(NSString *text) {
-    if (!text.length) return;
-    UIPasteboard.generalPasteboard.string = text;
 }
 
 // 解析过程提示：参考 DD语音包的方形 WeToast 三态（转圈 / ✓ / 错误）。
@@ -1097,7 +1090,6 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
                 ? videoURL
                 : [imageURLs componentsJoinedByString:@"\n"];
             if (!link.length) return;
-            DDPCopyToPasteboard(link);
             NSString *target = user.length ? user : DDPCurrentChatName();
             if (target.length) DDPSendTextMsg(link, target);   // 原始直链以文本消息发出
         });
