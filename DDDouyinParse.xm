@@ -207,7 +207,8 @@ static inline void DDDClearLog(void) {
 
 #pragma mark - 配置
 
-static NSString * const kDDPEnabledKey = @"DDDouyinParseEnabled";
+static NSString * const kDDPEnabledKey   = @"DDDouyinParseEnabled";
+static NSString * const kDDPWebFetchKey   = @"DDDouyinParseWebFetch";
 
 @interface DDPConfig : NSObject
 @property (nonatomic, assign) BOOL enabled;
@@ -234,8 +235,14 @@ static NSString * const kDDPEnabledKey = @"DDDouyinParseEnabled";
         } else {
             _enabled = [ud boolForKey:kDDPEnabledKey];
         }
-        _webFetchEnable = YES;   // 抖音页面需 JS 渲染
-        DDDLog(@"DDPConfig init enabled=%d", _enabled);
+        // 网页渲染解析：持久化读取，默认开启（抖音页面需 JS 渲染）
+        if ([ud objectForKey:kDDPWebFetchKey] == nil) {
+            _webFetchEnable = YES;
+            [ud setBool:YES forKey:kDDPWebFetchKey];
+        } else {
+            _webFetchEnable = [ud boolForKey:kDDPWebFetchKey];
+        }
+        DDDLog(@"DDPConfig init enabled=%d webFetchEnable=%d", _enabled, _webFetchEnable);
     }
     return self;
 }
@@ -243,6 +250,11 @@ static NSString * const kDDPEnabledKey = @"DDDouyinParseEnabled";
 - (void)setEnabled:(BOOL)enabled {
     _enabled = enabled;
     [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDPEnabledKey];
+}
+
+- (void)setWebFetchEnable:(BOOL)webFetchEnable {
+    _webFetchEnable = webFetchEnable;
+    [[NSUserDefaults standardUserDefaults] setBool:webFetchEnable forKey:kDDPWebFetchKey];
 }
 
 @end
@@ -1770,10 +1782,18 @@ static __weak CMessageWrap *gDDPCurrentMsgWrap;
     if (!_tableViewMgr) return;
     [self buildTable];
     UITableView *tableView = [self.tableViewMgr getTableView];
-    tableView.frame = self.view.bounds;
-    tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
+    self.view.backgroundColor = tableView.backgroundColor;
+    tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
     [self.view addSubview:tableView];
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    CGFloat top = self.view.safeAreaInsets.top;
+    UITableView *tableView = [self.tableViewMgr getTableView];
+    CGFloat w = self.view.bounds.size.width;
+    CGFloat h = self.view.bounds.size.height;
+    tableView.frame = CGRectMake(0, top, w, h - top);
 }
 
 - (void)buildTable {
@@ -1781,12 +1801,19 @@ static __weak CMessageWrap *gDDPCurrentMsgWrap;
     Class secCls  = objc_getClass("WCTableViewSectionManager");
     if (!cellCls || !secCls || !_tableViewMgr) return;
     [self.tableViewMgr clearAllSection];
+
+    // 解析设置分组：总开关 + 子项（总开关开启时展开，对齐 DDAdBlock）
     WCTableViewSectionManager *section = [secCls defaultSection];
-    [section addCell:[cellCls switchCellForSel:@selector(onEnabledSwitch:) target:self title:@"抖音解析" on:DDPConfig.shared.enabled]];
+    section.headerTitle = @"解析设置";
+    [section addCell:[self switchCellWithTitle:@"启用抖音解析" on:DDPConfig.shared.enabled action:@selector(onEnabledSwitch:)]];
+    if (DDPConfig.shared.enabled) {
+        [section addCell:[self switchCellWithTitle:@"网页渲染解析" on:DDPConfig.shared.webFetchEnable action:@selector(onWebFetchSwitch:)]];
+    }
     [self.tableViewMgr addSection:section];
 
-    // 日志分组
+    // 日志分组（与总开关无关）
     WCTableViewSectionManager *logSection = [secCls defaultSection];
+    logSection.headerTitle = @"日志";
     if ([cellCls respondsToSelector:@selector(normalCellForSel:target:title:)]) {
         [logSection addCell:[cellCls normalCellForSel:@selector(onExportLog:) target:self title:@"导出日志"]];
         [logSection addCell:[cellCls normalCellForSel:@selector(onClearLog:) target:self title:@"清空日志"]];
@@ -1795,7 +1822,13 @@ static __weak CMessageWrap *gDDPCurrentMsgWrap;
     [self.tableViewMgr reloadTableView];
 }
 
-- (void)onEnabledSwitch:(UISwitch *)sender { DDPConfig.shared.enabled = sender.isOn; [self buildTable]; }
+- (id)switchCellWithTitle:(NSString *)title on:(BOOL)on action:(SEL)action {
+    Class cellCls = objc_getClass("WCTableViewCellManager");
+    return [cellCls switchCellForSel:action target:self title:title on:on];
+}
+
+- (void)onEnabledSwitch:(UISwitch *)sender   { DDPConfig.shared.enabled = sender.isOn; [self buildTable]; }
+- (void)onWebFetchSwitch:(UISwitch *)sender  { DDPConfig.shared.webFetchEnable = sender.isOn; }
 
 // 导出日志（另存 txt 分享）
 - (void)onExportLog:(id)sender {
