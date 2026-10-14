@@ -43,6 +43,7 @@
 @interface WCTableViewSectionManager : NSObject
 + (id)defaultSection;
 - (void)addCell:(id)arg1;
+@property (nonatomic, copy) NSString *headerTitle;   // 头文件 37/65 行有 getter/setter
 @end
 
 @interface WCTableViewCellManager : NSObject
@@ -562,7 +563,7 @@ static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次
     self.retries = 0;
     self.lastCleanLen = 0;
     self.fetchStart = CFAbsoluteTimeGetCurrent();
-    DDDLog(@"[DDPWebFetcher] 开始解析 url=%@ (webFetch=%d)", request.URL.absoluteString, webFetch);
+    DDDLog(@"[DDPWebFetcher] 开始解析 url=%@", request.URL.absoluteString);
     // 首次加载，未命中 playwm 则重试
     dispatch_async(dispatch_get_main_queue(), ^{
         [self.webView loadRequest:request];
@@ -827,7 +828,7 @@ static BOOL gDDPDyTcEnable;
 static CMessageMgr *DDPMessageMgr(void) {
     MMContext *ctx = [MMContext activeUserContext];
     if (ctx) return [ctx getService:[CMessageMgr class]];
-    return [[MMContext currentContext].serviceCenter getService:[CMessageMgr class]];
+    return [[(MMContext *)[MMContext currentContext] serviceCenter] getService:[CMessageMgr class]];
 }
 
 // 取当前会话名（遍历 VC 响应 getCurrentChatName）
@@ -862,8 +863,9 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         wrap.m_uiStatus    = 4;
         wrap.m_nsContent   = content;
         wrap.m_uiCreateTime = (unsigned int)[[NSDate date] timeIntervalSince1970];
+        CMessageMgr *mgr = DDPMessageMgr();
         gDDPDyTcEnable = YES;                                  // 一次性放行，避免重发被拦截
-        [[DDPMessageMgr()] AddMsg:user MsgWrap:wrap];
+        [mgr AddMsg:user MsgWrap:wrap];
     });
 }
 
@@ -1052,7 +1054,8 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         id<DDPMsgExtendOperation> ext = [wrap m_extendInfoWithMsgType];
         [ext setImage:image withData:data isOriginImage:YES];
 
-        [[DDPMessageMgr()] AddMsg:chatName MsgWrap:wrap];   // 图片 type=3，不会命中抖音面板拦截
+        CMessageMgr *mgr = DDPMessageMgr();
+        [mgr AddMsg:chatName MsgWrap:wrap];   // 图片 type=3，不会命中抖音面板拦截
     });
 }
 
@@ -1359,7 +1362,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     if (!DDPConfig.shared.enabled) return;
     NSString *url = DDPExtractURL(ddp_cellContent(self));
     if (!url.length) return;
-    UIResponder *responder = self;
+    UIResponder *responder = (UIResponder *)self;
     while ((responder = [responder nextResponder])) {
         if ([responder isKindOfClass:[UIViewController class]]) {
             [DDPPanel handleParsePreview:url fromVC:(UIViewController *)responder];
