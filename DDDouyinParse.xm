@@ -11,13 +11,8 @@
 #import <Foundation/Foundation.h>
 #import <WebKit/WebKit.h>
 #import <Photos/Photos.h>
-#import <objc/runtime.h>
-#import <objc/message.h>
-#import <CommonCrypto/CommonCrypto.h>
-#import <AVKit/AVKit.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreGraphics/CoreGraphics.h>
-#import <unistd.h>
 #import <string.h>
 
 #pragma mark - 微信私有类声明（仅声明插件用到的方法）
@@ -120,21 +115,17 @@
 
 // 面板用微信原生 MMTipsViewController（灰色圆角卡片）
 
-@interface MMMenuController : NSObject  // 长按菜单控制器（hook setMenuItems: 追加项）
-+ (instancetype)sharedMenuController;
-- (void)setMenuItems:(id)menuItems;
-@end
-
-@interface MMMenuItem : NSObject  // 长按菜单项（NSObject 子类，无 title getter，靠 userInfo 标记）
-- (instancetype)initWithTitle:(NSString *)title svgName:(NSString *)svgName target:(id)target action:(SEL)action;
-@property (nonatomic, weak) id target;
+// 微信头文件里 MMMenuItem 直接继承 NSObject（不是 UIMenuItem），且没有 title 的 getter，
+// 所以识别菜单项一律走 userInfo 打标记，不要读 title（会 unrecognized selector）。参考 DD语音包。
+@interface MMMenuItem : NSObject
 @property (nonatomic, retain) id userInfo;
+- (instancetype)initWithTitle:(NSString *)title svgName:(NSString *)svgName target:(id)target action:(SEL)action;
 // 菜单项 ID：initWithTitle: 创建默认 0，须设唯一值，否则与其他插件注入项撞车被微信去重
 - (void)setMenuType:(long long)type;
 @end
 
-// 注入菜单项工具：userInfo 去重 + menuType 唯一 ID 防撞（参考 DD语音包做法）
-static NSArray *ddp_inject_item(NSArray *original, NSString *title, NSString *svgName, SEL action, long long menuType);
+// 注入菜单项（参考 DD语音包 ddvp_inject_item：svg 图标 + 标题，一级平铺项）。已注入则跳过。
+static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSString *title, NSString *svgName, SEL action, long long menuType);
 
 // 微信原生提示面板（用于展示解析结果卡片）
 @interface MMTipsViewController : UIViewController
@@ -151,6 +142,16 @@ static NSArray *ddp_inject_item(NSArray *original, NSString *title, NSString *sv
 // 微信自带视频播放器（用于播放本地 mp4）
 @interface MMMoviePlayerController : UIViewController
 - (instancetype)initWithMsgWrap:(id)arg1 VideoPath:(NSString *)arg2;
+@end
+
+// 视频信息构造（8.0.79 私有类，头文件已确认）
+@interface OpenApiMgrHelper : NSObject
++ (id)genCaptureVideoInfoWithVideoData:(id)videoData mediaMessage:(id)mediaMessage param:(id)param;
+@end
+
+@interface CaptureVideoInfo : NSObject
++ (id)genVideoInfoWithVideoUrl:(id)url thumb:(id)thumb;
+- (void)setThumb_path:(id)path;
 @end
 
 #pragma mark - 插件内部类声明
@@ -187,30 +188,24 @@ static inline NSString *DDDLogPath(void) {
 }
 static void DDDWriteLog(NSString *msg) {
     if (!msg.length) return;
-    @try {
-        NSString *path = DDDLogPath();
-        NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], msg];
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-        if (!fh) {
-            [line writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
-            fh = [NSFileHandle fileHandleForWritingAtPath:path];
-        }
-        if (fh) { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
-    } @catch (...) {}
+    NSString *path = DDDLogPath();
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], msg];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!fh) {
+        [line writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
+        fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    }
+    if (fh) { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
 }
 static inline NSString *DDDReadLog(void) {
-    @try {
-        NSString *path = DDDLogPath();
-        if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return nil;
-        return [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
-    } @catch (...) { return nil; }
+    NSString *path = DDDLogPath();
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return nil;
+    return [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
 }
 static inline void DDDClearLog(void) {
-    @try {
-        NSString *path = DDDLogPath();
-        if ([[NSFileManager defaultManager] fileExistsAtPath:path])
-            [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
-    } @catch (...) {}
+    NSString *path = DDDLogPath();
+    if ([[NSFileManager defaultManager] fileExistsAtPath:path])
+        [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
 }
 // 诊断日志（前缀 [DDDParse]，同时落盘）
 #define DDDLog(fmt, ...) do { NSString *__ddds = [NSString stringWithFormat:fmt, ##__VA_ARGS__]; NSLog(@"[DDDParse] %@", __ddds); DDDWriteLog(__ddds); } while (0)
@@ -286,19 +281,10 @@ static inline BOOL DDPIsDouyinLiveText(NSString *text) {
 
 // 发送方判定：优先 isSenderFromMsgWrap:，缺失则比对本机 wxid，仍不定按已发送（保证面板能弹）
 static BOOL DDPIsOutgoing(CMessageWrap *wrap) {
-    Class wrapCls = objc_getClass("CMessageWrap");
-    if (wrapCls && [wrapCls respondsToSelector:@selector(isSenderFromMsgWrap:)]) {
-        @try { return (BOOL)[wrapCls isSenderFromMsgWrap:wrap]; } @catch (...) {}
-    }
-    Class setCls = objc_getClass("SettingUtil");
-    NSString *me = nil;
-    if (setCls && [setCls respondsToSelector:@selector(getLocalUsrName:)]) {
-        @try { me = [setCls getLocalUsrName:0]; } @catch (...) {}
-    }
-    NSString *from = nil;
-    @try { from = wrap.m_nsFromUsr; } @catch (...) {}
+    if ([CMessageWrap isSenderFromMsgWrap:wrap]) return YES;
+    NSString *me = [SettingUtil getLocalUsrName:0];
+    NSString *from = wrap.m_nsFromUsr;
     if (me.length && from.length) return [from isEqualToString:me];
-    DDDLog(@"DDPIsOutgoing: 无法判定发送方，按“已发送”处理（wrap=%p from=%@）", wrap, from);
     return YES;
 }
 
@@ -451,7 +437,7 @@ static inline void DDPCopyToPasteboard(NSString *text) {
 static WeToast *gDDPBusyToast = nil;   // 进行中的 loading，出结果时收起
 
 static WeToast *DDPToast(void) {
-    return [NSClassFromString(@"WeToast") toast];
+    return [WeToast toast];
 }
 
 // 同时只保留一个 loading 实例；起新的前先收掉旧的，否则上一个转圈会永远停在屏幕上
@@ -527,17 +513,12 @@ static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次
         // 不注入脚本，纯渲染后取 outerHTML
         _webView = [[WKWebView alloc] initWithFrame:CGRectZero configuration:config];
 
-        // 设微信 UA（CUtility GetMMUserAgent），让抖音返回含 playwm 的页面
-        NSString *ua = nil;
-        Class cUtil = NSClassFromString(@"CUtility");
-        if (cUtil && [cUtil respondsToSelector:@selector(GetMMUserAgent)]) {
-            ua = [cUtil GetMMUserAgent];
-        }
+        // 微信 UA（CUtility GetMMUserAgent），让抖音返回含 playwm 的页面
+        NSString *ua = [CUtility GetMMUserAgent];
         if (!ua.length) {
             ua = @"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.40(0x18004025) NetType/WIFI Language/zh_CN";
         }
-        DDDLog(@"DDPWebFetcher: 设置 UA=%@", ua);
-        if (ua.length) _webView.customUserAgent = ua;
+        _webView.customUserAgent = ua;
 
         _webView.navigationDelegate = self;
 
@@ -570,16 +551,10 @@ static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次
                                              cachePolicy:NSURLRequestUseProtocolCachePolicy
                                          timeoutInterval:30.0];
 
-    // 按配置决定是否走 WKWebView
-    BOOL webFetch = DDPConfig.shared.webFetchEnable;
-
-    if (webFetch && !_webView.navigationDelegate) {
-        _webView.navigationDelegate = self;
-        UIWindow *keyWindow = DDPKeyWindow();
-        if (keyWindow) {
-            [keyWindow addSubview:_webView];
-            _webView.frame = keyWindow.bounds;
-        }
+    // 网页渲染解析开关：关闭则不抓取（抖音页面需 JS 渲染，无替代路径）
+    if (!DDPConfig.shared.webFetchEnable) {
+        if (completion) completion(nil, -1);
+        return;
     }
     _webView.hidden = YES;
 
@@ -604,12 +579,7 @@ static const NSInteger DDPMaxRetries = 11;         // 最多重试 11 次
     dispatch_after(delay, dispatch_get_main_queue(), ^{
         [webView evaluateJavaScript:@"document.documentElement.outerHTML" completionHandler:^(id result, NSError *error) {
             if (error) { DDDLog(@"DDPWebFetcher: evalJS 失败 %@", error); [wself ddFinishWithHTML:nil code:-2]; return; }
-            @try {
-                [wself handleRenderedHTML:(result ? [NSString stringWithFormat:@"%@", result] : @"")];
-            } @catch (NSException *e) {
-                DDDLog(@"DDPWebFetcher: handleRenderedHTML 异常 %@", e);
-                [wself ddFinishWithHTML:nil code:-2];
-            }
+            [wself handleRenderedHTML:(result ? [NSString stringWithFormat:@"%@", result] : @"")];
         }];
     });
 }
@@ -781,26 +751,21 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
         DDDLog(@"parseDouyinURL 回调: htmlLen=%lu errCode=%ld 线程=%@",
                (unsigned long)(html ? html.length : 0), (long)errCode,
                [NSThread isMainThread] ? @"main" : @"bg");
-        @try {
-            if (!html.length) {
-                if (completion) completion(DDPMediaTypeUnknown, nil, nil, [NSError errorWithDomain:@"DDP" code:-2 userInfo:nil]);
-                return;
-            }
-            NSArray *videos = [sself extractVideoLinksFromHTML:html];
-            if (videos.count) {
-                if (completion) completion(DDPMediaTypeVideo, videos.firstObject, nil, nil);
-                return;
-            }
-            NSArray *images = [sself extractGalleryImagesFromHTML:html];
-            if (images.count) {
-                if (completion) completion(DDPMediaTypeImage, nil, images, nil);
-                return;
-            }
-            if (completion) completion(DDPMediaTypeUnknown, nil, nil, [NSError errorWithDomain:@"DDP" code:-3 userInfo:nil]);
-        } @catch (NSException *e) {
-            DDDLog(@"parseDouyinURL 异常 %@", e);
-            if (completion) completion(DDPMediaTypeUnknown, nil, nil, [NSError errorWithDomain:@"DDP" code:-5 userInfo:nil]);
+        if (!html.length) {
+            if (completion) completion(DDPMediaTypeUnknown, nil, nil, [NSError errorWithDomain:@"DDP" code:-2 userInfo:nil]);
+            return;
         }
+        NSArray *videos = [sself extractVideoLinksFromHTML:html];
+        if (videos.count) {
+            if (completion) completion(DDPMediaTypeVideo, videos.firstObject, nil, nil);
+            return;
+        }
+        NSArray *images = [sself extractGalleryImagesFromHTML:html];
+        if (images.count) {
+            if (completion) completion(DDPMediaTypeImage, nil, images, nil);
+            return;
+        }
+        if (completion) completion(DDPMediaTypeUnknown, nil, nil, [NSError errorWithDomain:@"DDP" code:-3 userInfo:nil]);
     }];
 }
 
@@ -832,11 +797,7 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
     [request setValue:@"*/*" forHTTPHeaderField:@"Accept"];
 
     // 微信 UA（CUtility GetMMUserAgent）
-    NSString *ua = nil;
-    Class cUtil = NSClassFromString(@"CUtility");
-    if (cUtil && [cUtil respondsToSelector:@selector(GetMMUserAgent)]) {
-        ua = [cUtil GetMMUserAgent];
-    }
+    NSString *ua = [CUtility GetMMUserAgent];
     [request setValue:(ua.length ? ua : @"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15") forHTTPHeaderField:@"User-Agent"];
 
     NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
@@ -864,21 +825,9 @@ static BOOL gDDPDyTcEnable;
 
 // 取 CMessageMgr（优先 activeUserContext）
 static CMessageMgr *DDPMessageMgr(void) {
-    Class ctxCls = objc_getClass("MMContext");
-    Class mgrCls = objc_getClass("CMessageMgr");
-    if (!ctxCls || !mgrCls) return nil;
-    if ([ctxCls respondsToSelector:@selector(activeUserContext)]) {
-        id ctx = [ctxCls activeUserContext];
-        if ([ctx respondsToSelector:@selector(getService:)]) {
-            CMessageMgr *mgr = [ctx getService:mgrCls];
-            if (mgr) return mgr;
-        }
-    }
-    if ([ctxCls respondsToSelector:@selector(currentContext)]) {
-        MMContext *ctx = [ctxCls currentContext];
-        return [ctx.serviceCenter getService:mgrCls];
-    }
-    return nil;
+    MMContext *ctx = [MMContext activeUserContext];
+    if (ctx) return [ctx getService:[CMessageMgr class]];
+    return [[MMContext currentContext].serviceCenter getService:[CMessageMgr class]];
 }
 
 // 取当前会话名（遍历 VC 响应 getCurrentChatName）
@@ -891,10 +840,10 @@ static NSString *DDPCurrentChatName(void) {
     while (stack.count) {
         UIViewController *cur = stack.firstObject;
         [stack removeObjectAtIndex:0];
-        // 不依赖具体类名，响应即命中（iOS18 类名变化也能命中）
+        // 命中聊天控制器即取其会话名（respondsToSelector 确认后再强转调用）
         if ([cur respondsToSelector:@selector(getCurrentChatName)]) {
-            NSString *name = (NSString *)[cur performSelector:@selector(getCurrentChatName)];
-            if ([name isKindOfClass:NSString.class] && name.length) return name;
+            NSString *name = [(BaseMsgContentViewController *)cur getCurrentChatName];
+            if (name.length) return name;
         }
         if (cur.childViewControllers.count) [stack addObjectsFromArray:cur.childViewControllers];
         if (cur.presentedViewController) [stack addObject:cur.presentedViewController];
@@ -906,26 +855,15 @@ static NSString *DDPCurrentChatName(void) {
 static void DDPSendTextMsg(NSString *content, NSString *user) {
     if (!content.length || !user.length) return;
     dispatch_async(dispatch_get_main_queue(), ^{
-        // 先清标志，仅 AddMsg 前一行打开，避免失败路径残留
         gDDPDyTcEnable = NO;
-
-        Class wrapCls = objc_getClass("CMessageWrap");
-        Class setCls  = objc_getClass("SettingUtil");
-
-        CMessageWrap *wrap = [[wrapCls alloc] initWithMsgType:1];
-        if (setCls && [setCls respondsToSelector:@selector(getLocalUsrName:)]) {
-            wrap.m_nsFromUsr = [setCls getLocalUsrName:0];   // 取本机 wxid
-        }
-        wrap.m_nsToUsr      = user;
-        wrap.m_uiStatus     = 4;                             // m_uiStatus = 4
-        wrap.m_nsContent    = content;
+        CMessageWrap *wrap = [[CMessageWrap alloc] initWithMsgType:1];
+        wrap.m_nsFromUsr   = [SettingUtil getLocalUsrName:0];   // 本机 wxid
+        wrap.m_nsToUsr     = user;
+        wrap.m_uiStatus    = 4;
+        wrap.m_nsContent   = content;
         wrap.m_uiCreateTime = (unsigned int)[[NSDate date] timeIntervalSince1970];
-
-        CMessageMgr *mgr = DDPMessageMgr();
-
-        gDDPDyTcEnable = YES;                                // 一次性放行，避免重发被拦截
-        [mgr AddMsg:user MsgWrap:wrap];
-        DDDLog(@"DDPSendTextMsg: 已发送 user=%@ len=%lu", user, (unsigned long)content.length);
+        gDDPDyTcEnable = YES;                                  // 一次性放行，避免重发被拦截
+        [[DDPMessageMgr()] AddMsg:user MsgWrap:wrap];
     });
 }
 
@@ -956,58 +894,27 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 + (BOOL)showForContent:(NSString *)content user:(NSString *)user {
     if (!content.length) return NO;
 
-    @try {
-        // 优先使用微信原生 MMTipsViewController
-        Class tipsCls = objc_getClass("MMTipsViewController");
-        if (!tipsCls) { DDDLog(@"DDPanel: MMTipsViewController 不存在，回退系统面板"); return NO; }
-        if (![tipsCls instancesRespondToSelector:@selector(addButtonWithTitle:target:sel:)]) {
-            DDDLog(@"DDPanel: MMTipsViewController 缺方法，回退系统面板"); return NO;
-        }
+    UIViewController *top = DDPKeyWindow().rootViewController;
+    while (top.presentedViewController) top = top.presentedViewController;
+    if (!top) return NO;
 
-        UIWindow *window = DDPKeyWindow();
-        UIViewController *top = window.rootViewController;
-        while (top.presentedViewController) top = top.presentedViewController;
-        if (!top) { DDDLog(@"DDPanel: 找不到顶层 VC"); return NO; }
+    DDPPanelTarget *target = [DDPPanelTarget shared];
+    target.content = content;
+    target.user = user;
+    target.topVC = top;
 
-        // 适配器持有当前 content/user/topVC，按钮 sel 分发给 DDPPanel 类方法
-        DDPPanelTarget *target = [DDPPanelTarget shared];
-        target.content = content;
-        target.user = user;
-        target.topVC = top;
+    MMTipsViewController *sheet = [[MMTipsViewController alloc] initWithTitle:@"抖音解析" content:content buttons:@[]];
+    if (!sheet) return NO;
 
-        // buttons 传空数组（后续手动 addButtonWithTitle），避免 nil 数组在 VC 内部被 count 崩溃。
-        // tipsCls 是 Class（objc_getClass 返回），alloc 需强转 id 以消除 "no known class method" 警告。
-        MMTipsViewController *sheet = [[(id)tipsCls alloc] initWithTitle:@"抖音解析" content:content buttons:@[]];
-        if (!sheet) { DDDLog(@"DDPanel: MMTipsViewController 初始化失败"); return NO; }
+    [sheet addButtonWithTitle:@"直接发送" target:target sel:@selector(onDirectSend:)];
+    [sheet addButtonWithTitle:@"解析发送" target:target sel:@selector(onParseSend:)];
+    [sheet addButtonWithTitle:@"解析预览" target:target sel:@selector(onParsePreview:)];
+    [sheet addButtonWithTitle:@"解析链接" target:target sel:@selector(onParseLink:)];
+    [sheet addButtonWithTitle:@"保存相册" target:target sel:@selector(onSaveAlbum:)];
+    [sheet addCancelButtonWithTitle:@"取消" handler:nil];
 
-        // 抖音面板：内容经 content 参数纯展示（m_tipsContentLabel），不额外加输入框；
-        // 曾误加 addTextViewWithMaxLen: 导致面板上多出可编辑文本框，故此处不调用。
-
-        // 5 个操作按钮
-        [sheet addButtonWithTitle:@"直接发送" target:target sel:@selector(onDirectSend:)];
-        [sheet addButtonWithTitle:@"解析发送" target:target sel:@selector(onParseSend:)];
-        [sheet addButtonWithTitle:@"解析预览" target:target sel:@selector(onParsePreview:)];
-        [sheet addButtonWithTitle:@"解析链接" target:target sel:@selector(onParseLink:)];
-        [sheet addButtonWithTitle:@"保存相册" target:target sel:@selector(onSaveAlbum:)];
-
-        // 取消按钮（优先微信原生取消方法，缺则回退）
-        if ([sheet respondsToSelector:@selector(addButtonWithCancelTitle:target:sel:)]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wcast-function-type"
-            ((void(*)(id, SEL, id, id, SEL))objc_msgSend)(sheet,
-                @selector(addButtonWithCancelTitle:target:sel:), @"取消", target, @selector(onCancel:));
-#pragma clang diagnostic pop
-        } else if ([sheet respondsToSelector:@selector(addCancelButtonWithTitle:handler:)]) {
-            [sheet addCancelButtonWithTitle:@"取消" handler:nil];
-        }
-
-        [sheet show];
-        DDDLog(@"DDPanel: MMTipsViewController 面板已 show user=%@", user);
-        return YES;
-    } @catch (NSException *e) {
-        DDDLog(@"DDPanel: 异常 %@", e);
-        return NO;
-    }
+    [sheet show];
+    return YES;
 }
 
 // 直接发送
@@ -1019,25 +926,18 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 
 // 解析发送
 + (void)handleParseSend:(NSString *)url user:(NSString *)user force:(BOOL)force {
-    DDDLog(@"handleParseSend: 开始 url=%@ user=%@", url, user);
     DDPShowLoading(@"正在解析…");
     [[DDPEngine shared] parseDouyinURL:url completion:^(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err) {
-        @try {
-            if (err || type == DDPMediaTypeUnknown) {
-                DDDLog(@"handleParseSend: 解析失败 url=%@ err=%@", url, err);
-                DDPShowError(@"解析失败");
-                return;
-            }
-            // 转圈延续到下载完成：解析成功后不收起 loading，下载+发送结束再弹最终对勾
-            void (^finish)(void) = ^{ DDPShowDone(@"解析成功"); };
-            if (type == DDPMediaTypeVideo) {
-                [self sendVideoForURL:videoURL shareURL:url user:user force:force finish:finish];
-            } else {
-                [self sendImagesForURLs:imageURLs shareURL:url user:user force:force finish:finish];   // 图文/滑块：下载直链逐张发进聊天
-            }
-        } @catch (NSException *e) {
-            DDDLog(@"handleParseSend 异常 %@", e);
-            dispatch_async(dispatch_get_main_queue(), ^{ DDPHideLoading(); });
+        if (err || type == DDPMediaTypeUnknown) {
+            DDPShowError(@"解析失败");
+            return;
+        }
+        // 转圈延续到下载完成：解析成功后不收起 loading，下载+发送结束再弹最终对勾
+        void (^finish)(void) = ^{ DDPShowDone(@"解析成功"); };
+        if (type == DDPMediaTypeVideo) {
+            [self sendVideoForURL:videoURL shareURL:url user:user force:force finish:finish];
+        } else {
+            [self sendImagesForURLs:imageURLs shareURL:url user:user force:force finish:finish];   // 图文/滑块：下载直链逐张发进聊天
         }
     }];
 }
@@ -1087,30 +987,17 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 // 生成视频缩略图：AVAssetImageGenerator 取第 0.5s 帧 → JPEG 写临时目录 thumb_<UUID>.jpg → 返回路径
 + (NSString *)generateThumbnailForVideoPath:(NSString *)path {
     if (!path.length) return nil;
-    NSString *thumbPath = nil;
-    @try {
-        NSURL *videoURL = [NSURL fileURLWithPath:path];
-        AVAsset *asset = [AVAsset assetWithURL:videoURL];
-        if (!asset) return nil;
-        AVAssetImageGenerator *gen = [AVAssetImageGenerator assetImageGeneratorWithAsset:asset];
-        gen.appliesPreferredTrackTransform = YES;
-        // CMTimeMake(1,2) = 0.5s
-        CGImageRef cg = [gen copyCGImageAtTime:CMTimeMake(1, 2)
-                                    actualTime:NULL error:NULL];
-        if (!cg) return nil;
-        UIImage *img = [UIImage imageWithCGImage:cg];
-        CGImageRelease(cg);
-        NSData *jpg = UIImageJPEGRepresentation(img, 0.5);   // 压缩质量 0.5
-        if (jpg.length) {
-            thumbPath = [NSTemporaryDirectory()
-                stringByAppendingPathComponent:[NSString stringWithFormat:@"thumb_%@.jpg",
-                                                [[NSUUID UUID] UUIDString]]];
-            [jpg writeToFile:thumbPath atomically:YES];
-        }
-    } @catch (NSException *e) {
-        DDDLog(@"generateThumbnail 异常 %@", e);
-        return nil;
-    }
+    AVAssetImageGenerator *gen = [AVAssetImageGenerator assetImageGeneratorWithAsset:[AVAsset assetWithURL:[NSURL fileURLWithPath:path]]];
+    gen.appliesPreferredTrackTransform = YES;
+    // CMTimeMake(1,2) = 0.5s
+    CGImageRef cg = [gen copyCGImageAtTime:CMTimeMake(1, 2) actualTime:NULL error:NULL];
+    if (!cg) return nil;
+    NSData *jpg = UIImageJPEGRepresentation([UIImage imageWithCGImage:cg], 0.5);   // 压缩质量 0.5
+    CGImageRelease(cg);
+    if (!jpg.length) return nil;
+    NSString *thumbPath = [NSTemporaryDirectory()
+        stringByAppendingPathComponent:[NSString stringWithFormat:@"thumb_%@.jpg", [[NSUUID UUID] UUIDString]]];
+    [jpg writeToFile:thumbPath atomically:YES];
     return thumbPath;
 }
 
@@ -1121,85 +1008,28 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     if (!path.length) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         NSString *chatName = user.length ? user : DDPCurrentChatName();
-        if (!chatName.length) { return; }
-        CMessageMgr *msgMgr = DDPMessageMgr();
-        id videoInfo = nil;
-        @try {
-            // 1) 生成缩略图
-            NSString *thumbPath = [self generateThumbnailForVideoPath:path];
+        if (!chatName.length) return;
 
-            // 2) 取码率
-            long long bitrate = 0;
-            Class bitrateCls = objc_getClass("GXYeazddpmkzikglugu");   // 暴露 getVideoBitrateFromFilePath: 的私有类
-            if (bitrateCls && [bitrateCls respondsToSelector:@selector(getVideoBitrateFromFilePath:)]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                id bd = [bitrateCls performSelector:@selector(getVideoBitrateFromFilePath:) withObject:path];
-#pragma clang diagnostic pop
-                if ([bd respondsToSelector:@selector(objectForKeyedSubscript:)]) {
-                    id v = [bd objectForKeyedSubscript:@"videoBitrate"];
-                    if ([v respondsToSelector:@selector(longLongValue)]) bitrate = [v longLongValue];
-                }
-            }
-            // 码率拿不到时按体积兜底：私有方法失效时仍可发送，避免完全不能发。
-            // 阈值 5,000,000 bps（5 Mbps）。
-            if (bitrate == 0) {
-                NSNumber *sz = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil][NSFileSize];
-                if (sz.longLongValue > 5 * 1024 * 1024) bitrate = 5000000;   // >5MB 视为 ≥5Mbps
-            }
+        NSString *thumbPath = [self generateThumbnailForVideoPath:path];
+        // 码率按体积估算：>5MB 视为高码率（阈值 5 Mbps）
+        NSNumber *sz = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil][NSFileSize];
+        BOOL high = sz.longLongValue > 5 * 1024 * 1024;
 
-            // 3) 分支构造 VideoInfo（阈值 5,000,000 bps）
-            if (bitrate >= 5000000) {
-                // 高码率分支：OpenApiMgrHelper.genCaptureVideoInfoWithVideoData:mediaMessage:nil param:nil
-                Class ohCls = objc_getClass("OpenApiMgrHelper");
-                if (ohCls && [ohCls respondsToSelector:@selector(genCaptureVideoInfoWithVideoData:mediaMessage:param:)]) {
-                    // 动态调用（3 参私有方法，performSelector 最多 2 参，用 objc_msgSend 可变参）
-                    NSData *videoData = [NSData dataWithContentsOfFile:path];
-                    if (videoData) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wcast-function-type"
-                        videoInfo = ((id(*)(id, SEL, id, id, id))objc_msgSend)(
-                            (id)ohCls,
-                            @selector(genCaptureVideoInfoWithVideoData:mediaMessage:param:),
-                            videoData, nil, nil);
-#pragma clang diagnostic pop
-                    }
-                }
-            } else {
-                // 低码率分支：CaptureVideoInfo.genVideoInfoWithVideoUrl:thumb: + setThumb_path:
-                Class capCls = objc_getClass("CaptureVideoInfo");
-                if (capCls && [capCls respondsToSelector:@selector(genVideoInfoWithVideoUrl:thumb:)]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                    videoInfo = [capCls performSelector:@selector(genVideoInfoWithVideoUrl:thumb:)
-                                             withObject:[NSURL fileURLWithPath:path]
-                                             withObject:thumbPath];
-#pragma clang diagnostic pop
-                    if (videoInfo && thumbPath && [videoInfo respondsToSelector:@selector(setThumb_path:)]) {
-                        // 动态调用（id 类型，编译器不认私有 setter，走 performSelector 一参版本）
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                        [videoInfo performSelector:@selector(setThumb_path:) withObject:thumbPath];
-#pragma clang diagnostic pop
-                    }
-                }
-            }
-        } @catch (NSException *e) {
-            DDDLog(@"构造 VideoInfo 异常 %@", e);
-            videoInfo = nil;
+        id videoInfo;
+        if (high) {
+            // 高码率：OpenApiMgrHelper.genCaptureVideoInfoWithVideoData:mediaMessage:param:
+            NSData *videoData = [NSData dataWithContentsOfFile:path];
+            videoInfo = videoData ? [OpenApiMgrHelper genCaptureVideoInfoWithVideoData:videoData mediaMessage:nil param:nil] : nil;
+        } else {
+            // 低码率：CaptureVideoInfo.genVideoInfoWithVideoUrl:thumb: + setThumb_path:
+            videoInfo = [CaptureVideoInfo genVideoInfoWithVideoUrl:[NSURL fileURLWithPath:path] thumb:thumbPath];
+            if (thumbPath) [videoInfo setThumb_path:thumbPath];
         }
+        if (!videoInfo) return;
+
         // AddVideoMsg: 首参为发送方（本机 wxid），次参为接收方，三参为 VideoInfo。
-        // 旧版误把视频路径 path 当发送方传入，导致消息无法播放。
-        NSString *fromUsr = nil;
-        Class setCls = objc_getClass("SettingUtil");
-        if (setCls && [setCls respondsToSelector:@selector(getLocalUsrName:)]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-            fromUsr = [setCls getLocalUsrName:0];
-#pragma clang diagnostic pop
-        }
-        if (!videoInfo) { return; }
-        [msgMgr AddVideoMsg:fromUsr ToUsr:chatName VideoInfo:videoInfo];
+        CMessageMgr *msgMgr = DDPMessageMgr();
+        [msgMgr AddVideoMsg:[SettingUtil getLocalUsrName:0] ToUsr:chatName VideoInfo:videoInfo];
     });
 }
 
@@ -1208,27 +1038,21 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     if (!path.length) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         NSString *chatName = user.length ? user : DDPCurrentChatName();
-        if (!chatName.length) { return; }
+        if (!chatName.length) return;
 
         UIImage *image = [UIImage imageWithContentsOfFile:path];
-        if (!image) { return; }
+        if (!image) return;
         NSData *data = UIImagePNGRepresentation(image);
-        if (!data.length) { return; }
+        if (!data.length) return;
 
-        // 8.0.79 头文件中 FormImageMsg:withImage:withData: 仅声明于 BaseMsgContentLogicController 及其兄弟类，
-        // WeixinContentLogicController 本身未声明该方法，用错类会使图片发送始终失败。
-        Class ctrlCls = objc_getClass("BaseMsgContentLogicController");
-        id ctrl = [[ctrlCls alloc] init];
+        BaseMsgContentLogicController *ctrl = [[BaseMsgContentLogicController alloc] init];
         CMessageWrap *wrap = [ctrl FormImageMsg:chatName withImage:image withData:data];
 
         // 写入原图扩展信息（m_extendInfoWithMsgType → setImage:withData:isOriginImage:YES）
         id<DDPMsgExtendOperation> ext = [wrap m_extendInfoWithMsgType];
-        if (ext && [ext respondsToSelector:@selector(setImage:withData:isOriginImage:)]) {
-            [ext setImage:image withData:data isOriginImage:YES];
-        }
+        [ext setImage:image withData:data isOriginImage:YES];
 
-        CMessageMgr *mgr = DDPMessageMgr();
-        [mgr AddMsg:chatName MsgWrap:wrap];   // 图片 type=3，不会命中抖音面板拦截
+        [[DDPMessageMgr()] AddMsg:chatName MsgWrap:wrap];   // 图片 type=3，不会命中抖音面板拦截
     });
 }
 
@@ -1258,44 +1082,39 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     });
 }
 
-// 解析预览：视频→AVPlayer 播放；图文/滑块→下载存相册后查看
+// 解析预览：视频→MMMoviePlayerController 播放；图文/滑块→下载存相册后查看
 + (void)handleParsePreview:(NSString *)url fromVC:(UIViewController *)vc {
     DDPShowLoading(@"正在解析…");
     [[DDPEngine shared] parseDouyinURL:url completion:^(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err) {
-        @try {
-            if (err || type == DDPMediaTypeUnknown) {
-                DDPShowError(@"解析失败");
+        if (err || type == DDPMediaTypeUnknown) {
+            DDPShowError(@"解析失败");
+            return;
+        }
+        // 转圈延续到下载完成：下载（或命中缓存）结束再弹最终对勾
+        void (^finish)(void) = ^{ DDPShowDone(@"解析成功"); };
+        if (type == DDPMediaTypeVideo) {
+            NSString *path = DDPTempPath(url);
+            if (DDPFileUsable(path)) {
+                dispatch_async(dispatch_get_main_queue(), ^{ [DDPPanel playVideoAtPath:path fromVC:vc]; });
+                finish();
                 return;
             }
-            // 转圈延续到下载完成：下载（或命中缓存）结束再弹最终对勾
-            void (^finish)(void) = ^{ DDPShowDone(@"解析成功"); };
-            if (type == DDPMediaTypeVideo) {
-                NSString *path = DDPTempPath(url);
-                if (DDPFileUsable(path)) {
+            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                NSData *data = [[DDPEngine shared] downloadVideoFromURL:videoURL headers:nil];
+                if (data.length) {
+                    NSFileManager *fm = [NSFileManager defaultManager];
+                    if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
+                    [data writeToFile:path atomically:YES];
                     dispatch_async(dispatch_get_main_queue(), ^{ [DDPPanel playVideoAtPath:path fromVC:vc]; });
-                    finish();
-                    return;
                 }
-                dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                    NSData *data = [[DDPEngine shared] downloadVideoFromURL:videoURL headers:nil];
-                    if (data.length) {
-                        NSFileManager *fm = [NSFileManager defaultManager];
-                        if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
-                        [data writeToFile:path atomically:YES];
-                        dispatch_async(dispatch_get_main_queue(), ^{ [DDPPanel playVideoAtPath:path fromVC:vc]; });
-                    }
-                    finish();
-                });
-            } else {
-                [DDPPanel downloadImagesLocally:imageURLs completion:^(NSArray<NSString *> *paths) {
-                    if (!paths.count) { finish(); return; }
-                    [DDPPanel presentImageViewer:paths fromVC:vc];
-                    finish();
-                }];
-            }
-        } @catch (NSException *e) {
-            DDDLog(@"handleParsePreview 异常 %@", e);
-            dispatch_async(dispatch_get_main_queue(), ^{ DDPHideLoading(); });
+                finish();
+            });
+        } else {
+            [DDPPanel downloadImagesLocally:imageURLs completion:^(NSArray<NSString *> *paths) {
+                if (!paths.count) { finish(); return; }
+                [DDPPanel presentImageViewer:paths fromVC:vc];
+                finish();
+            }];
         }
     }];
 }
@@ -1303,13 +1122,10 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 // 视频预览：用微信自带 MMMoviePlayerController 播放本地 mp4 并 push 到导航栈
 + (void)playVideoAtPath:(NSString *)path fromVC:(UIViewController *)vc {
     if (!path.length || !vc) return;
-    Class cls = objc_getClass("MMMoviePlayerController");
-    if (cls && [cls instancesRespondToSelector:@selector(initWithMsgWrap:VideoPath:)]) {
-        id player = [[cls alloc] initWithMsgWrap:nil VideoPath:path];
-        UINavigationController *nav = vc.navigationController;
-        if (nav) { [nav pushViewController:player animated:YES]; return; }
-        [vc presentViewController:player animated:YES completion:nil];
-    }
+    MMMoviePlayerController *player = [[MMMoviePlayerController alloc] initWithMsgWrap:nil VideoPath:path];
+    UINavigationController *nav = vc.navigationController;
+    if (nav) { [nav pushViewController:player animated:YES]; return; }
+    [vc presentViewController:player animated:YES completion:nil];
 }
 
 // 下载图片直链到本地缓存（供"直接观看"，不存相册；复用 MD5 缓存）
@@ -1349,22 +1165,15 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     DDPShowLoading(@"正在解析…");
     [[DDPEngine shared] parseDouyinURL:url completion:^(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            @try {
-                if (err || type == DDPMediaTypeUnknown) { DDPShowError(@"解析失败"); return; }
-                DDPShowDone(@"解析成功");
-                NSString *link = (type == DDPMediaTypeVideo)
-                    ? videoURL
-                    : [imageURLs componentsJoinedByString:@"\n"];
-                if (!link.length) { return; }
-                DDPCopyToPasteboard(link);
-                NSString *target = user.length ? user : DDPCurrentChatName();
-                if (target.length) {
-                    DDPSendTextMsg(link, target);   // 原始直链以文本消息发出
-                }
-            } @catch (NSException *e) {
-                DDDLog(@"handleParseLink 异常 %@", e);
-                dispatch_async(dispatch_get_main_queue(), ^{ DDPHideLoading(); });
-            }
+            if (err || type == DDPMediaTypeUnknown) { DDPShowError(@"解析失败"); return; }
+            DDPShowDone(@"解析成功");
+            NSString *link = (type == DDPMediaTypeVideo)
+                ? videoURL
+                : [imageURLs componentsJoinedByString:@"\n"];
+            if (!link.length) return;
+            DDPCopyToPasteboard(link);
+            NSString *target = user.length ? user : DDPCurrentChatName();
+            if (target.length) DDPSendTextMsg(link, target);   // 原始直链以文本消息发出
         });
     }];
 }
@@ -1373,37 +1182,32 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 + (void)handleSaveAlbum:(NSString *)url {
     DDPShowLoading(@"正在解析…");
     [[DDPEngine shared] parseDouyinURL:url completion:^(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err) {
-        @try {
-            if (err || type == DDPMediaTypeUnknown) {
-                DDPShowError(@"解析失败");
+        if (err || type == DDPMediaTypeUnknown) {
+            DDPShowError(@"解析失败");
+            return;
+        }
+        // 转圈延续到下载完成：下载（或命中缓存）结束再弹最终对勾
+        void (^finish)(void) = ^{ DDPShowDone(@"解析成功"); };
+        if (type == DDPMediaTypeVideo) {
+            NSString *path = DDPTempPath(url);
+            if (DDPFileUsable(path)) {
+                [DDPPanel saveVideoToAlbumAtPath:path];
+                finish();
                 return;
             }
-            // 转圈延续到下载完成：下载（或命中缓存）结束再弹最终对勾
-            void (^finish)(void) = ^{ DDPShowDone(@"解析成功"); };
-            if (type == DDPMediaTypeVideo) {
-                NSString *path = DDPTempPath(url);
-                if (DDPFileUsable(path)) {
-                    [DDPPanel saveVideoToAlbumAtPath:path];
-                    finish();
-                    return;
+            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                NSData *data = [[DDPEngine shared] downloadVideoFromURL:videoURL headers:nil];
+                BOOL ok = NO;
+                if (data.length) {
+                    NSFileManager *fm = [NSFileManager defaultManager];
+                    if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
+                    ok = [data writeToFile:path atomically:YES];
                 }
-                dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                    NSData *data = [[DDPEngine shared] downloadVideoFromURL:videoURL headers:nil];
-                    BOOL ok = NO;
-                    if (data.length) {
-                        NSFileManager *fm = [NSFileManager defaultManager];
-                        if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
-                        ok = [data writeToFile:path atomically:YES];
-                    }
-                    if (ok) [DDPPanel saveVideoToAlbumAtPath:path];
-                    finish();
-                });
-            } else {
-                [self downloadAndSaveImages:imageURLs shareURL:url finish:finish];
-            }
-        } @catch (NSException *e) {
-            DDDLog(@"handleSaveAlbum 异常 %@", e);
-            dispatch_async(dispatch_get_main_queue(), ^{ DDPHideLoading(); });
+                if (ok) [DDPPanel saveVideoToAlbumAtPath:path];
+                finish();
+            });
+        } else {
+            [self downloadAndSaveImages:imageURLs shareURL:url finish:finish];
         }
     }];
 }
@@ -1487,112 +1291,29 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 
 @end
 
-#pragma mark - Hook：长按菜单
+#pragma mark - Hook：长按菜单「解析 / 预览」（参考 DD语音包：hook 单元格 operationMenuItems）
 
-// 当前长按消息（供菜单回调）
-static __weak CMessageWrap *gDDPCurrentMsgWrap;
-
-// 菜单回调单例
-@interface DDPMenuHandler : NSObject
-+ (instancetype)shared;
-- (void)onDouyinParse:(id)sender;    // 解析发送
-- (void)onDouyinPreview:(id)sender;  // 解析预览
-@end
-
-@implementation DDPMenuHandler
-
-+ (instancetype)shared {
-    static DDPMenuHandler *instance;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ instance = [[self alloc] init]; });
-    return instance;
-}
-
-// 取当前消息内容（type 1 用 m_nsContent，否则 m_nsTitle）
-+ (NSString *)currentContent {
-    CMessageWrap *wrap = gDDPCurrentMsgWrap;
+// 从 cell 取当前消息内容（type 1 用 m_nsContent，否则 m_nsTitle）
+static NSString *ddp_cellContent(id cell) {
+    id viewModel = [(id)cell valueForKey:@"viewModel"];
+    CMessageWrap *wrap = viewModel ? [viewModel valueForKey:@"messageWrap"] : nil;
     if (!wrap) return nil;
     return (wrap.m_uiMessageType == 1) ? wrap.m_nsContent : wrap.m_nsTitle;
 }
 
-- (void)onDouyinParse:(id)sender {
-    if (!DDPConfig.shared.enabled) return;
-    @try {
-        NSString *content = [DDPMenuHandler currentContent];
-        if (!content.length) { DDDLog(@"onDouyinParse: content 为空（长按消息未保存？）"); return; }
-        NSString *url = DDPExtractURL(content);
-        if (!url.length) { DDDLog(@"onDouyinParse: 未提取到 URL content=%@", content); return; }
-        NSString *chat = DDPCurrentChatName();
-        DDDLog(@"onDouyinParse: 解析发送 url=%@ chat=%@", url, chat);
-        [DDPPanel handleParseSend:url user:chat force:NO];   // 解析发送（to 取当前会话）
-    } @catch (NSException *e) {
-        DDDLog(@"onDouyinParse 异常 %@", e);
-    }
-}
-
-- (void)onDouyinPreview:(id)sender {
-    if (!DDPConfig.shared.enabled) return;
-    @try {
-        NSString *content = [DDPMenuHandler currentContent];
-        if (!content.length) return;
-        NSString *url = DDPExtractURL(content);
-        if (!url.length) { return; }
-        UIViewController *topVC = nil;
-        UIWindow *window = DDPKeyWindow();
-        if (window) topVC = window.rootViewController;
-        while (topVC.presentedViewController) topVC = topVC.presentedViewController;
-        if (topVC) [DDPPanel handleParsePreview:url fromVC:topVC];
-    } @catch (NSException *e) {
-        DDDLog(@"onDouyinPreview 异常 %@", e);
-    }
-}
-
-@end
-
-// 长按消息时保存当前消息
-%hook BaseMessageCellView
-
-- (BOOL)canShowForwardMenuItem {
-    BOOL ret = %orig;
-    // 经 viewModel.messageWrap 取消息（BaseMessageCellView 仅前向声明，强转 id 以调用 KVC）
-    id viewModel = [(id)self valueForKey:@"viewModel"];
-    CMessageWrap *wrap = viewModel ? [viewModel valueForKey:@"messageWrap"] : nil;
-    gDDPCurrentMsgWrap = wrap;
-    DDDLog(@"canShowForwardMenuItem: viewModel=%@ messageWrap=%@ content=%@",
-           viewModel?@"Y":@"N", wrap?@"Y":@"N", [DDPMenuHandler currentContent]);
-    return ret;
-}
-
-%end
-
-// hook setMenuItems: 追加"解析/预览"
-%hook MMMenuController
-
-- (void)setMenuItems:(id)menuItems {
-    if (!DDPConfig.shared.enabled) { %orig; return; }
-    NSString *content = [DDPMenuHandler currentContent];
-    if (!content.length || !DDPContainsDouyinLink(content) || DDPIsDouyinLiveText(content)) { %orig; return; }
-
-    // 已注入则跳过，并通过 menuType 唯一 ID 防与其它插件注入项撞车被去重
-    NSArray *items = ddp_inject_item(menuItems, @"解析", @"icons_filled_heart", @selector(onDouyinParse:), 1010);
-    items = ddp_inject_item(items, @"预览", @"icons_filled_play", @selector(onDouyinPreview:), 1011);
-    %orig(items);
-}
-
-%end
-
-// 注入菜单项：先按 userInfo token 去重（避免菜单重建时重复追加），再设唯一 menuType（防与其它插件注入项撞车被微信去重）
-static NSArray *ddp_inject_item(NSArray *original, NSString *title, NSString *svgName, SEL action, long long menuType) {
+// 注入菜单项（参考 DD语音包 ddvp_inject_item：svg 图标 + 标题，一级平铺项）。已注入则跳过。
+// 去重标记用 action 派生的 userInfo：MMMenuItem 没有 title/action 的 getter，只能用 userInfo 做记号。
+static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSString *title, NSString *svgName, SEL action, long long menuType) {
+    if (!enabled) return original;
     NSString *token = [@"ddp:" stringByAppendingString:NSStringFromSelector(action)];
     for (MMMenuItem *it in original) {
         id ui = [it userInfo];
         if ([ui isKindOfClass:[NSString class]] && [(NSString *)ui isEqualToString:token]) return original;
     }
-    Class cls = objc_getClass("MMMenuItem");
-    MMMenuItem *item = [[cls alloc] initWithTitle:title
-                                          svgName:svgName
-                                           target:[DDPMenuHandler shared]
-                                           action:action];
+    MMMenuItem *item = [[MMMenuItem alloc] initWithTitle:title
+                                                svgName:svgName
+                                                 target:cell
+                                                 action:action];
     if (!item) return original;
     [item setUserInfo:token];
     [item setMenuType:menuType];
@@ -1600,6 +1321,54 @@ static NSArray *ddp_inject_item(NSArray *original, NSString *title, NSString *sv
     [items addObject:item];
     return items;
 }
+
+%hook BaseMessageCellView
+
+// 长按菜单：在微信原生 operationMenuItems 基础上追加「解析 / 预览」（参考 DD语音包）
+- (id)operationMenuItems {
+    NSArray *items = %orig;
+    NSString *content = ddp_cellContent(self);
+    BOOL enabled = DDPConfig.shared.enabled && content.length
+                   && DDPContainsDouyinLink(content) && !DDPIsDouyinLiveText(content);
+    items = ddp_inject_item(self, items, enabled, @"解析", @"icons_filled_search", @selector(ddp_onParse:), 1010);
+    items = ddp_inject_item(self, items, enabled, @"预览", @"icons_filled_play", @selector(ddp_onPreview:), 1011);
+    return items;
+}
+
+// 给新 selector 放行（参考 DD语音包 canPerformAction）
+- (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
+    if (action == @selector(ddp_onParse:) || action == @selector(ddp_onPreview:)) {
+        NSString *content = ddp_cellContent(self);
+        return DDPConfig.shared.enabled && content.length
+               && DDPContainsDouyinLink(content) && !DDPIsDouyinLiveText(content);
+    }
+    BOOL origResult = %orig;
+    return origResult;
+}
+
+%new
+- (void)ddp_onParse:(id)sender {
+    if (!DDPConfig.shared.enabled) return;
+    NSString *url = DDPExtractURL(ddp_cellContent(self));
+    if (!url.length) return;
+    [DDPPanel handleParseSend:url user:DDPCurrentChatName() force:NO];
+}
+
+%new
+- (void)ddp_onPreview:(id)sender {
+    if (!DDPConfig.shared.enabled) return;
+    NSString *url = DDPExtractURL(ddp_cellContent(self));
+    if (!url.length) return;
+    UIResponder *responder = self;
+    while ((responder = [responder nextResponder])) {
+        if ([responder isKindOfClass:[UIViewController class]]) {
+            [DDPPanel handleParsePreview:url fromVC:(UIViewController *)responder];
+            return;
+        }
+    }
+}
+
+%end
 
 #pragma mark - Hook：CMessageMgr AddMsg（弹面板的真正入口）
 
@@ -1609,18 +1378,17 @@ static NSArray *ddp_inject_item(NSArray *original, NSString *title, NSString *sv
 
 - (void)AddMsg:(NSString *)usr MsgWrap:(CMessageWrap *)wrap {
     // 诊断日志
-    @try {
+    if (wrap) {
         NSString *c = wrap.m_nsContent;
-        DDDLog(@"AddMsg hook 触发: type=%u from=%@ to=%@ content=%@",
+        DDDLog(@"AddMsg: type=%u from=%@ to=%@ content=%@",
                (unsigned int)wrap.m_uiMessageType, wrap.m_nsFromUsr, wrap.m_nsToUsr,
-               [c length] > 120 ? [c substringToIndex:120] : c);
-    } @catch (...) {}
+               c.length > 120 ? [c substringToIndex:120] : c);
+    }
     do {
         if (!DDPConfig.shared.enabled || !wrap) break;
 
         // 发送方判定
         if (!DDPIsOutgoing(wrap)) break;          // 仅自己发出的消息
-        if (![wrap respondsToSelector:@selector(m_uiMessageType)]) break;
         // 允许文本(1)/链接卡片(49)/其他(62)，避免漏抓
         unsigned int ddMT = wrap.m_uiMessageType;
         if (ddMT != 1 && ddMT != 49 && ddMT != 62) break;
@@ -1773,10 +1541,7 @@ static NSArray *ddp_inject_item(NSArray *original, NSString *title, NSString *sv
 
 - (void)ensureTableViewMgr {
     if (_tableViewMgr) return;
-    Class mgrCls = objc_getClass("WCTableViewManager");
-    if (!mgrCls) return;
-    WCTableViewManager *mgr = [mgrCls alloc];
-    _tableViewMgr = [mgr initWithFrame:[UIScreen mainScreen].bounds style:UITableViewStyleInsetGrouped];
+    _tableViewMgr = [[WCTableViewManager alloc] initWithFrame:[UIScreen mainScreen].bounds style:UITableViewStyleInsetGrouped];
 }
 
 - (instancetype)init {
@@ -1806,13 +1571,11 @@ static NSArray *ddp_inject_item(NSArray *original, NSString *title, NSString *sv
 }
 
 - (void)buildTable {
-    Class cellCls = objc_getClass("WCTableViewCellManager");
-    Class secCls  = objc_getClass("WCTableViewSectionManager");
-    if (!cellCls || !secCls || !_tableViewMgr) return;
+    if (!_tableViewMgr) return;
     [self.tableViewMgr clearAllSection];
 
-    // 解析设置分组：总开关 + 子项（总开关开启时展开，对齐 DDAdBlock）
-    WCTableViewSectionManager *section = [secCls defaultSection];
+    // 解析设置分组：总开关 + 子项（总开关开启时展开）
+    WCTableViewSectionManager *section = [WCTableViewSectionManager defaultSection];
     section.headerTitle = @"解析设置";
     [section addCell:[self switchCellWithTitle:@"启用抖音解析" on:DDPConfig.shared.enabled action:@selector(onEnabledSwitch:)]];
     if (DDPConfig.shared.enabled) {
@@ -1821,19 +1584,16 @@ static NSArray *ddp_inject_item(NSArray *original, NSString *title, NSString *sv
     [self.tableViewMgr addSection:section];
 
     // 日志分组（与总开关无关）
-    WCTableViewSectionManager *logSection = [secCls defaultSection];
+    WCTableViewSectionManager *logSection = [WCTableViewSectionManager defaultSection];
     logSection.headerTitle = @"日志";
-    if ([cellCls respondsToSelector:@selector(normalCellForSel:target:title:)]) {
-        [logSection addCell:[cellCls normalCellForSel:@selector(onExportLog:) target:self title:@"导出日志"]];
-        [logSection addCell:[cellCls normalCellForSel:@selector(onClearLog:) target:self title:@"清空日志"]];
-        [self.tableViewMgr addSection:logSection];
-    }
+    [logSection addCell:[WCTableViewCellManager normalCellForSel:@selector(onExportLog:) target:self title:@"导出日志"]];
+    [logSection addCell:[WCTableViewCellManager normalCellForSel:@selector(onClearLog:) target:self title:@"清空日志"]];
+    [self.tableViewMgr addSection:logSection];
     [self.tableViewMgr reloadTableView];
 }
 
 - (id)switchCellWithTitle:(NSString *)title on:(BOOL)on action:(SEL)action {
-    Class cellCls = objc_getClass("WCTableViewCellManager");
-    return [cellCls switchCellForSel:action target:self title:title on:on];
+    return [WCTableViewCellManager switchCellForSel:action target:self title:title on:on];
 }
 
 - (void)onEnabledSwitch:(UISwitch *)sender   { DDPConfig.shared.enabled = sender.isOn; [self buildTable]; }
@@ -1841,40 +1601,32 @@ static NSArray *ddp_inject_item(NSArray *original, NSString *title, NSString *sv
 
 // 导出日志（另存 txt 分享）
 - (void)onExportLog:(id)sender {
-    @try {
-        NSString *log = DDDReadLog();
-        if (!log.length) { return; }
-        NSString *exportPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"DDDParse_export.txt"];
-        [log writeToFile:exportPath atomically:NO encoding:NSUTF8StringEncoding error:nil];
-        NSURL *url = [NSURL fileURLWithPath:exportPath];
-        UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:@[url] applicationActivities:nil];
-        // iPad 需 popover 锚点
-        if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) {
-            avc.popoverPresentationController.sourceView = self.view;
-            avc.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(self.view.bounds),
-                                                                       CGRectGetMidY(self.view.bounds), 0, 0);
-            avc.popoverPresentationController.permittedArrowDirections = 0;
-        }
-        [self presentViewController:avc animated:YES completion:nil];
-    } @catch (NSException *e) {
-        DDDLog(@"导出日志异常 %@", e);
+    NSString *log = DDDReadLog();
+    if (!log.length) return;
+    NSString *exportPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"DDDParse_export.txt"];
+    [log writeToFile:exportPath atomically:NO encoding:NSUTF8StringEncoding error:nil];
+    NSURL *url = [NSURL fileURLWithPath:exportPath];
+    UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:@[url] applicationActivities:nil];
+    // iPad 需 popover 锚点
+    if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) {
+        avc.popoverPresentationController.sourceView = self.view;
+        avc.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(self.view.bounds),
+                                                                   CGRectGetMidY(self.view.bounds), 0, 0);
+        avc.popoverPresentationController.permittedArrowDirections = 0;
     }
+    [self presentViewController:avc animated:YES completion:nil];
 }
 
 // 清空日志（二次确认）
 - (void)onClearLog:(id)sender {
-    @try {
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"清空日志"
-                                                                       message:@"确定要清空 DDDParse.log 吗？"
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-            [alert addAction:[UIAlertAction actionWithTitle:@"清空" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a){
-            DDDClearLog();
-        }]];
-        [self presentViewController:alert animated:YES completion:nil];
-    } @catch (NSException *e) {
-        DDDLog(@"清空日志异常 %@", e);
-    }
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"清空日志"
+                                                                   message:@"确定要清空 DDDParse.log 吗？"
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"清空" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a){
+        DDDClearLog();
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 @end
@@ -1882,10 +1634,7 @@ static NSArray *ddp_inject_item(NSArray *original, NSString *title, NSString *sv
 #pragma mark - 注册入口
 
 %ctor {
-    Class mgrCls = objc_getClass("WCPluginsMgr");
-    if (mgrCls) {
-        [[mgrCls sharedInstance] registerControllerWithTitle:@"DD抖音解析"
+    [[WCPluginsMgr sharedInstance] registerControllerWithTitle:@"DD抖音解析"
                                                      version:@"1.0.0"
                                                   controller:@"DDPDouyinParseSettingsViewController"];
-    }
 }
