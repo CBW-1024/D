@@ -235,11 +235,14 @@ static BOOL DDPIsDouyinLiveText(NSString *text) { return [text containsString:@"
 
 static BOOL DDPIsOutgoing(CMessageWrap *wrap) { return [%c(CMessageWrap) isSenderFromMsgWrap:wrap]; }
 
-// 抽取文本中的第一个 http(s) URL
+// 抽取文本中的第一个抖音 http(s) URL（只认 douyin.com，避免文案里其他链接抢先被抠走）
 static NSString *DDPExtractURL(NSString *text) {
     NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"https?://[^\\s\"']+" options:0 error:nil];
-    NSTextCheckingResult *m = [re firstMatchInString:text options:0 range:NSMakeRange(0, text.length)];
-    return m ? [text substringWithRange:m.range] : nil;
+    for (NSTextCheckingResult *m in [re matchesInString:text options:0 range:NSMakeRange(0, text.length)]) {
+        NSString *u = [text substringWithRange:m.range];
+        if ([u containsString:@"douyin.com"]) return u;
+    }
+    return nil;
 }
 
 // 去水印：/playwm/ → /play/，清晰度固定 720p
@@ -447,7 +450,7 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
         NSString *u = [[html substringWithRange:m.range] stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
         if ([u containsString:@"video_id=https:"]) continue;
         NSString *clean = DDPRemoveWatermark(u);
-        if (clean.length && ![result containsObject:clean]) [result addObject:clean];
+        if (![result containsObject:clean]) [result addObject:clean];
     }
     DDDLog(@"extractVideoLinks: 候选数=%lu", (unsigned long)result.count);
     return [result copy];
@@ -907,7 +910,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
 - (id)operationMenuItems {
     NSArray *items = %orig;
     NSString *content = ddp_cellContent(self);
-    BOOL enabled = DDPConfig.shared.enabled && content.length
+    BOOL enabled = DDPConfig.shared.enabled
                    && DDPContainsDouyinLink(content) && !DDPIsDouyinLiveText(content);
     items = ddp_inject_item(self, items, enabled, @"解析", @"icons_filled_search", @selector(ddp_onParse:), 1010);
     items = ddp_inject_item(self, items, enabled, @"预览", @"icons_filled_play", @selector(ddp_onPreview:), 1011);
@@ -916,7 +919,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
     if (action == @selector(ddp_onParse:) || action == @selector(ddp_onPreview:)) {
         NSString *content = ddp_cellContent(self);
-        return DDPConfig.shared.enabled && content.length
+        return DDPConfig.shared.enabled
                && DDPContainsDouyinLink(content) && !DDPIsDouyinLiveText(content);
     }
     return %orig;
@@ -951,7 +954,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
         BOOL bypass = gDDPDyTcEnable; gDDPDyTcEnable = NO;       // 复位须在检测前
         if (bypass) break;
         NSString *content = wrap.m_nsContent;
-        if (!DDPContainsDouyinLink(content) && DDPContainsDouyinLink(wrap.m_nsTitle)) content = wrap.m_nsTitle;
+        if (!DDPContainsDouyinLink(content)) content = wrap.m_nsTitle;
         if (!DDPContainsDouyinLink(content)) break;
         if (DDPIsDouyinLiveText(content)) break;
         NSString *target = usr.length ? usr : wrap.m_nsToUsr;
