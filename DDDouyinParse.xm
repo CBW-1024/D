@@ -30,6 +30,9 @@
 @property (retain, nonatomic) NSString *m_nsFromUsr;
 @property (retain, nonatomic) NSString *m_nsToUsr;
 @property (retain, nonatomic) NSString *m_nsTitle;
+@property (nonatomic) unsigned int m_uiStatus;
+@property (nonatomic) unsigned int m_uiCreateTime;
+- (id)initWithMsgType:(long long)type;
 + (BOOL)isSenderFromMsgWrap:(id)wrap;
 @end
 
@@ -85,6 +88,25 @@
 - (instancetype)initWithTitle:(NSString *)title cancelButtonTitle:(NSString *)cancelTitle;
 - (long long)addButtonWithTitle:(NSString *)title eventAction:(void (^)(void))action;
 - (void)showInView:(UIView *)view;
+@end
+
+@interface WCTableViewManager : NSObject
+- (instancetype)initWithFrame:(struct CGRect)arg1 style:(long long)arg2;
+- (void)clearAllSection;
+- (id)getTableView;
+- (void)addSection:(id)arg1;
+- (void)reloadTableView;
+@end
+
+@interface WCTableViewSectionManager : NSObject
++ (id)defaultSection;
+- (void)addCell:(id)arg1;
+- (void)setHeaderTitle:(id)arg1;
+@end
+
+@interface WCTableViewCellManager : NSObject
++ (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 on:(BOOL)arg4;
++ (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3;
 @end
 
 // 可缩放单图页：UIScrollView + UIImageView，支持捏合/双击缩放，背景随深色模式
@@ -225,9 +247,9 @@ static NSString *DDPExtractURL(NSString *text) {
 // 去水印：/playwm/ → /play/，清晰度固定 720p
 static NSString *DDPRemoveWatermark(NSString *url) {
     NSString *clean = [url stringByReplacingOccurrencesOfString:@"/playwm/" withString:@"/play/"];
-    clean = [NSRegularExpression stringByReplacingMatchesInString:clean options:0 range:NSMakeRange(0, clean.length)
-                                                            withTemplate:@"ratio=720p"
-                                                       pattern:@"ratio=\\d+p" error:nil];
+    NSError *reErr = nil;
+    NSRegularExpression *reRatio = [NSRegularExpression regularExpressionWithPattern:@"ratio=\\d+p" options:0 error:&reErr];
+    if (reRatio) clean = [reRatio stringByReplacingMatchesInString:clean options:0 range:NSMakeRange(0, clean.length) withTemplate:@"ratio=720p"];
     if ([clean rangeOfString:@"ratio="].location == NSNotFound) {
         NSString *sep = ([clean rangeOfString:@"?"].location == NSNotFound) ? @"?" : @"&";
         clean = [clean stringByAppendingFormat:@"%@ratio=720p", sep];
