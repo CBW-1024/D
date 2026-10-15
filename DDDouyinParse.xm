@@ -291,10 +291,9 @@ static inline NSString *DDPRemoveWatermark(NSString *url) {
     return clean;
 }
 
-// 缓存路径：<md5>.mp4（md5 走微信原生 CRUtils，不再自己实现 RFC1321）
+// 下载目标路径：<md5>.mp4（md5 走微信原生 CRUtils，不再自己实现 RFC1321）
 static inline NSString *DDPTempPath(NSString *url) {
     NSString *md5 = [%c(CRUtils) md5:url];
-    DDDLog(@"DDPTempPath: md5=%@ 长度=%lu class=%@", md5, (unsigned long)md5.length, md5.class);
     if (!md5.length) return nil;
     return [NSTemporaryDirectory() stringByAppendingPathComponent:[md5 stringByAppendingString:@".mp4"]];
 }
@@ -318,20 +317,6 @@ static inline UIWindow *DDPKeyWindow(void) {
     return nil;
 }
 
-// 文件存在且 >2 字节才复用
-static inline BOOL DDPFileUsable(NSString *path) {
-    BOOL ok = NO;
-    if (path.length) {
-        NSFileManager *fm = [NSFileManager defaultManager];
-        if ([fm fileExistsAtPath:path]) {
-            NSDictionary *attr = [fm attributesOfItemAtPath:path error:nil];
-            ok = attr.fileSize > 2;
-        }
-    }
-    DDDLog(@"缓存判断: %@ -> %@", [path lastPathComponent], ok ? @"命中" : @"未命中");
-    return ok;
-}
-
 // 解析过程提示：参考 DD语音包的方形 WeToast 三态（转圈 / ✓ / 错误）。
 // loading 与结果提示共用同一控件，出结果前必须先收起 loading。
 static WeToast *gDDPBusyToast = nil;   // 进行中的 loading，出结果时收起
@@ -353,13 +338,6 @@ static void DDPShowLoading(NSString *text) {
         [toast setLoadingStyle:YES];
         [toast showToastWithText:text];
         gDDPBusyToast = toast;
-    });
-}
-
-static void DDPShowDone(NSString *text) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        DDPHideLoading();
-        [DDPToast() showDoneToastWithText:text];
     });
 }
 
@@ -521,6 +499,7 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重试 3 次（配�
 
     // 命中 playwm/图集即成功
     if (code == DDPCodeGallery || [clean containsString:@"playwm"]) {
+        DDDLog(@"[DDPWebFetcher] 命中成功 retries=%u（%@）", self.retries, self.retries ? @"重试有效" : @"首轮即命中");
         [self ddFinishWithHTML:clean code:code];
         return;
     }
@@ -800,8 +779,8 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
             DDPShowError(@"解析失败");
             return;
         }
-        // 转圈延续到下载完成：解析成功后不收起 loading，下载+发送结束再弹最终对勾
-        void (^finish)(void) = ^{ DDPShowDone(@"解析成功"); };
+        // 下载+发送结束收起加载转圈（不再弹"解析成功"对勾）
+        void (^finish)(void) = ^{ DDPHideLoading(); };
         if (type == DDPMediaTypeVideo) {
             [self sendVideoForURL:videoURL shareURL:url user:user finish:finish];
         } else {
@@ -810,17 +789,11 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     }];
 }
 
-// 下载视频直链并发到聊天（含本地缓存复用）
+// 下载视频直链并发到聊天
 + (void)sendVideoForURL:(NSString *)videoURL shareURL:(NSString *)url user:(NSString *)user finish:(void(^)(void))finish {
-    if (!videoURL.length) { if (finish) finish(); return; }
+    if (!videoURL.length) { DDDLog(@"sendVideoForURL: videoURL 为空，直接结束"); if (finish) finish(); return; }
     NSString *path = DDPTempPath(url);
-    if (DDPFileUsable(path)) {
-        DDDLog(@"sendVideoForURL: 命中缓存，跳过下载 path=%@", path);
-        [DDPPanel sendVideoAtPath:path toUser:user];
-        if (finish) finish();
-        return;
-    }
-    DDDLog(@"sendVideoForURL: 无缓存，开始下载 → %@", path);
+    DDDLog(@"sendVideoForURL: 开始下载 → %@", path);
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSData *data = [[DDPEngine shared] downloadVideoFromURL:videoURL];
         BOOL ok = NO;
@@ -828,8 +801,16 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
             NSFileManager *fm = [NSFileManager defaultManager];
             if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
             ok = [data writeToFile:path atomically:YES];
+            DDDLog(@"sendVideoForURL: 下载完成 size=%lu ok=%d", (unsigned long)data.length, ok);
+        } else {
+            DDDLog(@"sendVideoForURL: 下载失败，data 为空");
         }
-        if (ok) [DDPPanel sendVideoAtPath:path toUser:user];
+        if (ok) {
+            DDDLog(@"sendVideoForURL: 触发发送 → %@", path);
+            [DDPPanel sendVideoAtPath:path toUser:user];
+        } else {
+            DDDLog(@"sendVideoForURL: 未触发发送（下载/写文件失败）");
+        }
         if (finish) finish();
     });
 }
@@ -839,7 +820,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     if (!urls.count) { if (finish) finish(); return; }
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         for (NSString *imgURL in urls) {
-            DDDLog(@"下载开始(存相册图): %@（本路径恒重新下载，无缓存复用）", [DDPTempPathExt(imgURL, [[imgURL pathExtension].lowercaseString isEqualToString:@"png"]?@"png":@"jpg") lastPathComponent]);
+            DDDLog(@"下载开始(存相册图): %@", [DDPTempPathExt(imgURL, [[imgURL pathExtension].lowercaseString isEqualToString:@"png"]?@"png":@"jpg") lastPathComponent]);
             NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL];
             if (!data.length) continue;
             NSString *ext = @"jpg";
@@ -962,13 +943,14 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 
 // 发图片消息（CMessageMgr AddMsg:MsgWrap:；wrap 由 BaseMsgContentLogicController.FormImageMsg:withImage:withData: 构造）
 + (void)sendImageAtPath:(NSString *)path toUser:(NSString *)user {
-    if (!path.length) return;
+    if (!path.length) { DDDLog(@"sendImageAtPath: path 为空，返回"); return; }
     dispatch_async(dispatch_get_main_queue(), ^{
         NSString *chatName = user.length ? user : DDPCurrentChatName();
-        if (!chatName.length) return;
+        if (!chatName.length) { DDDLog(@"sendImageAtPath: chatName 为空，返回"); return; }
+        DDDLog(@"sendImageAtPath: 进入发送 path=%@ chat=%@", path, chatName);
 
         UIImage *image = [UIImage imageWithContentsOfFile:path];
-        if (!image) return;
+        if (!image) { DDDLog(@"sendImageAtPath: 读图失败 path=%@", path); return; }
         NSData *data = UIImagePNGRepresentation(image);
         if (!data.length) return;
 
@@ -981,6 +963,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 
         CMessageMgr *mgr = DDPMessageMgr();
         [mgr AddMsg:chatName MsgWrap:wrap];   // 图片 type=3，不会命中抖音面板拦截
+        DDDLog(@"sendImageAtPath: AddMsg 完成 chat=%@", chatName);
     });
 }
 
@@ -993,17 +976,16 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
                 NSString *ext = @"jpg";
                 if ([[imgURL pathExtension].lowercaseString isEqualToString:@"png"]) ext = @"png";
                 NSString *path = DDPTempPathExt(imgURL, ext);
-                if (DDPFileUsable(path)) {
-                    [DDPPanel sendImageAtPath:path toUser:user];
-                    continue;
-                }
                 DDDLog(@"下载开始(发图): %@", [path lastPathComponent]);
                 NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL];
-                if (!data.length) continue;
+                if (!data.length) { DDDLog(@"sendImagesForURLs: 下载失败跳过 %@", [path lastPathComponent]); continue; }
                 NSFileManager *fm = [NSFileManager defaultManager];
                 if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
                 if ([data writeToFile:path atomically:YES]) {
+                    DDDLog(@"sendImagesForURLs: 写文件成功，触发发送 %@", [path lastPathComponent]);
                     [DDPPanel sendImageAtPath:path toUser:user];
+                } else {
+                    DDDLog(@"sendImagesForURLs: 写文件失败 %@", [path lastPathComponent]);
                 }
             }
         }
@@ -1019,15 +1001,10 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
             DDPShowError(@"解析失败");
             return;
         }
-        // 转圈延续到下载完成：下载（或命中缓存）结束再弹最终对勾
-        void (^finish)(void) = ^{ DDPShowDone(@"解析成功"); };
+        // 下载结束收起加载转圈（不再弹"解析成功"对勾）
+        void (^finish)(void) = ^{ DDPHideLoading(); };
         if (type == DDPMediaTypeVideo) {
             NSString *path = DDPTempPath(url);
-            if (DDPFileUsable(path)) {
-                dispatch_async(dispatch_get_main_queue(), ^{ [DDPPanel playVideoAtPath:path fromVC:vc]; });
-                finish();
-                return;
-            }
             dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
                 DDDLog(@"下载开始(预览视频): %@", [path lastPathComponent]);
                 NSData *data = [[DDPEngine shared] downloadVideoFromURL:videoURL];
@@ -1068,13 +1045,11 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
             NSString *ext = @"jpg";
             if ([[imgURL pathExtension].lowercaseString isEqualToString:@"png"]) ext = @"png";
             NSString *path = DDPTempPathExt(imgURL, ext);
-            if (![fm fileExistsAtPath:path]) {
-                DDDLog(@"下载开始(本地看图): %@", [path lastPathComponent]);
-                NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL];
-                if (data.length) {
-                    if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
-                    [data writeToFile:path atomically:YES];
-                }
+            DDDLog(@"下载开始(本地看图): %@", [path lastPathComponent]);
+            NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL];
+            if (data.length) {
+                if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
+                [data writeToFile:path atomically:YES];
             }
             if ([fm fileExistsAtPath:path]) [out addObject:path];
         }
@@ -1097,7 +1072,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     [[DDPEngine shared] parseDouyinURL:url completion:^(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err) {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (err || type == DDPMediaTypeUnknown) { DDPShowError(@"解析失败"); return; }
-            DDPShowDone(@"解析成功");
+            DDPHideLoading();
             NSString *link = (type == DDPMediaTypeVideo)
                 ? videoURL
                 : [imageURLs componentsJoinedByString:@"\n"];
@@ -1116,15 +1091,10 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
             DDPShowError(@"解析失败");
             return;
         }
-        // 转圈延续到下载完成：下载（或命中缓存）结束再弹最终对勾
-        void (^finish)(void) = ^{ DDPShowDone(@"解析成功"); };
+        // 下载结束收起加载转圈（不再弹"解析成功"对勾）
+        void (^finish)(void) = ^{ DDPHideLoading(); };
         if (type == DDPMediaTypeVideo) {
             NSString *path = DDPTempPath(url);
-            if (DDPFileUsable(path)) {
-                [DDPPanel saveVideoToAlbumAtPath:path];
-                finish();
-                return;
-            }
             dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
                 DDDLog(@"下载开始(存相册视频): %@", [path lastPathComponent]);
                 NSData *data = [[DDPEngine shared] downloadVideoFromURL:videoURL];
