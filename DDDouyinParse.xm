@@ -277,8 +277,8 @@ static inline NSString *DDPExtractURL(NSString *text) {
 }
 
 // 去水印：/playwm/ → /play/，清晰度固定 720p
-// 实测：抖音 play 接口可用档位只有 1080p(≈25.3MB) / 720p(≈21.6MB) / 540p(≈15.0MB)；
-// 480p、360p 不被支持（会返回 1080p），不带 ratio 时默认也是 720p。
+// 稳定走 720p：正则替换已有的 ratio=NNNp；若链接本身不含 ratio=，则强制拼接 ratio=720p，避免走抖音默认档位。
+// 注：抖音会忽略其不支持的 ratio（如 480p）并回退默认最高档（实测 480p 反而下到 1080p），故用 720p 作稳妥中档。
 static inline NSString *DDPRemoveWatermark(NSString *url) {
     if (!url.length) return nil;
     NSString *clean = [url stringByReplacingOccurrencesOfString:@"/playwm/" withString:@"/play/"];
@@ -287,6 +287,11 @@ static inline NSString *DDPRemoveWatermark(NSString *url) {
                                                                             error:nil];
     if (re) {
         clean = [re stringByReplacingMatchesInString:clean options:0 range:NSMakeRange(0, clean.length) withTemplate:@"ratio=720p"];
+    }
+    // 链接本身不含 ratio=（正则未触发）时，强制拼接 ratio=720p，确保稳定走 720p 而非抖音默认档位
+    if ([clean rangeOfString:@"ratio="].location == NSNotFound) {
+        NSString *sep = ([clean rangeOfString:@"?"].location == NSNotFound) ? @"?" : @"&";
+        clean = [clean stringByAppendingFormat:@"%@ratio=720p", sep];
     }
     return clean;
 }
