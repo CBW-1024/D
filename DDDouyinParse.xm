@@ -788,6 +788,8 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
         }
         search = NSMakeRange(start + segLen, decoded.length - (start + segLen));
     }
+    NSInteger c1 = (NSInteger)result.count;   // stage1(image_list JSON) 命中数
+    DDDLog(@"[extractGallery] stage1 image_list 命中=%ld", (long)c1);
 
     // 2) 兜底：若 image_list 未命中，退而全文档提取 url_list 首项（覆盖非 image_list 命名的图集结构）
     if (result.count == 0) {
@@ -802,6 +804,9 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
             if (u.length && ![result containsObject:u]) [result addObject:u];
         }
     }
+    NSInteger c2 = (NSInteger)result.count;   // 含 stage2（全文档 url_list）后的累计数
+    DDDLog(@"[extractGallery] stage2 全文档url_list 触发=%@ 新增=%ld",
+           (c1 == 0 ? @"YES" : @"NO(已被image_list命中)"), (long)(c2 - c1));
 
     // 3) DOM 正则兜底：gallery-container __carousel__image / aweme-slides-swiper-item 内的 <img src>
     NSRegularExpression *re1 = [NSRegularExpression
@@ -820,7 +825,12 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
             if (u.length && ![result containsObject:u]) [result addObject:u];
         }
     }
-    DDDLog(@"extractGalleryImages: 候选数=%lu", (unsigned long)result.count);
+    NSInteger c3 = (NSInteger)result.count;
+    NSString *src = (c1 > 0) ? @"image_list(JSON)"
+                   : (c2 > c1) ? @"全文档url_list"
+                   : (c3 > c2) ? @"DOM-img" : @"无";
+    DDDLog(@"[extractGallery] stage3 DOM-img 新增=%ld", (long)(c3 - c2));
+    DDDLog(@"[extractGallery] 候选数=%lu 来源=%@", (unsigned long)result.count, src);
     return [result copy];
 }
 
