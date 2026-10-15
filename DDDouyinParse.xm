@@ -51,10 +51,8 @@
 @end
 
 @interface MMContext : NSObject
-+ (id)currentContext;
 + (id)activeUserContext;
 - (id)getService:(Class)arg1;
-@property (readonly, nonatomic) id serviceCenter;
 @end
 
 @interface CMessageMgr : NSObject
@@ -252,9 +250,8 @@ static NSString *DDPExtractURL(NSString *text) {
 // 去水印：/playwm/ → /play/，清晰度固定 720p
 static NSString *DDPRemoveWatermark(NSString *url) {
     NSString *clean = [url stringByReplacingOccurrencesOfString:@"/playwm/" withString:@"/play/"];
-    NSError *reErr = nil;
-    NSRegularExpression *reRatio = [NSRegularExpression regularExpressionWithPattern:@"ratio=\\d+p" options:0 error:&reErr];
-    if (reRatio) clean = [reRatio stringByReplacingMatchesInString:clean options:0 range:NSMakeRange(0, clean.length) withTemplate:@"ratio=720p"];
+    NSRegularExpression *reRatio = [NSRegularExpression regularExpressionWithPattern:@"ratio=\\d+p" options:0 error:nil];
+    clean = [reRatio stringByReplacingMatchesInString:clean options:0 range:NSMakeRange(0, clean.length) withTemplate:@"ratio=720p"];
     if ([clean rangeOfString:@"ratio="].location == NSNotFound) {
         NSString *sep = ([clean rangeOfString:@"?"].location == NSNotFound) ? @"?" : @"&";
         clean = [clean stringByAppendingFormat:@"%@ratio=720p", sep];
@@ -265,12 +262,12 @@ static NSString *DDPRemoveWatermark(NSString *url) {
 // 视频缓存路径 <md5>.mp4（md5 用微信原生 CRUtils）
 static NSString *DDPTempPath(NSString *url) {
     NSString *md5 = [%c(CRUtils) md5:url];
-    return md5 ? [NSTemporaryDirectory() stringByAppendingPathComponent:[md5 stringByAppendingString:@".mp4"]] : nil;
+    return [NSTemporaryDirectory() stringByAppendingPathComponent:[md5 stringByAppendingString:@".mp4"]];
 }
 // 图片缓存路径 <md5>.<ext>
 static NSString *DDPTempPathExt(NSString *url, NSString *ext) {
     NSString *md5 = [%c(CRUtils) md5:url];
-    return md5 ? [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.%@", md5, ext ?: @"dat"]] : nil;
+    return [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.%@", md5, ext]];
 }
 // 取 URL 后缀作为临时文件扩展名（默认 jpg）
 static NSString *DDPImageExt(NSString *url) {
@@ -329,9 +326,7 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重载 3 次（实�
         WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
         config.defaultWebpagePreferences.allowsContentJavaScript = YES;   // 替代已废弃的 javaScriptEnabled
         _webView = [[WKWebView alloc] initWithFrame:CGRectZero configuration:config];
-        NSString *ua = [%c(CUtility) GetMMUserAgent];
-        if (!ua.length) ua = @"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.40(0x18004025) NetType/WIFI Language/zh_CN";
-        _webView.customUserAgent = ua;
+        _webView.customUserAgent = [%c(CUtility) GetMMUserAgent];
         _webView.navigationDelegate = self;
         _webView.hidden = YES;   // WKWebView 独立进程渲染，无需挂窗口；hidden 防误显示
     }
@@ -340,7 +335,6 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重载 3 次（实�
 - (void)fetchHTMLFromURL:(NSString *)url completion:(void (^)(NSString *html, NSInteger errCode))completion {
     self.completion = completion; self.hasCompleted = NO;
     NSURL *nsurl = [NSURL URLWithString:url];
-    if (!nsurl) { if (completion) completion(nil, -1); return; }
     NSURLRequest *request = [NSURLRequest requestWithURL:nsurl cachePolicy:NSURLRequestUseProtocolCachePolicy timeoutInterval:30.0];
     self.ddpRequest = request; self.retries = 0; self.lastCleanLen = 0;
     self.fetchStart = CFAbsoluteTimeGetCurrent();
@@ -526,7 +520,6 @@ static NSString *DDPImageIdentityKey(NSString *url) {
 - (NSData *)downloadVideoFromURL:(NSString *)url {
     NSString *encoded = [url stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
     NSURL *nsurl = [NSURL URLWithString:encoded];
-    if (!nsurl) return nil;
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:nsurl];
     request.HTTPMethod = @"GET";
     [request setValue:@"zh-CN,zh;q=0.9" forHTTPHeaderField:@"Accept-language"];
@@ -556,9 +549,7 @@ static NSString *DDPImageIdentityKey(NSString *url) {
 static BOOL gDDPDyTcEnable;   // 一次性放行：防「直接发送」重发被自己拦截
 
 static CMessageMgr *DDPMessageMgr(void) {
-    MMContext *ctx = [%c(MMContext) activeUserContext];
-    if (ctx) return [ctx getService:%c(CMessageMgr)];
-    return [[(MMContext *)[%c(MMContext) currentContext] serviceCenter] getService:%c(CMessageMgr)];
+    return [[%c(MMContext) activeUserContext] getService:%c(CMessageMgr)];
 }
 // 取当前会话名：在 VC 树里找 BaseMsgContentViewController
 static NSString *DDPCurrentChatName(void) {
@@ -1004,7 +995,6 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     [super viewDidLoad];
     self.title = @"DD抖音解析";
     [self ensureTableViewMgr];
-    if (!_tableViewMgr) return;
     [self buildTable];
     UITableView *tv = [_tableViewMgr getTableView];
     self.view.backgroundColor = tv.backgroundColor;
@@ -1017,7 +1007,6 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     tv.frame = CGRectMake(0, self.view.safeAreaInsets.top, self.view.bounds.size.width, self.view.bounds.size.height - self.view.safeAreaInsets.top);
 }
 - (void)buildTable {
-    if (!_tableViewMgr) return;
     [_tableViewMgr clearAllSection];
     id sec = [%c(WCTableViewSectionManager) defaultSection];
     [sec setHeaderTitle:@"解析设置"];
