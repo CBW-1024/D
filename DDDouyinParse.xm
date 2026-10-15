@@ -684,9 +684,9 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
     [decoded replaceOccurrencesOfString:@"\\\"" withString:@"\"" options:0 range:NSMakeRange(0, decoded.length)];
     [decoded replaceOccurrencesOfString:@"&quot;" withString:@"\"" options:0 range:NSMakeRange(0, decoded.length)];
 
-    // 图文帖图集：抖音标准容器 "images"（旧 H5 为 "image_list"），数组内每项含 url_list[]，取其首项即各张图
+    // 图文帖图集：抖音标准容器 "images"，数组内每项含 url_list[]，取其首项即各张图
     // 精确配对容器数组边界，只在图集数组内提取，避免混入视频封面/头像/推荐流的 url_list（不做其他兜底）
-    NSArray *containerKeys = @[@"\"images\"", @"\"image_list\""];
+    NSArray *containerKeys = @[@"\"images\""];
     for (NSString *ckey in containerKeys) {
         NSRange csearch = NSMakeRange(0, decoded.length);
         while (csearch.length > 0) {
