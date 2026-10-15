@@ -119,6 +119,12 @@
 - (void)setMenuItems:(id)items;
 @end
 
+// 消息 cell 基类：菜单显示前会调 canCellShowOperationMenu，此时 self 即 cell，
+// 用来缓存当前消息供 setMenuItems: 取用（PKC 同款：它在此方法里 setTempMsgWrap:）
+@interface BaseMessageCellView : NSObject
+- (BOOL)canCellShowOperationMenu;
+@end
+
 // 可缩放单图页：UIScrollView + UIImageView，支持捏合/双击缩放，背景随深色模式
 @interface DDPPhotoPage : UIViewController <UIScrollViewDelegate>
 @property (nonatomic, copy) NSString *path;
@@ -892,11 +898,19 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 
 #pragma mark - Hook：长按菜单「解析 / 预览」
 
-static NSString *ddp_cellContent(id cell) {
-    id viewModel = [(id)cell valueForKey:@"viewModel"];
-    CMessageWrap *wrap = viewModel ? [viewModel valueForKey:@"messageWrap"] : nil;
+// 从消息对象取判定文本：文本消息用 m_nsContent，其余（分享卡片等）用 m_nsTitle
+static NSString *ddp_wrapContent(CMessageWrap *wrap) {
     return wrap ? ((wrap.m_uiMessageType == 1) ? wrap.m_nsContent : wrap.m_nsTitle) : nil;
 }
+static NSString *ddp_cellContent(id cell) {
+    id viewModel = [(id)cell valueForKey:@"viewModel"];
+    return ddp_wrapContent(viewModel ? [viewModel valueForKey:@"messageWrap"] : nil);
+}
+// 菜单对应的当前 cell：在 cell 级方法里缓存，供 MMMenuController setMenuItems: 取用
+// （既用它取消息内容，也作为菜单项的 target）。
+// 与 PKC 同款做法——不依赖 MMMenuController.responder（它在 setMenuVisible:responder: 才传入，
+// 可能晚于 setMenuItems:，导致取不到内容）。用完即清空，避免残留到下一次菜单。
+static id gDDPMenuCell;
 // 注入菜单项（已注入则跳过）；用 action 派生的 userInfo 去重（MMMenuItem 无 title getter）
 static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSString *title, NSString *svgName, SEL action, long long menuType) {
     if (!enabled) return original;
@@ -953,15 +967,26 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
 // 覆盖两条菜单路径：气泡菜单（非链接长按）与浮窗预览菜单（长按文本/链接）。
 // 从 responder(消息 cell) 反查消息内容，命中抖音链接则追加「解析/预览」；
 // 已存在同 token 项时 ddp_inject_item 会跳过，不会与 operationMenuItems 的注入重复。
+// 菜单显示前微信会调此方法，此时 self 即 cell —— 缓存下来供 setMenuItems: 使用
+%hook BaseMessageCellView
+- (BOOL)canCellShowOperationMenu {
+    gDDPMenuCell = self;
+    return %orig;
+}
+%end
+
+// 覆盖两条菜单路径：气泡菜单（非链接长按）与浮窗预览菜单（长按文本/链接）。
+// 已存在同 token 项时 ddp_inject_item 会跳过，不会与 operationMenuItems 的注入重复。
 %hook MMMenuController
 - (void)setMenuItems:(NSArray *)items {
-    id resp = [self responder];
-    NSString *content = ddp_cellContent(resp);
+    id cell = gDDPMenuCell ?: [self responder];   // 优先用缓存，responder 仅作补充
+    NSString *content = ddp_cellContent(cell);
     BOOL enabled = DDPConfig.shared.enabled
                    && DDPContainsDouyinLink(content) && !DDPIsDouyinLiveText(content);
-    NSArray *all = ddp_inject_item(resp, items, enabled, @"解析", @"icons_filled_search", @selector(ddp_onParse:), 1010);
-    all = ddp_inject_item(resp, all, enabled, @"预览", @"icons_filled_play", @selector(ddp_onPreview:), 1011);
+    NSArray *all = ddp_inject_item(cell, items, enabled, @"解析", @"icons_filled_search", @selector(ddp_onParse:), 1010);
+    all = ddp_inject_item(cell, all, enabled, @"预览", @"icons_filled_play", @selector(ddp_onPreview:), 1011);
     %orig(all);
+    gDDPMenuCell = nil;   // 用完清空，避免残留到下一次菜单
 }
 %end
 
