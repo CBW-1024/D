@@ -14,6 +14,8 @@
 #import <objc/runtime.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <AVKit/AVKit.h>
+#import <QuickLook/QuickLook.h>
 
 #pragma mark - 微信私有类声明（仅声明插件用到的方法）
 
@@ -137,9 +139,19 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
 - (void)showInView:(UIView *)view;
 @end
 
-// 微信自带视频播放器（用于播放本地 mp4）
-@interface MMMoviePlayerController : UIViewController
-- (instancetype)initWithMsgWrap:(id)arg1 VideoPath:(NSString *)arg2;
+// 系统图片预览数据源（QLPreviewController 的 dataSource）
+static const void *kDDPImageQLSourceKey = &kDDPImageQLSourceKey;
+
+@interface DDPImageQLSource : NSObject <QLPreviewControllerDataSource>
+@property (nonatomic, copy) NSArray<NSString *> *paths;
+@end
+@implementation DDPImageQLSource
+- (NSInteger)numberOfPreviewItemsInPreviewController:(QLPreviewController *)controller {
+    return (NSInteger)self.paths.count;
+}
+- (id<QLPreviewItem>)previewController:(QLPreviewController *)controller previewItemAtIndex:(NSInteger)index {
+    return [NSURL fileURLWithPath:self.paths[index]];
+}
 @end
 
 // 视频信息构造（8.0.79 私有类，头文件已确认）
@@ -159,13 +171,6 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
 
 #pragma mark - 插件内部类声明
 
-// 直接观看图片查看器（完整接口提前声明，供 DDPPanel presentImageViewer: 编译期识别）
-@interface DDPImageViewerController : UIViewController <UIScrollViewDelegate>
-@property (nonatomic, copy) NSArray<NSString *> *imagePaths;
-@property (nonatomic, strong) UIScrollView *pager;
-@property (nonatomic, strong) UIPageControl *pageCtl;
-@property (nonatomic, assign) NSInteger currentIndex;
-@end
 
 #pragma mark - 文件日志
 
@@ -1053,7 +1058,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     });
 }
 
-// 解析预览：视频→MMMoviePlayerController 播放；图文/滑块→下载存相册后查看
+// 解析预览：视频→系统 AVPlayerViewController 播放；图文/滑块→下载后系统 QL 预览
 + (void)handleParsePreview:(NSString *)url fromVC:(UIViewController *)vc {
     DDPShowLoading(@"正在解析…");
     [[DDPEngine shared] parseDouyinURL:url completion:^(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err) {
@@ -1086,12 +1091,11 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     }];
 }
 
-// 视频预览：用微信自带 MMMoviePlayerController 播放本地 mp4 并 push 到导航栈
+// 视频预览：用系统 AVPlayerViewController 播放本地 mp4（iOS 14+ 画中画自动支持，无需手动开启）
 + (void)playVideoAtPath:(NSString *)path fromVC:(UIViewController *)vc {
     if (!path.length || !vc) return;
-    MMMoviePlayerController *player = [[%c(MMMoviePlayerController) alloc] initWithMsgWrap:nil VideoPath:path];
-    UINavigationController *nav = vc.navigationController;
-    if (nav) { [nav pushViewController:player animated:YES]; return; }
+    AVPlayerViewController *player = [[AVPlayerViewController alloc] init];
+    player.player = [AVPlayer playerWithURL:[NSURL fileURLWithPath:path]];
     [vc presentViewController:player animated:YES completion:nil];
 }
 
@@ -1117,12 +1121,17 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     });
 }
 
-// 直接观看图片（多图横向分页 + 捏合缩放），系统 UIKit，无第三方依赖
+// 直接观看图片：用系统 QLPreviewController 预览本地图片（多图左右滑切换、捏合缩放均由系统处理）
+// 保存走 QL 系统分享菜单，故不再提供自定义"保存"按钮
 + (void)presentImageViewer:(NSArray<NSString *> *)paths fromVC:(UIViewController *)vc {
     if (!paths.count || !vc) return;
-    DDPImageViewerController *ivc = [[DDPImageViewerController alloc] init];
-    ivc.imagePaths = paths;
-    [vc presentViewController:ivc animated:YES completion:nil];
+    QLPreviewController *ql = [[QLPreviewController alloc] init];
+    DDPImageQLSource *src = [[DDPImageQLSource alloc] init];
+    src.paths = paths;
+    ql.dataSource = src;
+    // QLPreviewController.dataSource 为 assign（非 weak），用关联对象强持有 src，避免释放后野指针
+    objc_setAssociatedObject(ql, kDDPImageQLSourceKey, src, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [vc presentViewController:ql animated:YES completion:nil];
 }
 
 // 解析链接：把提取到的直链以文本消息发出
@@ -1353,116 +1362,6 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
 
 %end
 
-#pragma mark - 图片查看器（直接观看，多图横向分页 + 捏合缩放）
-
-@implementation DDPImageViewerController
-
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.view.backgroundColor = [UIColor blackColor];
-    CGFloat w = self.view.bounds.size.width;
-    CGFloat h = self.view.bounds.size.height;
-    NSInteger n = self.imagePaths.count;
-    self.pager = [[UIScrollView alloc] initWithFrame:self.view.bounds];
-    self.pager.pagingEnabled = YES;
-    self.pager.showsHorizontalScrollIndicator = NO;
-    self.pager.showsVerticalScrollIndicator = NO;
-    self.pager.contentSize = CGSizeMake(w * n, h);
-    self.pager.delegate = self;
-    self.pager.backgroundColor = [UIColor blackColor];
-    [self.view addSubview:self.pager];
-
-    for (NSInteger i = 0; i < n; i++) {
-        CGRect f = CGRectMake(w * i, 0, w, h);
-        UIScrollView *zoom = [[UIScrollView alloc] initWithFrame:f];
-        zoom.minimumZoomScale = 1.0;
-        zoom.maximumZoomScale = 3.0;
-        zoom.showsHorizontalScrollIndicator = NO;
-        zoom.showsVerticalScrollIndicator = NO;
-        zoom.delegate = self;
-        UIImage *img = [UIImage imageWithContentsOfFile:self.imagePaths[i]];
-        UIImageView *iv = [[UIImageView alloc] initWithImage:img];
-        iv.contentMode = UIViewContentModeScaleAspectFit;
-        iv.userInteractionEnabled = YES;
-        CGSize sz = [self fitSize:img.size inSize:CGSizeMake(w, h)];
-        iv.frame = CGRectMake((w - sz.width) / 2, (h - sz.height) / 2, sz.width, sz.height);
-        [zoom addSubview:iv];
-        zoom.contentSize = CGSizeMake(w, h);
-        [self.pager addSubview:zoom];
-        // 单击关闭 / 双击放大
-        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(dismissSelf)];
-        tap.numberOfTapsRequired = 1;
-        UITapGestureRecognizer *dtap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(onDoubleTap:)];
-        dtap.numberOfTapsRequired = 2;
-        [tap requireGestureRecognizerToFail:dtap];
-        [zoom addGestureRecognizer:tap];
-        [zoom addGestureRecognizer:dtap];
-    }
-
-    // 关闭按钮（右上）
-    UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
-    [close setTitle:@"关闭" forState:UIControlStateNormal];
-    [close setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    close.frame = CGRectMake(w - 64, 20, 56, 32);
-    [close addTarget:self action:@selector(dismissSelf) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:close];
-
-    // 保存到相册按钮（左上）
-    UIButton *save = [UIButton buttonWithType:UIButtonTypeSystem];
-    [save setTitle:@"保存" forState:UIControlStateNormal];
-    [save setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    save.frame = CGRectMake(20, 20, 56, 32);
-    [save addTarget:self action:@selector(onSaveCurrent) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:save];
-
-    if (n > 1) {
-        self.pageCtl = [[UIPageControl alloc] initWithFrame:CGRectMake(0, h - 30, w, 20)];
-        self.pageCtl.numberOfPages = n;
-        self.pageCtl.currentPage = 0;
-        [self.view addSubview:self.pageCtl];
-    }
-}
-
-- (CGSize)fitSize:(CGSize)src inSize:(CGSize)box {
-    if (src.width <= 0 || src.height <= 0) return box;
-    CGFloat r = MIN(box.width / src.width, box.height / src.height);
-    return CGSizeMake(src.width * r, src.height * r);
-}
-
-- (void)scrollViewDidEndDecelerating:(UIScrollView *)scrollView {
-    if (scrollView == self.pager && self.pageCtl) {
-        NSInteger p = (NSInteger)(self.pager.contentOffset.x / self.pager.bounds.size.width + 0.5);
-        self.pageCtl.currentPage = p;
-        self.currentIndex = p;
-    }
-}
-
-- (UIView *)viewForZoomingInScrollView:(UIScrollView *)scrollView {
-    if (scrollView == self.pager) return nil;
-    return scrollView.subviews.firstObject;
-}
-
-// 双击放大/还原
-- (void)onDoubleTap:(UITapGestureRecognizer *)gesture {
-    UIScrollView *zoom = (UIScrollView *)gesture.view;
-    CGFloat scale = (zoom.zoomScale > 1.0) ? 1.0 : 2.0;
-    [zoom setZoomScale:scale animated:YES];
-}
-
-// 保存当前图片到相册
-- (void)onSaveCurrent {
-    if (self.currentIndex < 0 || self.currentIndex >= self.imagePaths.count) return;
-    [DDPPanel saveImageToAlbumAtPath:self.imagePaths[self.currentIndex] completion:^(BOOL success) {
-        if (success) DDPShowDone(@"保存成功");
-        else DDPShowError(@"保存失败");
-    }];
-}
-
-- (void)dismissSelf {
-    [self dismissViewControllerAnimated:YES completion:nil];
-}
-
-@end
 
 #pragma mark - 设置界面
 
