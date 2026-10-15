@@ -319,7 +319,7 @@ static inline NSString *DDPTempPathExt(NSString *url, NSString *ext) {
 // 优先看字节魔数（GIF87a/GIF89a），URL 无扩展名或扩展名不准时也能识别；最后回退到 URL 后缀/png/jpg
 static inline NSString *DDPImageExt(NSData *data, NSString *url) {
     if (data.length >= 6) {
-        const unsigned char *b = data.bytes;
+        const unsigned char *b = (const unsigned char *)data.bytes;
         if (b[0] == 'G' && b[1] == 'I' && b[2] == 'F') return @"gif";
     }
     NSString *ue = [url pathExtension].lowercaseString;
@@ -1214,7 +1214,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 // 保存到相册（视频）
 + (void)saveVideoToAlbumAtPath:(NSString *)path completion:(void(^)(BOOL success))completion {
     NSURL *fileURL = [NSURL fileURLWithPath:path];
-    [PHPhotoLibrary requestAuthorization:^(PHAuthorizationStatus status) {
+    [PHPhotoLibrary requestAuthorizationForAccessLevel:PHAccessLevelAddOnly handler:^(PHAuthorizationStatus status) {
         if (status != PHAuthorizationStatusAuthorized) {
             if (completion) completion(NO);
             return;
@@ -1228,20 +1228,23 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 }
 
 // 保存到相册（图片，图文/滑块）
-// 用原始字节 creationRequestForAssetFromImageData: 写入，保留 GIF 动画（imageWithContentsOfFile 会丢帧变静态图）
+// 用原始字节 addResourceWithType:data: 写入，保留 GIF 动画（经 UIImage 解码会丢帧变静态图）。
+// 原 creationRequestForAssetFromImageData: 在 iOS 15 废弃、新 SDK 已移除，改用更稳的 creationRequestForAsset + addResource。
 + (void)saveImageToAlbumAtPath:(NSString *)path completion:(void(^)(BOOL success))completion {
     if (!path.length) { if (completion) completion(NO); return; }
     NSData *data = [NSData dataWithContentsOfFile:path];   // 读原始字节，避免经 UIImage 解码丢帧
     if (!data.length) { if (completion) completion(NO); return; }
-    [PHPhotoLibrary requestAuthorization:^(PHAuthorizationStatus status) {
+    [PHPhotoLibrary requestAuthorizationForAccessLevel:PHAccessLevelAddOnly handler:^(PHAuthorizationStatus status) {
         if (status != PHAuthorizationStatusAuthorized) {
             if (completion) completion(NO);
             return;
         }
         [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
-            PHAssetCreationRequest *req = [PHAssetCreationRequest creationRequestForAssetFromImageData:data];
+            PHAssetCreationRequest *req = [PHAssetCreationRequest creationRequestForAsset];
+            [req addResourceWithType:PHAssetResourceTypePhoto data:data options:nil];  // 直接写原始字节，保留 GIF 动图
             req.creationDate = [NSDate date];   // 写入创建时间为当前时间
         } completionHandler:^(BOOL success, NSError *error) {
+            if (!success) DDDLog(@"saveImageToAlbumAtPath: 写相册失败: %@", error);
             if (completion) completion(success);
         }];
     }];
