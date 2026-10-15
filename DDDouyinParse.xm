@@ -313,6 +313,8 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重载 3 次（实�
 @property (nonatomic, strong) NSURLRequest *ddpRequest;
 @property (nonatomic, assign) NSTimeInterval fetchStart;
 @property (nonatomic, assign) NSUInteger lastCleanLen;
+// 视频短链备用：分享页轮询超时未出直链时，退到规范地址重试（诊断用，观察是否多余）
+@property (nonatomic, copy) NSString *ddpCanonical;
 @property (nonatomic, copy) void (^completion)(NSString *html, NSInteger errCode);
 - (void)fetchHTMLFromURL:(NSString *)url completion:(void (^)(NSString *html, NSInteger errCode))completion;
 - (void)ddFinishWithHTML:(NSString *)html code:(NSInteger)code;
@@ -341,7 +343,9 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重载 3 次（实�
     NSURL *nsurl = [NSURL URLWithString:url];
     NSURLRequest *request = [NSURLRequest requestWithURL:nsurl cachePolicy:NSURLRequestUseProtocolCachePolicy timeoutInterval:30.0];
     self.ddpRequest = request; self.retries = 0; self.lastCleanLen = 0;
+    self.ddpCanonical = nil;
     self.fetchStart = CFAbsoluteTimeGetCurrent();
+    DDDLog(@"[fetch] 开始加载 url=%@", url);
     dispatch_async(dispatch_get_main_queue(), ^{ [self.webView loadRequest:request]; });
 }
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
@@ -353,9 +357,17 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重载 3 次（实�
     if (m) {
         NSString *type = [u substringWithRange:[m rangeAtIndex:1]];
         NSString *awemeId = [u substringWithRange:[m rangeAtIndex:2]];
-        self.fetchStart = CFAbsoluteTimeGetCurrent();
-        [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"https://www.douyin.com/%@/%@", type, awemeId]]]];
-        return;
+        NSString *canon = [NSString stringWithFormat:@"https://www.douyin.com/%@/%@", type, awemeId];
+        // 图集：分享页只有渲染后的 DOM <img>、没有内嵌 JSON "images"，必须跳规范地址才取得到 url_list
+        if ([type caseInsensitiveCompare:@"note"] == NSOrderedSame) {
+            DDDLog(@"[fetch] note 短链 → 直接跳规范 %@", canon);
+            self.fetchStart = CFAbsoluteTimeGetCurrent();
+            [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:canon]]];
+            return;
+        }
+        // 视频：分享页自带播放器，JS 执行后 playwm 会进 DOM，先留在当前页轮询
+        DDDLog(@"[fetch] video 短链 → 先轮询分享页，备用规范=%@", canon);
+        self.ddpCanonical = canon;
     }
     [self pollHTML:webView attempt:0];
 }
@@ -366,16 +378,27 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重载 3 次（实�
     [webView evaluateJavaScript:@"document.documentElement.outerHTML" completionHandler:^(id result, NSError *error) {
         __strong typeof(wself) strong = wself;
         if (!strong) return;
-        if (error) { [strong ddFinishWithHTML:nil code:-2]; return; }
+        if (error) { DDDLog(@"[fetch] JS 取 HTML 失败 %@", error); [strong ddFinishWithHTML:nil code:-2]; return; }
         NSString *html = result ? [NSString stringWithFormat:@"%@", result] : @"";
         NSTimeInterval waited = CFAbsoluteTimeGetCurrent() - strong.fetchStart;
         if ([html containsString:@"playwm"] ||
             [html containsString:@"aweme-share-swiper-item"] ||
             [html containsString:@"aweme-slides-swiper-item"]) {
+            DDDLog(@"[fetch] 命中直链 attempt=%lu waited=%.1fs htmlLen=%lu", (unsigned long)attempt, waited, (unsigned long)html.length);
             [strong handleRenderedHTML:html];
             return;
         }
-        if (waited > 5.0) { [strong handleRenderedHTML:html]; return; }
+        if (waited > 5.0) {
+            if (strong.ddpCanonical.length) {   // 视频：分享页没出直链，退到规范地址重试
+                NSString *canon = strong.ddpCanonical; strong.ddpCanonical = nil;
+                DDDLog(@"[fetch] 分享页超时无直链(%.1fs) → 重试规范 %@", waited, canon);
+                strong.fetchStart = CFAbsoluteTimeGetCurrent();
+                [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:canon]]];
+                return;
+            }
+            DDDLog(@"[fetch] 超时无直链，收尾 htmlLen=%lu", (unsigned long)html.length);
+            [strong handleRenderedHTML:html]; return;
+        }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [strong pollHTML:webView attempt:attempt + 1];
         });
@@ -915,29 +938,22 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     return items;
 }
 
-// 菜单显示前的统一入口：微信直接把消息对象(inMsgWrap)传进来，menuSourceType 区分来源
-// （气泡菜单 / 浮窗预览等不同来源都走这里）。两个重载都缓存，覆盖微信实际调用的任意一个。
+// 菜单显示前的统一入口：微信把消息对象(inMsgWrap)直接传进来，覆盖气泡菜单与浮窗预览菜单。
+// 只 hook 2 参重载——实测它每次菜单都最先被调用（4 参在其后），且缓存在 %orig 之前完成，
+// 到 setMenuItems: 时必然已就绪；4 参独有的 menuSourceType/buttonList 我们并未使用。
 %hook BaseMsgContentViewController
 - (void)willShowMenuController:(id)menu inMsgWrap:(id)wrap {
     gDDPMenuWrap = wrap; gDDPMenuVC = self;
-    DDDLog(@"[menu] willShow(2参) wrap=%d vc=%d", wrap != nil, self != nil);
-    %orig;
-}
-- (void)willShowMenuController:(id)menu inMsgWrap:(id)wrap menuSourceType:(int)type buttonList:(id)list {
-    gDDPMenuWrap = wrap; gDDPMenuVC = self;
-    DDDLog(@"[menu] willShow(4参) type=%d wrap=%d", type, wrap != nil);
     %orig;
 }
 %new
 - (void)ddp_vcParse:(id)sender {
     NSString *url = DDPExtractURL(ddp_wrapContent(gDDPMenuWrap));
-    DDDLog(@"[menu] ddp_vcParse url=%d", url.length > 0);
     if (url.length) [DDPPanel handleParseSend:url user:DDPCurrentChatName()];
 }
 %new
 - (void)ddp_vcPreview:(id)sender {
     NSString *url = DDPExtractURL(ddp_wrapContent(gDDPMenuWrap));
-    DDDLog(@"[menu] ddp_vcPreview url=%d", url.length > 0);
     if (url.length) [DDPPanel handleParsePreview:url fromVC:self];
 }
 %end
@@ -952,7 +968,6 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     NSString *content = ddp_wrapContent(gDDPMenuWrap);
     BOOL enabled = DDPConfig.shared.enabled
                    && DDPContainsDouyinLink(content) && !DDPIsDouyinLiveText(content);
-    DDDLog(@"[menu] setMenuItems 原有=%lu 命中=%d", (unsigned long)items.count, enabled);
     NSArray *all = ddp_inject_item(gDDPMenuVC, items, enabled, @"解析", @"icons_filled_search", @selector(ddp_vcParse:), 1010);
     all = ddp_inject_item(gDDPMenuVC, all, enabled, @"预览", @"icons_filled_play", @selector(ddp_vcPreview:), 1011);
     %orig(all);
