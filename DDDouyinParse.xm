@@ -327,8 +327,12 @@ static WeToast *DDPToast(void) {
 
 // 同时只保留一个 loading 实例；起新的前先收掉旧的，否则上一个转圈会永远停在屏幕上
 static void DDPHideLoading(void) {
-    [gDDPBusyToast hideWithAnimated:YES];
-    gDDPBusyToast = nil;
+    void (^work)(void) = ^{
+        [gDDPBusyToast hideWithAnimated:YES];
+        gDDPBusyToast = nil;
+    };
+    if ([NSThread isMainThread]) work();
+    else dispatch_async(dispatch_get_main_queue(), work);
 }
 
 static void DDPShowLoading(NSString *text) {
@@ -345,6 +349,14 @@ static void DDPShowError(NSString *text) {
     dispatch_async(dispatch_get_main_queue(), ^{
         DDPHideLoading();
         [DDPToast() showErrorToastWithText:text];
+    });
+}
+
+// 成功提示（对勾）+ 收起加载转圈（主线程）。用于保存相册等需要正向反馈的动作
+static void DDPShowDone(NSString *text) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        DDPHideLoading();
+        [DDPToast() showDoneToastWithText:text];
     });
 }
 
@@ -437,18 +449,40 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重试 3 次（配�
     });
 }
 
-// 加载完延迟取 outerHTML（等 JS 渲染）
+// 导航完成：立即开始轮询取 outerHTML，命中 playwm/图集即收，不再死等固定 5s
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
     DDDLog(@"[DDPWebFetcher] didFinishNavigation retries=%u 距开始%.1fs", self.retries, CFAbsoluteTimeGetCurrent() - self.fetchStart);
+    [self pollHTML:webView attempt:0];
+}
+
+// 轮询检测：每 0.5s 取一次 outerHTML，出现 playwm/图集立即交回 handleRenderedHTML 收尾（提前命中）；
+// 超过 5s 仍无则同样交回，让其走原有"同 HTML 即停 + 重试"逻辑。避免固定 5s 空等，且不退化最坏耗时。
+- (void)pollHTML:(WKWebView *)webView attempt:(NSUInteger)attempt {
+    if (self.hasCompleted) return;
     __weak typeof(self) wself = self;
-    // 固定延迟 5s 等 JS 渲染
-    dispatch_time_t delay = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC));
-    dispatch_after(delay, dispatch_get_main_queue(), ^{
-        [webView evaluateJavaScript:@"document.documentElement.outerHTML" completionHandler:^(id result, NSError *error) {
-            if (error) { DDDLog(@"DDPWebFetcher: evalJS 失败 %@", error); [wself ddFinishWithHTML:nil code:-2]; return; }
-            [wself handleRenderedHTML:(result ? [NSString stringWithFormat:@"%@", result] : @"")];
-        }];
-    });
+    [webView evaluateJavaScript:@"document.documentElement.outerHTML" completionHandler:^(id result, NSError *error) {
+        __strong typeof(wself) strong = wself;
+        if (!strong) return;
+        if (error) { DDDLog(@"DDPWebFetcher: evalJS 失败 %@", error); [strong ddFinishWithHTML:nil code:-2]; return; }
+        NSString *html = result ? [NSString stringWithFormat:@"%@", result] : @"";
+        NSTimeInterval waited = CFAbsoluteTimeGetCurrent() - strong.fetchStart;
+        if ([html containsString:@"playwm"] ||
+            [html containsString:@"aweme-share-swiper-item"] ||
+            [html containsString:@"aweme-slides-swiper-item"]) {
+            DDDLog(@"[DDPWebFetcher] 轮询第%lu次命中 playwm 距开始%.1fs", (unsigned long)attempt, waited);
+            [strong handleRenderedHTML:html];
+            return;
+        }
+        if (waited > 5.0) {
+            DDDLog(@"[DDPWebFetcher] 轮询%lu次(%.1fs)未命中，交回原判定", (unsigned long)attempt, waited);
+            [strong handleRenderedHTML:html];
+            return;
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [strong pollHTML:webView attempt:attempt + 1];
+        });
+    }];
 }
 
 // 失败兜底，避免反复重载
@@ -731,8 +765,8 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 + (void)sendImageAtPath:(NSString *)path toUser:(NSString *)user;
 + (void)sendImagesForURLs:(NSArray<NSString *> *)urls user:(NSString *)user finish:(void(^)(void))finish;
 + (void)playVideoAtPath:(NSString *)path fromVC:(UIViewController *)vc;
-+ (void)saveVideoToAlbumAtPath:(NSString *)path;
-+ (void)saveImageToAlbumAtPath:(NSString *)path;
++ (void)saveVideoToAlbumAtPath:(NSString *)path completion:(void(^)(BOOL success))completion;
++ (void)saveImageToAlbumAtPath:(NSString *)path completion:(void(^)(BOOL success))completion;
 + (void)downloadAndSaveImages:(NSArray<NSString *> *)urls finish:(void(^)(void))finish;
 + (void)sendVideoForURL:(NSString *)videoURL shareURL:(NSString *)shareURL user:(NSString *)user finish:(void(^)(void))finish;
 + (void)downloadImagesLocally:(NSArray<NSString *> *)urls completion:(void (^)(NSArray<NSString *> *paths))completion;
@@ -805,13 +839,15 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         } else {
             DDDLog(@"sendVideoForURL: 下载失败，data 为空");
         }
-        if (ok) {
-            DDDLog(@"sendVideoForURL: 触发发送 → %@", path);
-            [DDPPanel sendVideoAtPath:path toUser:user];
-        } else {
-            DDDLog(@"sendVideoForURL: 未触发发送（下载/写文件失败）");
+        if (!ok) {
+            DDDLog(@"sendVideoForURL: 下载/写文件失败，提示并收起转圈");
+            DDPShowError(@"解析失败");
+            return;
         }
+        // 下载完成即收起转圈（发送交给微信，不再等缩略图生成/AddVideoMsg）；随后异步触发发送
+        DDDLog(@"sendVideoForURL: 下载完成，收起转圈并触发发送 → %@", path);
         if (finish) finish();
+        [DDPPanel sendVideoAtPath:path toUser:user];
     });
 }
 
@@ -819,6 +855,8 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 + (void)downloadAndSaveImages:(NSArray<NSString *> *)urls finish:(void(^)(void))finish {
     if (!urls.count) { if (finish) finish(); return; }
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        __block NSInteger total = 0, done = 0, failed = 0;
+        dispatch_queue_t q = dispatch_queue_create("ddp.save", DISPATCH_QUEUE_SERIAL);
         for (NSString *imgURL in urls) {
             DDDLog(@"下载开始(存相册图): %@", [DDPTempPathExt(imgURL, [[imgURL pathExtension].lowercaseString isEqualToString:@"png"]?@"png":@"jpg") lastPathComponent]);
             NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL];
@@ -829,10 +867,23 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
             NSFileManager *fm = [NSFileManager defaultManager];
             if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
             if ([data writeToFile:path atomically:YES]) {
-                [DDPPanel saveImageToAlbumAtPath:path];
+                total++;
+                [DDPPanel saveImageToAlbumAtPath:path completion:^(BOOL success) {
+                    dispatch_async(q, ^{
+                        done++;
+                        if (!success) failed++;
+                        if (done < total) return;
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            if (failed == 0) DDPShowDone(@"保存成功");
+                            else if (failed < total) DDPShowDone(@"部分保存成功");
+                            else DDPShowError(@"保存失败");
+                        });
+                    });
+                }];
             }
         }
-        if (finish) finish();
+        // 全部下载失败（无保存动作）：仅收起转圈，避免卡死
+        if (total == 0) { if (finish) finish(); }
     });
 }
 
@@ -971,6 +1022,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 + (void)sendImagesForURLs:(NSArray<NSString *> *)urls user:(NSString *)user finish:(void(^)(void))finish {
     if (!urls.count) { if (finish) finish(); return; }
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        BOOL anySent = NO;
         for (NSString *imgURL in urls) {
             @autoreleasepool {
                 NSString *ext = @"jpg";
@@ -984,12 +1036,15 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
                 if ([data writeToFile:path atomically:YES]) {
                     DDDLog(@"sendImagesForURLs: 写文件成功，触发发送 %@", [path lastPathComponent]);
                     [DDPPanel sendImageAtPath:path toUser:user];
+                    anySent = YES;
                 } else {
                     DDDLog(@"sendImagesForURLs: 写文件失败 %@", [path lastPathComponent]);
                 }
             }
         }
-        if (finish) finish();
+        // 全部下载/发送失败才提示；部分成功则静默（已发的留下），仅收起转圈
+        if (!anySent) DDPShowError(@"解析失败");
+        else if (finish) finish();
     });
 }
 
@@ -1104,8 +1159,15 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
                     if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
                     ok = [data writeToFile:path atomically:YES];
                 }
-                if (ok) [DDPPanel saveVideoToAlbumAtPath:path];
-                finish();
+                if (ok) {
+                    [DDPPanel saveVideoToAlbumAtPath:path completion:^(BOOL success) {
+                        if (success) DDPShowDone(@"保存成功");
+                        else DDPShowError(@"保存失败");
+                    }];
+                } else {
+                    DDDLog(@"handleSaveAlbum: 视频下载/写文件失败，提示并收起转圈");
+                    DDPShowError(@"解析失败");
+                }
             });
         } else {
             [self downloadAndSaveImages:imageURLs finish:finish];
@@ -1114,33 +1176,37 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 }
 
 // 保存到相册（视频）
-+ (void)saveVideoToAlbumAtPath:(NSString *)path {
++ (void)saveVideoToAlbumAtPath:(NSString *)path completion:(void(^)(BOOL success))completion {
     NSURL *fileURL = [NSURL fileURLWithPath:path];
     [PHPhotoLibrary requestAuthorization:^(PHAuthorizationStatus status) {
         if (status != PHAuthorizationStatusAuthorized) {
+            if (completion) completion(NO);
             return;
         }
         [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
             [PHAssetCreationRequest creationRequestForAssetFromVideoAtFileURL:fileURL];
         } completionHandler:^(BOOL success, NSError *error) {
+            if (completion) completion(success);
         }];
     }];
 }
 
 // 保存到相册（图片，图文/滑块）
 // 流程：imageWithData: 转 UIImage → 请求相册授权 → 在变更块里 creationRequestForAssetFromImage: + 写入创建时间
-+ (void)saveImageToAlbumAtPath:(NSString *)path {
-    if (!path.length) return;
++ (void)saveImageToAlbumAtPath:(NSString *)path completion:(void(^)(BOOL success))completion {
+    if (!path.length) { if (completion) completion(NO); return; }
     UIImage *image = [UIImage imageWithContentsOfFile:path];
-    if (!image) { return; }
+    if (!image) { if (completion) completion(NO); return; }
     [PHPhotoLibrary requestAuthorization:^(PHAuthorizationStatus status) {
         if (status != PHAuthorizationStatusAuthorized) {
+            if (completion) completion(NO);
             return;
         }
         [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
             PHAssetCreationRequest *req = [PHAssetCreationRequest creationRequestForAssetFromImage:image];
             req.creationDate = [NSDate date];   // 写入创建时间为当前时间
         } completionHandler:^(BOOL success, NSError *error) {
+            if (completion) completion(success);
         }];
     }];
 }
@@ -1381,7 +1447,10 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
 // 保存当前图片到相册
 - (void)onSaveCurrent {
     if (self.currentIndex < 0 || self.currentIndex >= self.imagePaths.count) return;
-    [DDPPanel saveImageToAlbumAtPath:self.imagePaths[self.currentIndex]];
+    [DDPPanel saveImageToAlbumAtPath:self.imagePaths[self.currentIndex] completion:^(BOOL success) {
+        if (success) DDPShowDone(@"保存成功");
+        else DDPShowError(@"保存失败");
+    }];
 }
 
 - (void)dismissSelf {
