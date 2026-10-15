@@ -446,68 +446,34 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
     return [result copy];
 }
 
-// 图片唯一标识：剥掉协议+域名、查询串、~tplv… 尺寸后缀，只留图床资源主干。
-// 抖音同一张图会给出多个 CDN 地址（p3/p6/p9…）和多种尺寸，它们的路径主干相同、只有域名/后缀不同，
-// 按整串 URL 去重无法合并，导致 7 张图膨胀成十几条重复项；必须按主干去重。
-static NSString *DDPImageIdentityKey(NSString *url) {
-    NSString *s = url;
-    NSRange sch = [s rangeOfString:@"://"];
-    if (sch.location != NSNotFound) {
-        s = [s substringFromIndex:NSMaxRange(sch)];
-        NSRange slash = [s rangeOfString:@"/"];
-        if (slash.location != NSNotFound) s = [s substringFromIndex:slash.location];
-    }
-    NSRange q = [s rangeOfString:@"?"];
-    if (q.location != NSNotFound) s = [s substringToIndex:q.location];
-    NSRange tilde = [s rangeOfString:@"~"];
-    if (tilde.location != NSNotFound) s = [s substringToIndex:tilde.location];
-    return s;
-}
-
-// 图集：从内嵌 JSON 的 "images" 容器提取各张图（精确配对数组边界，不兜底、不混入封面/头像）
+// 图集：只取第一个 "images" 容器（页面会把同一份图集重复嵌入多次，实测首个容器即完整图集）
 - (NSArray<NSString *> *)extractGalleryImagesFromHTML:(NSString *)html {
     NSMutableArray *result = [NSMutableArray array];
-    NSMutableSet *seen = [NSMutableSet set];
-    NSUInteger rawCount = 0, containerIdx = 0;   // 诊断用：去重前总数 / 容器序号
     NSMutableString *decoded = [html mutableCopy];
     [decoded replaceOccurrencesOfString:@"\\u002f" withString:@"/" options:0 range:NSMakeRange(0, decoded.length)];
     [decoded replaceOccurrencesOfString:@"\\/" withString:@"/" options:0 range:NSMakeRange(0, decoded.length)];
     [decoded replaceOccurrencesOfString:@"\\\"" withString:@"\"" options:0 range:NSMakeRange(0, decoded.length)];
     [decoded replaceOccurrencesOfString:@"&quot;" withString:@"\"" options:0 range:NSMakeRange(0, decoded.length)];
 
-    NSRange csearch = NSMakeRange(0, decoded.length);
-    while (csearch.length > 0) {
-        NSRange cr = [decoded rangeOfString:@"\"images\"" options:NSCaseInsensitiveSearch range:csearch];
-        if (cr.location == NSNotFound) break;
-        NSRange br = [decoded rangeOfString:@":[" options:0 range:NSMakeRange(cr.location, MIN(decoded.length - cr.location, 64))];
-        NSInteger arrOpen = (br.location != NSNotFound) ? ((NSInteger)br.location + (NSInteger)br.length - 1) : -1;
-        NSInteger arrEnd = -1, depth = 0;
-        for (NSInteger i = arrOpen; i >= 0 && i < (NSInteger)decoded.length; i++) {
-            unichar ch = [decoded characterAtIndex:i];
-            if (ch == '[') depth++;
-            else if (ch == ']') { depth--; if (depth == 0) { arrEnd = i; break; } }
-        }
-        if (arrEnd > arrOpen) {
-            NSString *seg = [decoded substringWithRange:NSMakeRange(arrOpen, arrEnd - arrOpen + 1)];
-            NSRegularExpression *reU = [NSRegularExpression
-                regularExpressionWithPattern:@"\"url_list\"\\s*:\\s*\\[\\s*\"(https?://[^\"]+)\""
-                options:NSRegularExpressionCaseInsensitive error:nil];
-            NSArray *ms = [reU matchesInString:seg options:0 range:NSMakeRange(0, seg.length)];
-            DDDLog(@"[extractGallery] 容器#%lu url_list=%lu", (unsigned long)containerIdx, (unsigned long)ms.count);
-            for (NSTextCheckingResult *m in ms) {
-                rawCount++;
-                NSString *u = [[seg substringWithRange:[m rangeAtIndex:1]] stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
-                NSString *key = DDPImageIdentityKey(u);
-                if (u.length && key.length && ![seen containsObject:key]) {
-                    [seen addObject:key];
-                    [result addObject:u];
-                }
-            }
-        }
-        containerIdx++;
-        csearch = NSMakeRange(cr.location + @"\"images\"".length, decoded.length - (cr.location + @"\"images\"".length));
+    NSRange cr = [decoded rangeOfString:@"\"images\"" options:NSCaseInsensitiveSearch];
+    if (cr.location == NSNotFound) return @[];
+    NSRange br = [decoded rangeOfString:@":[" options:0 range:NSMakeRange(cr.location, MIN(decoded.length - cr.location, 64))];
+    NSInteger arrOpen = (br.location != NSNotFound) ? ((NSInteger)br.location + (NSInteger)br.length - 1) : -1;
+    NSInteger arrEnd = -1, depth = 0;
+    for (NSInteger i = arrOpen; i >= 0 && i < (NSInteger)decoded.length; i++) {
+        unichar ch = [decoded characterAtIndex:i];
+        if (ch == '[') depth++;
+        else if (ch == ']') { depth--; if (depth == 0) { arrEnd = i; break; } }
     }
-    DDDLog(@"[extractGallery] 容器总数=%lu 去重前=%lu 去重后=%lu", (unsigned long)containerIdx, (unsigned long)rawCount, (unsigned long)result.count);
+    if (arrEnd > arrOpen) {
+        NSString *seg = [decoded substringWithRange:NSMakeRange(arrOpen, arrEnd - arrOpen + 1)];
+        NSRegularExpression *reU = [NSRegularExpression
+            regularExpressionWithPattern:@"\"url_list\"\\s*:\\s*\\[\\s*\"(https?://[^\"]+)\""
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        for (NSTextCheckingResult *m in [reU matchesInString:seg options:0 range:NSMakeRange(0, seg.length)]) {
+            [result addObject:[[seg substringWithRange:[m rangeAtIndex:1]] stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"]];
+        }
+    }
     return [result copy];
 }
 - (void)parseDouyinURL:(NSString *)url
