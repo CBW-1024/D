@@ -112,17 +112,11 @@
 - (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
 @end
 
-// 微信自定义菜单控制器：气泡菜单(TextMessageCellView operationMenuItems) 与
-// 浮窗预览菜单(长按文本/链接) 最终都经 setMenuItems: 装配，故在此统一注入
+// 微信自定义菜单控制器：气泡菜单与浮窗预览菜单最终都经 setMenuItems: 装配，故在此统一注入
 @interface MMMenuController : NSObject
 - (void)setMenuItems:(id)items;
 @end
 
-// 消息 cell 基类：菜单显示前会调 canCellShowOperationMenu，此时 self 即 cell，
-// 用来缓存当前消息供 setMenuItems: 取用（PKC 同款：它在此方法里 setTempMsgWrap:）
-@interface BaseMessageCellView : NSObject
-- (BOOL)canCellShowOperationMenu;
-@end
 
 // 可缩放单图页：UIScrollView + UIImageView，支持捏合/双击缩放，背景随深色模式
 @interface DDPPhotoPage : UIViewController <UIScrollViewDelegate>
@@ -901,15 +895,11 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 static NSString *ddp_wrapContent(CMessageWrap *wrap) {
     return wrap ? ((wrap.m_uiMessageType == 1) ? wrap.m_nsContent : wrap.m_nsTitle) : nil;
 }
-static NSString *ddp_cellContent(id cell) {
-    id viewModel = [(id)cell valueForKey:@"viewModel"];
-    return ddp_wrapContent(viewModel ? [viewModel valueForKey:@"messageWrap"] : nil);
-}
-// 菜单对应的当前 cell：在 cell 级方法里缓存，供 MMMenuController setMenuItems: 取用
-// （既用它取消息内容，也作为菜单项的 target）。
-// 与 PKC 同款做法——不依赖 MMMenuController.responder（它在 setMenuVisible:responder: 才传入，
-// 可能晚于 setMenuItems:，导致取不到内容）。用完即清空，避免残留到下一次菜单。
-static id gDDPMenuCell;
+// 菜单对应的消息与宿主 VC：由 BaseMsgContentViewController willShowMenuController: 直传并缓存。
+// 微信在该回调里把消息对象(inMsgWrap)直接交给插件，无需从 cell 反查，也没有时序风险。
+// 不清空——下次菜单显示时会被覆盖；handler 在菜单点击时才触发，清空会导致拿不到消息。
+static CMessageWrap *gDDPMenuWrap;
+static UIViewController *gDDPMenuVC;
 // 注入菜单项（已注入则跳过）；用 action 派生的 userInfo 去重（MMMenuItem 无 title getter）
 static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSString *title, NSString *svgName, SEL action, long long menuType) {
     if (!enabled) return original;
@@ -925,67 +915,47 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     return items;
 }
 
-// 必须 hook 具体 cell 子类（operationMenuItems 被 70+ 子类各自实现且不调 super），不能 hook 基类
-%hook TextMessageCellView
-- (id)operationMenuItems {
-    NSArray *items = %orig;
-    NSString *content = ddp_cellContent(self);
-    BOOL enabled = DDPConfig.shared.enabled
-                   && DDPContainsDouyinLink(content) && !DDPIsDouyinLiveText(content);
-    items = ddp_inject_item(self, items, enabled, @"解析", @"icons_filled_search", @selector(ddp_onParse:), 1010);
-    items = ddp_inject_item(self, items, enabled, @"预览", @"icons_filled_play", @selector(ddp_onPreview:), 1011);
-    return items;
+// 菜单显示前的统一入口：微信直接把消息对象(inMsgWrap)传进来，menuSourceType 区分来源
+// （气泡菜单 / 浮窗预览等不同来源都走这里）。两个重载都缓存，覆盖微信实际调用的任意一个。
+%hook BaseMsgContentViewController
+- (void)willShowMenuController:(id)menu inMsgWrap:(id)wrap {
+    gDDPMenuWrap = wrap; gDDPMenuVC = self;
+    DDDLog(@"[menu] willShow(2参) wrap=%d vc=%d", wrap != nil, self != nil);
+    %orig;
 }
-- (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
-    if (action == @selector(ddp_onParse:) || action == @selector(ddp_onPreview:)) {
-        NSString *content = ddp_cellContent(self);
-        return DDPConfig.shared.enabled
-               && DDPContainsDouyinLink(content) && !DDPIsDouyinLiveText(content);
-    }
-    return %orig;
+- (void)willShowMenuController:(id)menu inMsgWrap:(id)wrap menuSourceType:(int)type buttonList:(id)list {
+    gDDPMenuWrap = wrap; gDDPMenuVC = self;
+    DDDLog(@"[menu] willShow(4参) type=%d wrap=%d", type, wrap != nil);
+    %orig;
 }
 %new
-- (void)ddp_onParse:(id)sender {
-    if (!DDPConfig.shared.enabled) return;
-    NSString *url = DDPExtractURL(ddp_cellContent(self));
+- (void)ddp_vcParse:(id)sender {
+    NSString *url = DDPExtractURL(ddp_wrapContent(gDDPMenuWrap));
+    DDDLog(@"[menu] ddp_vcParse url=%d", url.length > 0);
     if (url.length) [DDPPanel handleParseSend:url user:DDPCurrentChatName()];
 }
 %new
-- (void)ddp_onPreview:(id)sender {
-    if (!DDPConfig.shared.enabled) return;
-    NSString *url = DDPExtractURL(ddp_cellContent(self));
-    if (!url.length) return;
-    UIResponder *r = (UIResponder *)self;
-    while ((r = [r nextResponder]))
-        if ([r isKindOfClass:[UIViewController class]]) { [DDPPanel handleParsePreview:url fromVC:(UIViewController *)r]; return; }
+- (void)ddp_vcPreview:(id)sender {
+    NSString *url = DDPExtractURL(ddp_wrapContent(gDDPMenuWrap));
+    DDDLog(@"[menu] ddp_vcPreview url=%d", url.length > 0);
+    if (url.length) [DDPPanel handleParsePreview:url fromVC:self];
 }
 %end
 
 #pragma mark - Hook：MMMenuController setMenuItems（统一菜单注入点）
 
-// 覆盖两条菜单路径：气泡菜单（非链接长按）与浮窗预览菜单（长按文本/链接）。
-// 从 canCellShowOperationMenu 缓存的 cell 取消息内容，命中抖音链接则追加「解析/预览」；
-// 已存在同 token 项时 ddp_inject_item 会跳过，不会与 operationMenuItems 的注入重复。
-// 菜单显示前微信会调此方法，此时 self 即 cell —— 缓存下来供 setMenuItems: 使用
-%hook BaseMessageCellView
-- (BOOL)canCellShowOperationMenu {
-    gDDPMenuCell = self;
-    return %orig;
-}
-%end
-
-// 覆盖两条菜单路径：气泡菜单（非链接长按）与浮窗预览菜单（长按文本/链接）。
-// 已存在同 token 项时 ddp_inject_item 会跳过，不会与 operationMenuItems 的注入重复。
+// 唯一注入点：气泡菜单与浮窗预览菜单最终都经此装配。
+// 消息内容来自 willShowMenuController: 直传的 gDDPMenuWrap，菜单项 target 用宿主 VC。
+// 已存在同 token 项时 ddp_inject_item 会跳过，不会重复。
 %hook MMMenuController
 - (void)setMenuItems:(NSArray *)items {
-    id cell = gDDPMenuCell;                       // 由 canCellShowOperationMenu 缓存
-    NSString *content = ddp_cellContent(cell);
+    NSString *content = ddp_wrapContent(gDDPMenuWrap);
     BOOL enabled = DDPConfig.shared.enabled
                    && DDPContainsDouyinLink(content) && !DDPIsDouyinLiveText(content);
-    NSArray *all = ddp_inject_item(cell, items, enabled, @"解析", @"icons_filled_search", @selector(ddp_onParse:), 1010);
-    all = ddp_inject_item(cell, all, enabled, @"预览", @"icons_filled_play", @selector(ddp_onPreview:), 1011);
+    DDDLog(@"[menu] setMenuItems 原有=%lu 命中=%d", (unsigned long)items.count, enabled);
+    NSArray *all = ddp_inject_item(gDDPMenuVC, items, enabled, @"解析", @"icons_filled_search", @selector(ddp_vcParse:), 1010);
+    all = ddp_inject_item(gDDPMenuVC, all, enabled, @"预览", @"icons_filled_play", @selector(ddp_vcPreview:), 1011);
     %orig(all);
-    gDDPMenuCell = nil;   // 用完清空，避免残留到下一次菜单
 }
 %end
 
