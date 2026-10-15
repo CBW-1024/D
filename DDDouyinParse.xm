@@ -80,6 +80,7 @@
 @interface BaseMsgContentLogicController : NSObject
 - (instancetype)init;
 - (CMessageWrap *)FormImageMsg:(NSString *)arg1 withImage:(UIImage *)arg2 withData:(NSData *)arg3;
+- (void)AddVideoMsg:(NSString *)fromUsr ToUsr:(NSString *)toUsr VideoInfo:(id)info;
 @end
 
 @interface MMServiceCenter : NSObject
@@ -144,7 +145,16 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
 // 视频信息构造（8.0.79 私有类，头文件已确认）
 @interface CaptureVideoInfo : NSObject
 + (id)genVideoInfoWithVideoUrl:(id)url thumb:(id)thumb;
+- (void)setVideo_path:(id)path;
 - (void)setThumb_path:(id)path;
+- (void)setVideo_size:(unsigned int)size;
+- (void)setVideo_time:(unsigned int)time;
+- (void)setVideo_width:(unsigned int)width;
+- (void)setVideo_height:(unsigned int)height;
+- (void)setThumb_size:(unsigned int)size;
+- (void)setM_videoCreateTime:(unsigned int)createTime;
+- (void)setM_uiIsSenderStatus:(unsigned int)senderStatus;
+- (void)setM_nsSpecifiedChatName:(id)chatName;
 @end
 
 #pragma mark - 插件内部类声明
@@ -862,22 +872,91 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     return thumbPath;
 }
 
-// 发视频消息（CMessageMgr AddVideoMsg:ToUsr:VideoInfo:）
-// 流程：主线程 → 生成缩略图 → CaptureVideoInfo 构造 VideoInfo（只传文件路径，不读进内存）→ 发送。
-// 注意：AddVideoMsg: 第一个参数是【发送方】本机 wxid，不是视频路径（旧版误把路径当发送方导致无法播放）。
+// 纯色兜底缩略图：generateThumbnailForVideoPath 取不到帧（超短视频）时，
+// 写入一张纯色 JPEG，避免 VideoInfo.thumb_path 为空（参考 WeChatDouyinParser DYWriteFallbackThumb）。
++ (NSString *)fallbackThumbnailAtPath:(NSString *)videoPath {
+    if (!videoPath.length) return nil;
+    NSString *thumbPath = [NSTemporaryDirectory()
+        stringByAppendingPathComponent:[NSString stringWithFormat:@"thumb_%@.jpg", [[NSUUID UUID] UUIDString]]];
+    CGSize size = CGSizeMake(360, 640);
+    UIGraphicsBeginImageContextWithOptions(size, YES, 1.0);
+    [[UIColor colorWithRed:0.12 green:0.12 blue:0.12 alpha:1.0] setFill];
+    UIRectFill(CGRectMake(0, 0, size.width, size.height));
+    UIImage *image = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    NSData *jpeg = UIImageJPEGRepresentation(image, 0.75);
+    if (jpeg.length && [jpeg writeToFile:thumbPath atomically:YES]) return thumbPath;
+    return nil;
+}
+
+// 发视频消息
+// 流程：主线程 → 生成（取不到帧则纯色兜底）缩略图 → alloc CaptureVideoInfo + AVFoundation 读元数据并手动 set 全部属性
+//       → 优先 BaseMsgContentLogicController.AddVideoMsg（与发图一致，自动刷新 UI），回退 CMessageMgr.AddVideoMsg。
+// 注意：不走 CaptureVideoInfo 的 genVideoInfoWithVideoUrl: 工厂方法（其内部期望远程 URL 自行探测，传本地 fileURL 会属性不全→发送崩溃）。
+//       AddVideoMsg: 第一个参数仍是【发送方】本机 wxid。
 + (void)sendVideoAtPath:(NSString *)path toUser:(NSString *)user {
-    if (!path.length) return;
+    if (!path.length) { DDDLog(@"sendVideoAtPath: path 为空，返回"); return; }
     dispatch_async(dispatch_get_main_queue(), ^{
         NSString *chatName = user.length ? user : DDPCurrentChatName();
-        if (!chatName.length) return;
+        if (!chatName.length) { DDDLog(@"sendVideoAtPath: chatName 为空，返回"); return; }
+        DDDLog(@"sendVideoAtPath: 进入发送 path=%@ chat=%@", path, chatName);
 
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if (![fm fileExistsAtPath:path]) { DDDLog(@"sendVideoAtPath: 文件不存在，返回"); return; }
+
+        // 缩略图：取第 0.3s 帧，取不到（超短视频）则纯色兜底
         NSString *thumbPath = [self generateThumbnailForVideoPath:path];
-        id videoInfo = [%c(CaptureVideoInfo) genVideoInfoWithVideoUrl:[NSURL fileURLWithPath:path] thumb:thumbPath];
-        if (thumbPath) [videoInfo setThumb_path:thumbPath];
-        if (!videoInfo) return;
+        if (!thumbPath) thumbPath = [self fallbackThumbnailAtPath:path];
+        DDDLog(@"sendVideoAtPath: 缩略图=%@", thumbPath ?: @"nil");
 
-        CMessageMgr *msgMgr = DDPMessageMgr();
-        [msgMgr AddVideoMsg:[%c(SettingUtil) getLocalUsrName:0] ToUsr:chatName VideoInfo:videoInfo];
+        // 手动构造 CaptureVideoInfo（参考 WeChatDouyinParser，不走 genVideoInfoWithVideoUrl:，
+        // 该方法内部期望远程 URL 自行探测，传本地 fileURL 会导致属性不全进而发送崩溃）。
+        id info = [[%c(CaptureVideoInfo) alloc] init];
+        if (!info) { DDDLog(@"sendVideoAtPath: CaptureVideoInfo alloc 失败，返回"); return; }
+
+        // AVFoundation 读视频元数据
+        unsigned long long fileSize = 0;
+        NSDictionary *attrs = [fm attributesOfItemAtPath:path error:nil];
+        if (attrs) fileSize = [attrs fileSize];
+        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
+        Float64 seconds = CMTimeGetSeconds(asset.duration);
+        if (!(seconds > 0)) seconds = 1;   // 覆盖 NaN 与 <=0
+        unsigned int width = 0, height = 0;
+        NSArray *tracks = [asset tracksWithMediaType:AVMediaTypeVideo];
+        if (tracks.count) {
+            AVAssetTrack *track = tracks.firstObject;
+            CGSize sz = CGSizeApplyAffineTransform(track.naturalSize, track.preferredTransform);
+            width = (unsigned int)llround(fabs(sz.width));
+            height = (unsigned int)llround(fabs(sz.height));
+        }
+        unsigned int thumbSize = 0;
+        NSDictionary *thumbAttrs = [fm attributesOfItemAtPath:thumbPath error:nil];
+        if (thumbAttrs) thumbSize = (unsigned int)[thumbAttrs fileSize];
+
+        [info setVideo_path:path];
+        if (thumbPath) [info setThumb_path:thumbPath];
+        [info setVideo_size:(unsigned int)MIN(fileSize, 0xFFFFFFFFu)];
+        [info setVideo_time:(unsigned int)MAX(1, (int)llround(seconds))];
+        [info setVideo_width:width];
+        [info setVideo_height:height];
+        [info setThumb_size:thumbSize];
+        [info setM_videoCreateTime:(unsigned int)[[NSDate date] timeIntervalSince1970]];
+        [info setM_uiIsSenderStatus:1];
+        [info setM_nsSpecifiedChatName:chatName];
+        DDDLog(@"sendVideoAtPath: VideoInfo 构造完成 size=%llu dur=%.1f %ux%u", fileSize, seconds, width, height);
+
+        NSString *from = [%c(SettingUtil) getLocalUsrName:0];
+        // 优先走 BaseMsgContentLogicController（与发图片一致，发送后自动刷新 UI），失败回退 CMessageMgr
+        BaseMsgContentLogicController *ctrl = [[%c(BaseMsgContentLogicController) alloc] init];
+        if (ctrl) {
+            DDDLog(@"sendVideoAtPath: 走 logicController.AddVideoMsg");
+            [ctrl AddVideoMsg:from ToUsr:chatName VideoInfo:info];
+        } else {
+            CMessageMgr *msgMgr = DDPMessageMgr();
+            DDDLog(@"sendVideoAtPath: 走 CMessageMgr.AddVideoMsg");
+            [msgMgr AddVideoMsg:from ToUsr:chatName VideoInfo:info];
+        }
+        DDDLog(@"sendVideoAtPath: AddVideoMsg 完成");
     });
 }
 
