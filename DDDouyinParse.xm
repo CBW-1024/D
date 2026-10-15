@@ -230,13 +230,8 @@ static NSString * const kDDPEnabledKey = @"DDDouyinParseEnabled";
 
 static BOOL DDPContainsDouyinLink(NSString *text) { return [text containsString:@"douyin.com"]; }
 
-// 排除直播：v.douyin.com 短链分享中，直播文案不含发布日期 MM/DD，而视频/图文均带日期
-static BOOL DDPIsDouyinLiveText(NSString *text) {
-    NSRange linkR = [text rangeOfString:@"v.douyin.com"];
-    if (linkR.location == NSNotFound) return NO;
-    NSString *after = [text substringFromIndex:linkR.location];
-    return [after rangeOfString:@"\\d{2}/\\d{2}" options:NSRegularExpressionSearch].location == NSNotFound;
-}
+// 排除直播：抖音直播分享文案含「正在直播」
+static BOOL DDPIsDouyinLiveText(NSString *text) { return [text containsString:@"正在直播"]; }
 
 static BOOL DDPIsOutgoing(CMessageWrap *wrap) { return [%c(CMessageWrap) isSenderFromMsgWrap:wrap]; }
 
@@ -341,6 +336,18 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重载 3 次（实�
     dispatch_async(dispatch_get_main_queue(), ^{ [self.webView loadRequest:request]; });
 }
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
+    // v.douyin.com 短链会 302 到 iesdouyin.com/share/<type>/<id>，该落地页无图集/直链数据；
+    // 提取 type+id 改加载规范 www.douyin.com/<type>/<id>（已非 share 路径，不会循环重导）
+    NSString *u = webView.URL.absoluteString ?: @"";
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"/share/(note|video)/(\\d+)" options:NSRegularExpressionCaseInsensitive error:nil];
+    NSTextCheckingResult *m = [re firstMatchInString:u options:0 range:NSMakeRange(0, u.length)];
+    if (m) {
+        NSString *type = [u substringWithRange:[m rangeAtIndex:1]];
+        NSString *awemeId = [u substringWithRange:[m rangeAtIndex:2]];
+        self.fetchStart = CFAbsoluteTimeGetCurrent();
+        [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"https://www.douyin.com/%@/%@", type, awemeId]]]];
+        return;
+    }
     [self pollHTML:webView attempt:0];
 }
 // 抖音 H5 懒加载：首轮 outerHTML 常无 playwm，故每 0.5s 轮询，命中即收，最多 5s
