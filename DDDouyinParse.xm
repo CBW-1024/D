@@ -583,7 +583,7 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重试 3 次（配�
     full = NSMakeRange(0, clean.length);
     [clean replaceOccurrencesOfString:@"\\u002F" withString:@"/" options:NSLiteralSearch range:full];    // \u002F -> /
     full = NSMakeRange(0, clean.length);
-    [clean replaceOccurrencesOfString:@"\\/" withString:@"/" options:NSLiteralSearch range:full];         // \/ -> /（兜底）
+    [clean replaceOccurrencesOfString:@"\\/" withString:@"/" options:NSLiteralSearch range:full];         // \/ -> /（JSON 转义还原，匹配 playwm/URL 必需）
     full = NSMakeRange(0, clean.length);
     [clean replaceOccurrencesOfString:@"\u001D" withString:@"" options:NSLiteralSearch range:full];       // 控制字符 0x1D
 
@@ -991,25 +991,8 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     return thumbPath;
 }
 
-// 纯色兜底缩略图：generateThumbnailForVideoPath 取不到帧（超短视频）时，
-// 写入一张纯色 JPEG，避免 VideoInfo.thumb_path 为空（参考 WeChatDouyinParser DYWriteFallbackThumb）。
-+ (NSString *)fallbackThumbnailAtPath:(NSString *)videoPath {
-    if (!videoPath.length) return nil;
-    NSString *thumbPath = [NSTemporaryDirectory()
-        stringByAppendingPathComponent:[NSString stringWithFormat:@"thumb_%@.jpg", [[NSUUID UUID] UUIDString]]];
-    CGSize size = CGSizeMake(360, 640);
-    UIGraphicsBeginImageContextWithOptions(size, YES, 1.0);
-    [[UIColor colorWithRed:0.12 green:0.12 blue:0.12 alpha:1.0] setFill];
-    UIRectFill(CGRectMake(0, 0, size.width, size.height));
-    UIImage *image = UIGraphicsGetImageFromCurrentImageContext();
-    UIGraphicsEndImageContext();
-    NSData *jpeg = UIImageJPEGRepresentation(image, 0.75);
-    if (jpeg.length && [jpeg writeToFile:thumbPath atomically:YES]) return thumbPath;
-    return nil;
-}
-
 // 发视频消息
-// 流程：主线程 → 生成（取不到帧则纯色兜底）缩略图 → alloc CaptureVideoInfo + AVFoundation 读元数据并手动 set 全部属性
+// 流程：主线程 → 生成缩略图 → alloc CaptureVideoInfo + AVFoundation 读元数据并手动 set 全部属性
 //       → 优先 BaseMsgContentLogicController.AddVideoMsg（与发图一致，自动刷新 UI），回退 CMessageMgr.AddVideoMsg。
 // 注意：不走 CaptureVideoInfo 的 genVideoInfoWithVideoUrl: 工厂方法（其内部期望远程 URL 自行探测，传本地 fileURL 会属性不全→发送崩溃）。
 //       AddVideoMsg: 第一个参数仍是【发送方】本机 wxid。
@@ -1023,9 +1006,8 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         NSFileManager *fm = [NSFileManager defaultManager];
         if (![fm fileExistsAtPath:path]) { DDDLog(@"sendVideoAtPath: 文件不存在，返回"); return; }
 
-        // 缩略图：取第 0.3s 帧，取不到（超短视频）则纯色兜底
+        // 缩略图：取第 0.3s 帧
         NSString *thumbPath = [self generateThumbnailForVideoPath:path];
-        if (!thumbPath) thumbPath = [self fallbackThumbnailAtPath:path];
         DDDLog(@"sendVideoAtPath: 缩略图=%@", thumbPath ?: @"nil");
 
         // 手动构造 CaptureVideoInfo（参考 WeChatDouyinParser，不走 genVideoInfoWithVideoUrl:，
