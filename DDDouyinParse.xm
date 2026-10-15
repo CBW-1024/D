@@ -315,6 +315,19 @@ static inline NSString *DDPTempPathExt(NSString *url, NSString *ext) {
     return [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.%@", md5, ext ?: @"dat"]];
 }
 
+// 根据下载到的字节判断真实图片格式，返回扩展名；GIF 用于保留动图（原图不被重新编码成静态图）
+// 优先看字节魔数（GIF87a/GIF89a），URL 无扩展名或扩展名不准时也能识别；最后回退到 URL 后缀/png/jpg
+static inline NSString *DDPImageExt(NSData *data, NSString *url) {
+    if (data.length >= 6) {
+        const unsigned char *b = data.bytes;
+        if (b[0] == 'G' && b[1] == 'I' && b[2] == 'F') return @"gif";
+    }
+    NSString *ue = [url pathExtension].lowercaseString;
+    if ([ue isEqualToString:@"png"]) return @"png";
+    if ([ue isEqualToString:@"gif"]) return @"gif";
+    return @"jpg";
+}
+
 // 取当前 foreground 的 keyWindow（iOS 13+ 多场景）
 static inline UIWindow *DDPKeyWindow(void) {
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
@@ -540,6 +553,18 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重试 3 次（配�
     DDDLog(@"[DDPWebFetcher] 第%u轮 cleanLen=%lu playwm=%d gallery=%d 距开始%.1fs",
            self.retries, (unsigned long)clean.length, [clean containsString:@"playwm"],
            code == DDPCodeGallery, CFAbsoluteTimeGetCurrent() - self.fetchStart);
+
+    // 【诊断探针·临时】扫描 HTML 是否暴露 Live Photo / 动效视频地址，用于判断"实况照片能否保存为动态"
+    // 若命中 live_photo/dynamic_cover/<video/.mov/play_addr 等字段 → 动效地址可得，后续可配对存 Live Photo；
+    // 若全无 → 分享页只给静态封面，当前架构拿不到动效，Live Photo 只能存成静态图。验证完可删除本段。
+    NSArray<NSString *> *motionKeys = @[@"live_photo", @"dynamic_cover", @"<video", @".mov", @"play_addr", @"motion_photo", @"image_list"];
+    NSMutableArray<NSString *> *hit = [NSMutableArray array];
+    for (NSString *k in motionKeys) {
+        if ([clean rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) [hit addObject:k];
+    }
+    DDDLog(@"[DDPWebFetcher] 动效字段扫描: %@",
+           hit.count ? [hit componentsJoinedByString:@", "]
+                     : @"无（分享页未暴露动效视频地址 → Live Photo 只能存为静态图）");
 
     // 命中 playwm/图集即成功
     if (code == DDPCodeGallery || [clean containsString:@"playwm"]) {
@@ -868,12 +893,11 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         __block NSInteger total = 0, done = 0, failed = 0;
         dispatch_queue_t q = dispatch_queue_create("ddp.save", DISPATCH_QUEUE_SERIAL);
         for (NSString *imgURL in urls) {
-            DDDLog(@"下载开始(存相册图): %@", [DDPTempPathExt(imgURL, [[imgURL pathExtension].lowercaseString isEqualToString:@"png"]?@"png":@"jpg") lastPathComponent]);
             NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL];
-            if (!data.length) continue;
-            NSString *ext = @"jpg";
-            if ([[imgURL pathExtension].lowercaseString isEqualToString:@"png"]) ext = @"png";
+            if (!data.length) { DDDLog(@"downloadAndSaveImages: 下载失败跳过"); continue; }
+            NSString *ext = DDPImageExt(data, imgURL);   // 按真实字节判定格式，GIF 保留 .gif 扩展名（避免被当成静态图）
             NSString *path = DDPTempPathExt(imgURL, ext);
+            DDDLog(@"下载开始(存相册图): %@ ext=%@", [path lastPathComponent], ext);
             NSFileManager *fm = [NSFileManager defaultManager];
             if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
             if ([data writeToFile:path atomically:YES]) {
@@ -1035,12 +1059,11 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         BOOL anySent = NO;
         for (NSString *imgURL in urls) {
             @autoreleasepool {
-                NSString *ext = @"jpg";
-                if ([[imgURL pathExtension].lowercaseString isEqualToString:@"png"]) ext = @"png";
-                NSString *path = DDPTempPathExt(imgURL, ext);
-                DDDLog(@"下载开始(发图): %@", [path lastPathComponent]);
                 NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL];
-                if (!data.length) { DDDLog(@"sendImagesForURLs: 下载失败跳过 %@", [path lastPathComponent]); continue; }
+                if (!data.length) { DDDLog(@"sendImagesForURLs: 下载失败跳过"); continue; }
+                NSString *ext = DDPImageExt(data, imgURL);   // 按真实字节判定格式，GIF 保留 .gif 扩展名
+                NSString *path = DDPTempPathExt(imgURL, ext);
+                DDDLog(@"下载开始(发图): %@ ext=%@", [path lastPathComponent], ext);
                 NSFileManager *fm = [NSFileManager defaultManager];
                 if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
                 if ([data writeToFile:path atomically:YES]) {
@@ -1106,11 +1129,10 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         NSMutableArray *out = [NSMutableArray array];
         NSFileManager *fm = [NSFileManager defaultManager];
         for (NSString *imgURL in urls) {
-            NSString *ext = @"jpg";
-            if ([[imgURL pathExtension].lowercaseString isEqualToString:@"png"]) ext = @"png";
-            NSString *path = DDPTempPathExt(imgURL, ext);
-            DDDLog(@"下载开始(本地看图): %@", [path lastPathComponent]);
             NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL];
+            NSString *ext = DDPImageExt(data, imgURL);   // 按真实字节判定格式，GIF 保留 .gif 扩展名
+            NSString *path = DDPTempPathExt(imgURL, ext);
+            DDDLog(@"下载开始(本地看图): %@ ext=%@", [path lastPathComponent], ext);
             if (data.length) {
                 if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
                 [data writeToFile:path atomically:YES];
@@ -1206,18 +1228,18 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 }
 
 // 保存到相册（图片，图文/滑块）
-// 流程：imageWithData: 转 UIImage → 请求相册授权 → 在变更块里 creationRequestForAssetFromImage: + 写入创建时间
+// 用原始字节 creationRequestForAssetFromImageData: 写入，保留 GIF 动画（imageWithContentsOfFile 会丢帧变静态图）
 + (void)saveImageToAlbumAtPath:(NSString *)path completion:(void(^)(BOOL success))completion {
     if (!path.length) { if (completion) completion(NO); return; }
-    UIImage *image = [UIImage imageWithContentsOfFile:path];
-    if (!image) { if (completion) completion(NO); return; }
+    NSData *data = [NSData dataWithContentsOfFile:path];   // 读原始字节，避免经 UIImage 解码丢帧
+    if (!data.length) { if (completion) completion(NO); return; }
     [PHPhotoLibrary requestAuthorization:^(PHAuthorizationStatus status) {
         if (status != PHAuthorizationStatusAuthorized) {
             if (completion) completion(NO);
             return;
         }
         [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
-            PHAssetCreationRequest *req = [PHAssetCreationRequest creationRequestForAssetFromImage:image];
+            PHAssetCreationRequest *req = [PHAssetCreationRequest creationRequestForAssetFromImageData:data];
             req.creationDate = [NSDate date];   // 写入创建时间为当前时间
         } completionHandler:^(BOOL success, NSError *error) {
             if (completion) completion(success);
