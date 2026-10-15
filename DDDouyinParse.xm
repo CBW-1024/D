@@ -671,7 +671,7 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
     return [result copy];
 }
 
-// 图文/滑块：抠图集与幻灯片图片（两段正则）
+// 图文帖图集：从内嵌 JSON 的 images 容器提取各张图（无兜底）
 - (NSArray<NSString *> *)extractGalleryImagesFromHTML:(NSString *)html {
     if (!html.length) return @[];
     NSMutableArray *result = [NSMutableArray array];
@@ -684,8 +684,8 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
     [decoded replaceOccurrencesOfString:@"\\\"" withString:@"\"" options:0 range:NSMakeRange(0, decoded.length)];
     [decoded replaceOccurrencesOfString:@"&quot;" withString:@"\"" options:0 range:NSMakeRange(0, decoded.length)];
 
-    // 1) 图文帖图集：抖音标准容器 "images"（旧 H5 为 "image_list"），数组内每项含 url_list[]，取其首项即各张图
-    //    精确配对容器数组边界，只在图集数组内提取，避免混入视频封面/头像/推荐流的 url_list
+    // 图文帖图集：抖音标准容器 "images"（旧 H5 为 "image_list"），数组内每项含 url_list[]，取其首项即各张图
+    // 精确配对容器数组边界，只在图集数组内提取，避免混入视频封面/头像/推荐流的 url_list（不做其他兜底）
     NSArray *containerKeys = @[@"\"images\"", @"\"image_list\""];
     for (NSString *ckey in containerKeys) {
         NSRange csearch = NSMakeRange(0, decoded.length);
@@ -717,49 +717,7 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
             csearch = NSMakeRange(cr.location + ckey.length, decoded.length - (cr.location + ckey.length));
         }
     }
-    NSInteger c1 = (NSInteger)result.count;   // stage1(图集容器) 命中数
-    DDDLog(@"[extractGallery] stage1 图集容器 命中=%ld", (long)c1);
-
-    // 2) 兜底：若图集容器未命中，退而全文档提取 url_list 首项（覆盖非 images 命名的图集结构）
-    if (result.count == 0) {
-        NSRegularExpression *reAll = [NSRegularExpression
-            regularExpressionWithPattern:@"\"url_list\"\\s*:\\s*\\[\\s*\"(https?://[^\"]+)\""
-            options:NSRegularExpressionCaseInsensitive error:nil];
-        NSArray *am = [reAll matchesInString:decoded options:0 range:NSMakeRange(0, decoded.length)];
-        for (NSTextCheckingResult *m in am) {
-            if (m.numberOfRanges < 2) continue;
-            NSString *u = [decoded substringWithRange:[m rangeAtIndex:1]];
-            u = [u stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
-            if (u.length && ![result containsObject:u]) [result addObject:u];
-        }
-    }
-    NSInteger c2 = (NSInteger)result.count;   // 含 stage2（全文档 url_list）后的累计数
-    DDDLog(@"[extractGallery] stage2 全文档url_list 触发=%@ 新增=%ld",
-           (c1 == 0 ? @"YES" : @"NO(已被图集容器命中)"), (long)(c2 - c1));
-
-    // 3) DOM 正则兜底：gallery-container __carousel__image / aweme-slides-swiper-item 内的 <img src>
-    NSRegularExpression *re1 = [NSRegularExpression
-        regularExpressionWithPattern:@"<img[^>]*src=\"([^\"]+)\"[^>]*class=\"[^\"]*gallery-container[^\"]*__carousel__image[^\"]*\""
-        options:NSRegularExpressionCaseInsensitive error:nil];
-    NSRegularExpression *re2 = [NSRegularExpression
-        regularExpressionWithPattern:@"<div[^>]*class=\"aweme-slides-swiper-item[^>]*>.*?<img[^>]*src=\"([^\"]+)\""
-        options:(NSRegularExpressionCaseInsensitive | NSRegularExpressionDotMatchesLineSeparators) error:nil];
-    for (NSRegularExpression *re in @[re1, re2]) {
-        if (!re) continue;
-        NSArray *matches = [re matchesInString:html options:0 range:NSMakeRange(0, html.length)];
-        for (NSTextCheckingResult *m in matches) {
-            if (m.numberOfRanges < 2) continue;
-            NSString *u = [html substringWithRange:[m rangeAtIndex:1]];
-            u = [u stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
-            if (u.length && ![result containsObject:u]) [result addObject:u];
-        }
-    }
-    NSInteger c3 = (NSInteger)result.count;
-    NSString *src = (c1 > 0) ? @"图集容器(JSON)"
-                   : (c2 > c1) ? @"全文档url_list"
-                   : (c3 > c2) ? @"DOM-img" : @"无";
-    DDDLog(@"[extractGallery] stage3 DOM-img 新增=%ld", (long)(c3 - c2));
-    DDDLog(@"[extractGallery] 候选数=%lu 来源=%@", (unsigned long)result.count, src);
+    DDDLog(@"[extractGallery] 图集候选数=%lu", (unsigned long)result.count);
     return [result copy];
 }
 
