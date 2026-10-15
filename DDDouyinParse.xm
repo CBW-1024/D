@@ -315,17 +315,10 @@ static inline NSString *DDPTempPathExt(NSString *url, NSString *ext) {
     return [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.%@", md5, ext ?: @"dat"]];
 }
 
-// 根据下载到的字节判断真实图片格式，返回扩展名；GIF 用于保留动图（原图不被重新编码成静态图）
-// 优先看字节魔数（GIF87a/GIF89a），URL 无扩展名或扩展名不准时也能识别；最后回退到 URL 后缀/png/jpg
-static inline NSString *DDPImageExt(NSData *data, NSString *url) {
-    if (data.length >= 6) {
-        const unsigned char *b = (const unsigned char *)data.bytes;
-        if (b[0] == 'G' && b[1] == 'I' && b[2] == 'F') return @"gif";
-    }
+// 取 URL 后缀作为临时文件扩展名（本地看图 QL 预览按扩展名识别格式；默认 jpg）
+static inline NSString *DDPImageExt(NSString *url) {
     NSString *ue = [url pathExtension].lowercaseString;
-    if ([ue isEqualToString:@"png"]) return @"png";
-    if ([ue isEqualToString:@"gif"]) return @"gif";
-    return @"jpg";
+    return ue.length ? ue : @"jpg";
 }
 
 // 取微信主窗口（单主窗口 app，直接取 AppDelegate.window，无需遍历场景）
@@ -544,17 +537,6 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重试 3 次（配�
            self.retries, (unsigned long)clean.length, [clean containsString:@"playwm"],
            code == DDPCodeGallery, CFAbsoluteTimeGetCurrent() - self.fetchStart);
 
-    // 【诊断探针·临时】扫描 HTML 是否暴露 Live Photo / 动效视频地址，用于判断"实况照片能否保存为动态"
-    // 若命中 live_photo/dynamic_cover/<video/.mov/play_addr 等字段 → 动效地址可得，后续可配对存 Live Photo；
-    // 若全无 → 分享页只给静态封面，当前架构拿不到动效，Live Photo 只能存成静态图。验证完可删除本段。
-    NSArray<NSString *> *motionKeys = @[@"live_photo", @"dynamic_cover", @"<video", @".mov", @"play_addr", @"motion_photo", @"image_list"];
-    NSMutableArray<NSString *> *hit = [NSMutableArray array];
-    for (NSString *k in motionKeys) {
-        if ([clean rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) [hit addObject:k];
-    }
-    DDDLog(@"[DDPWebFetcher] 动效字段扫描: %@",
-           hit.count ? [hit componentsJoinedByString:@", "]
-                     : @"无（分享页未暴露动效视频地址 → Live Photo 只能存为静态图）");
 
     // 命中 playwm/图集即成功
     if (code == DDPCodeGallery || [clean containsString:@"playwm"]) {
@@ -885,7 +867,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         for (NSString *imgURL in urls) {
             NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL];
             if (!data.length) { DDDLog(@"downloadAndSaveImages: 下载失败跳过"); continue; }
-            NSString *ext = DDPImageExt(data, imgURL);   // 按真实字节判定格式，GIF 保留 .gif 扩展名（避免被当成静态图）
+            NSString *ext = DDPImageExt(imgURL);   // 取 URL 后缀作为临时文件扩展名
             NSString *path = DDPTempPathExt(imgURL, ext);
             DDDLog(@"下载开始(存相册图): %@ ext=%@", [path lastPathComponent], ext);
             NSFileManager *fm = [NSFileManager defaultManager];
@@ -1051,7 +1033,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
             @autoreleasepool {
                 NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL];
                 if (!data.length) { DDDLog(@"sendImagesForURLs: 下载失败跳过"); continue; }
-                NSString *ext = DDPImageExt(data, imgURL);   // 按真实字节判定格式，GIF 保留 .gif 扩展名
+                NSString *ext = DDPImageExt(imgURL);   // 取 URL 后缀作为临时文件扩展名
                 NSString *path = DDPTempPathExt(imgURL, ext);
                 DDDLog(@"下载开始(发图): %@ ext=%@", [path lastPathComponent], ext);
                 NSFileManager *fm = [NSFileManager defaultManager];
@@ -1120,7 +1102,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         NSFileManager *fm = [NSFileManager defaultManager];
         for (NSString *imgURL in urls) {
             NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL];
-            NSString *ext = DDPImageExt(data, imgURL);   // 按真实字节判定格式，GIF 保留 .gif 扩展名
+            NSString *ext = DDPImageExt(imgURL);   // 取 URL 后缀作为临时文件扩展名
             NSString *path = DDPTempPathExt(imgURL, ext);
             DDDLog(@"下载开始(本地看图): %@ ext=%@", [path lastPathComponent], ext);
             if (data.length) {
@@ -1218,7 +1200,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 }
 
 // 保存到相册（图片，图文/滑块）
-// 用原始字节 addResourceWithType:data: 写入，保留 GIF 动画（经 UIImage 解码会丢帧变静态图）。
+// 直接写原始字节 addResourceWithType:data:（不经 UIImage 解码，避免无谓重编码）。
 // 原 creationRequestForAssetFromImageData: 在 iOS 15 废弃、新 SDK 已移除，改用更稳的 creationRequestForAsset + addResource。
 + (void)saveImageToAlbumAtPath:(NSString *)path completion:(void(^)(BOOL success))completion {
     if (!path.length) { if (completion) completion(NO); return; }
@@ -1231,7 +1213,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         }
         [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
             PHAssetCreationRequest *req = [PHAssetCreationRequest creationRequestForAsset];
-            [req addResourceWithType:PHAssetResourceTypePhoto data:data options:nil];  // 直接写原始字节，保留 GIF 动图
+            [req addResourceWithType:PHAssetResourceTypePhoto data:data options:nil];  // 直接写原始字节
             req.creationDate = [NSDate date];   // 写入创建时间为当前时间
         } completionHandler:^(BOOL success, NSError *error) {
             if (!success) DDDLog(@"saveImageToAlbumAtPath: 写相册失败: %@", error);
