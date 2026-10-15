@@ -313,8 +313,6 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重载 3 次（实�
 @property (nonatomic, strong) NSURLRequest *ddpRequest;
 @property (nonatomic, assign) NSTimeInterval fetchStart;
 @property (nonatomic, assign) NSUInteger lastCleanLen;
-// 视频短链备用：分享页轮询超时未出直链时，退到规范地址重试（诊断用，观察是否多余）
-@property (nonatomic, copy) NSString *ddpCanonical;
 @property (nonatomic, copy) void (^completion)(NSString *html, NSInteger errCode);
 - (void)fetchHTMLFromURL:(NSString *)url completion:(void (^)(NSString *html, NSInteger errCode))completion;
 - (void)ddFinishWithHTML:(NSString *)html code:(NSInteger)code;
@@ -343,9 +341,7 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重载 3 次（实�
     NSURL *nsurl = [NSURL URLWithString:url];
     NSURLRequest *request = [NSURLRequest requestWithURL:nsurl cachePolicy:NSURLRequestUseProtocolCachePolicy timeoutInterval:30.0];
     self.ddpRequest = request; self.retries = 0; self.lastCleanLen = 0;
-    self.ddpCanonical = nil;
     self.fetchStart = CFAbsoluteTimeGetCurrent();
-    DDDLog(@"[fetch] 开始加载 url=%@", url);
     dispatch_async(dispatch_get_main_queue(), ^{ [self.webView loadRequest:request]; });
 }
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
@@ -358,16 +354,18 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重载 3 次（实�
         NSString *type = [u substringWithRange:[m rangeAtIndex:1]];
         NSString *awemeId = [u substringWithRange:[m rangeAtIndex:2]];
         NSString *canon = [NSString stringWithFormat:@"https://www.douyin.com/%@/%@", type, awemeId];
-        // 图集：分享页只有渲染后的 DOM <img>、没有内嵌 JSON "images"，必须跳规范地址才取得到 url_list
+        // 图集：分享页只有渲染后的 DOM <img>、没有内嵌 JSON "images"，必须跳规范地址才取得到 url_list。
+        // 同时把 ddpRequest 换成规范地址——否则 handleRenderedHTML 的重试会重载原始短链，
+        // 再次 302 回 share 页并触发本跳转，形成「短链↔规范地址」死循环。
         if ([type caseInsensitiveCompare:@"note"] == NSOrderedSame) {
-            DDDLog(@"[fetch] note 短链 → 直接跳规范 %@", canon);
+            NSURLRequest *canonReq = [NSURLRequest requestWithURL:[NSURL URLWithString:canon]];
+            self.ddpRequest = canonReq;
             self.fetchStart = CFAbsoluteTimeGetCurrent();
-            [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:canon]]];
+            [webView loadRequest:canonReq];
             return;
         }
-        // 视频：分享页自带播放器，JS 执行后 playwm 会进 DOM，先留在当前页轮询
-        DDDLog(@"[fetch] video 短链 → 先轮询分享页，备用规范=%@", canon);
-        self.ddpCanonical = canon;
+        // 视频：分享页自带播放器，JS 执行后 playwm 会进 DOM，留在当前页轮询即可
+        // （实测 attempt=0 即命中；跳到裸规范地址反而会丢分享授权参数）
     }
     [self pollHTML:webView attempt:0];
 }
@@ -378,27 +376,16 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重载 3 次（实�
     [webView evaluateJavaScript:@"document.documentElement.outerHTML" completionHandler:^(id result, NSError *error) {
         __strong typeof(wself) strong = wself;
         if (!strong) return;
-        if (error) { DDDLog(@"[fetch] JS 取 HTML 失败 %@", error); [strong ddFinishWithHTML:nil code:-2]; return; }
+        if (error) { [strong ddFinishWithHTML:nil code:-2]; return; }
         NSString *html = result ? [NSString stringWithFormat:@"%@", result] : @"";
         NSTimeInterval waited = CFAbsoluteTimeGetCurrent() - strong.fetchStart;
         if ([html containsString:@"playwm"] ||
             [html containsString:@"aweme-share-swiper-item"] ||
             [html containsString:@"aweme-slides-swiper-item"]) {
-            DDDLog(@"[fetch] 命中直链 attempt=%lu waited=%.1fs htmlLen=%lu", (unsigned long)attempt, waited, (unsigned long)html.length);
             [strong handleRenderedHTML:html];
             return;
         }
-        if (waited > 5.0) {
-            if (strong.ddpCanonical.length) {   // 视频：分享页没出直链，退到规范地址重试
-                NSString *canon = strong.ddpCanonical; strong.ddpCanonical = nil;
-                DDDLog(@"[fetch] 分享页超时无直链(%.1fs) → 重试规范 %@", waited, canon);
-                strong.fetchStart = CFAbsoluteTimeGetCurrent();
-                [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:canon]]];
-                return;
-            }
-            DDDLog(@"[fetch] 超时无直链，收尾 htmlLen=%lu", (unsigned long)html.length);
-            [strong handleRenderedHTML:html]; return;
-        }
+        if (waited > 5.0) { [strong handleRenderedHTML:html]; return; }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [strong pollHTML:webView attempt:attempt + 1];
         });
