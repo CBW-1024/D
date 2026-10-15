@@ -304,15 +304,11 @@ static void DDPShowDone(NSString *text) {
 #pragma mark - 抓取（离屏 WKWebView，轮询 playwm）
 
 static const NSInteger DDPCodeGallery = 0x4161;   // 图集类型标记
-static const NSInteger DDPMaxRetries = 3;          // 最多重载 3 次（实测 1~2 轮即出直链）
 
 @interface DDPWebFetcher : NSObject <WKNavigationDelegate>
 @property (nonatomic, readonly) WKWebView *webView;
-@property (nonatomic, assign) unsigned int retries;
 @property (nonatomic, assign) BOOL hasCompleted;
-@property (nonatomic, strong) NSURLRequest *ddpRequest;
 @property (nonatomic, assign) NSTimeInterval fetchStart;
-@property (nonatomic, assign) NSUInteger lastCleanLen;
 @property (nonatomic, copy) void (^completion)(NSString *html, NSInteger errCode);
 - (void)fetchHTMLFromURL:(NSString *)url completion:(void (^)(NSString *html, NSInteger errCode))completion;
 - (void)ddFinishWithHTML:(NSString *)html code:(NSInteger)code;
@@ -337,10 +333,9 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重载 3 次（实�
     return self;
 }
 - (void)fetchHTMLFromURL:(NSString *)url completion:(void (^)(NSString *html, NSInteger errCode))completion {
-    self.completion = completion; self.hasCompleted = NO;
+    self.completion = completion;     self.hasCompleted = NO;
     NSURL *nsurl = [NSURL URLWithString:url];
     NSURLRequest *request = [NSURLRequest requestWithURL:nsurl cachePolicy:NSURLRequestUseProtocolCachePolicy timeoutInterval:30.0];
-    self.ddpRequest = request; self.retries = 0; self.lastCleanLen = 0;
     self.fetchStart = CFAbsoluteTimeGetCurrent();
     dispatch_async(dispatch_get_main_queue(), ^{ [self.webView loadRequest:request]; });
 }
@@ -354,14 +349,10 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重载 3 次（实�
         NSString *type = [u substringWithRange:[m rangeAtIndex:1]];
         NSString *awemeId = [u substringWithRange:[m rangeAtIndex:2]];
         NSString *canon = [NSString stringWithFormat:@"https://www.douyin.com/%@/%@", type, awemeId];
-        // 图集：分享页只有渲染后的 DOM <img>、没有内嵌 JSON "images"，必须跳规范地址才取得到 url_list。
-        // 同时把 ddpRequest 换成规范地址——否则 handleRenderedHTML 的重试会重载原始短链，
-        // 再次 302 回 share 页并触发本跳转，形成「短链↔规范地址」死循环。
+        // 图集：分享页只有渲染后的 DOM <img>、没有内嵌 JSON "images"，必须跳规范地址才取得到 url_list
         if ([type caseInsensitiveCompare:@"note"] == NSOrderedSame) {
-            NSURLRequest *canonReq = [NSURLRequest requestWithURL:[NSURL URLWithString:canon]];
-            self.ddpRequest = canonReq;
             self.fetchStart = CFAbsoluteTimeGetCurrent();
-            [webView loadRequest:canonReq];
+            [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:canon]]];
             return;
         }
         // 视频：分享页自带播放器，JS 执行后 playwm 会进 DOM，留在当前页轮询即可
@@ -405,7 +396,6 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重载 3 次（实�
     if (self.hasCompleted) return;
     self.hasCompleted = YES;
     if (self.completion) self.completion(html, code);
-    self.retries = 0;
 }
 - (void)handleRenderedHTML:(NSString *)html {
     if (!html.length) { [self ddFinishWithHTML:nil code:-2]; return; }
@@ -423,16 +413,8 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重载 3 次（实�
     [clean replaceOccurrencesOfString:@"\u001D" withString:@"" options:NSLiteralSearch range:full];
 
     NSInteger code = ([clean containsString:@"aweme-share-swiper-item"] || [clean containsString:@"aweme-slides-swiper-item"]) ? DDPCodeGallery : 0;
-    if (code == DDPCodeGallery || [clean containsString:@"playwm"]) { [self ddFinishWithHTML:clean code:code]; return; }
-    // 重载拿回完全相同的 HTML：再试也不会有新内容，直接放弃
-    if (self.lastCleanLen == clean.length) { [self ddFinishWithHTML:nil code:500]; return; }
-    self.lastCleanLen = clean.length;
-    if (self.retries < DDPMaxRetries) {
-        self.retries += 1;
-        [self.webView loadRequest:self.ddpRequest];
-        return;
-    }
-    [self ddFinishWithHTML:nil code:500];
+    // 不重试：命中与否都把 HTML 交出去，由解析层（直链正则 / 图集容器）做最终判定
+    [self ddFinishWithHTML:clean code:code];
 }
 - (WKWebView *)webView { return _webView; }
 @end
