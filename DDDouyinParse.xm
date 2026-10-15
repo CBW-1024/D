@@ -145,7 +145,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
 @implementation DDPPhotoPage
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.view.backgroundColor = UIColor.blackColor;
+    self.view.backgroundColor = UIColor.systemBackgroundColor;   // 白色（浅色）/ 系统深色（深色模式），自动适配
     UIScrollView *sv = [[UIScrollView alloc] initWithFrame:self.view.bounds];
     sv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     sv.minimumZoomScale = 1.0;
@@ -166,11 +166,12 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
 // 多图浏览器：UIPageViewController 左右滑切换，体验类似系统相册
 @interface DDPPhotoBrowser : UIPageViewController <UIPageViewControllerDataSource>
 @property (nonatomic, copy) NSArray<NSString *> *paths;
+@property (nonatomic, copy) void (^onSaveCurrent)(NSString *path);  // 由 presentImageViewer 注入：保存当前图片到相册
 @end
 @implementation DDPPhotoBrowser
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.view.backgroundColor = UIColor.blackColor;
+    self.view.backgroundColor = UIColor.systemBackgroundColor;   // 白色（浅色）/ 系统深色（深色模式），自动适配
     self.dataSource = self;
     if (self.paths.count) {
         [self setViewControllers:@[[self pageAt:0]]
@@ -178,11 +179,13 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
                         animated:NO completion:nil];
     }
     self.navigationItem.leftBarButtonItem =
-        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
-                                                      target:self action:@selector(ddp_dismiss:)];
+        [[UIBarButtonItem alloc] initWithTitle:@"关闭"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self action:@selector(ddp_dismiss:)];
     self.navigationItem.rightBarButtonItem =
-        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAction
-                                                      target:self action:@selector(ddp_share:)];
+        [[UIBarButtonItem alloc] initWithTitle:@"保存"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self action:@selector(ddp_saveCurrent:)];
 }
 - (DDPPhotoPage *)pageAt:(NSInteger)i {
     DDPPhotoPage *p = [[DDPPhotoPage alloc] init];
@@ -200,15 +203,94 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     return (i < (NSInteger)self.paths.count - 1) ? [self pageAt:i + 1] : nil;
 }
 - (void)ddp_dismiss:(id)sender { [self dismissViewControllerAnimated:YES completion:nil]; }
-- (void)ddp_share:(id)sender {
+- (void)ddp_saveCurrent:(id)sender {
     DDPPhotoPage *cur = (DDPPhotoPage *)self.viewControllers.firstObject;
     if (!cur.path) return;
-    NSURL *url = [NSURL fileURLWithPath:cur.path];
-    UIActivityViewController *av = [[UIActivityViewController alloc] initWithActivityItems:@[url]
-                                                                     applicationActivities:nil];
-    if (av.popoverPresentationController)
-        av.popoverPresentationController.barButtonItem = self.navigationItem.rightBarButtonItem;
-    [self presentViewController:av animated:YES completion:nil];
+    if (self.onSaveCurrent) self.onSaveCurrent(cur.path);   // 交给调用方执行保存相册（含成功/失败提示）
+}
+@end
+
+// 自定义视频播放器：AVPlayerLayer + AVPictureInPictureController，
+// 导航栏带"关闭/保存"，默认自动开启画中画小窗口播放（不支持 PiP 时退化为内联播放）。
+// 直接持有 AVPictureInPictureController（而非 AVPlayerViewController 自动管理的 PiP），
+// 可在微信等未声明 PiP background mode 的宿主下稳定控制画中画，并支持自动/点击开启。
+@interface DDPVideoPlayer : UIViewController
+@property (nonatomic, copy) NSString *path;
+@property (nonatomic, copy) void (^onSave)(NSString *path);   // 由 playVideoAtPath 注入：保存视频到相册
+@property (nonatomic, strong) AVPlayer *player;
+@property (nonatomic, strong) AVPlayerLayer *playerLayer;
+@property (nonatomic, strong) AVPictureInPictureController *pip;
+@end
+
+@implementation DDPVideoPlayer
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = UIColor.systemBackgroundColor;   // 白色（浅色）/ 系统深色（深色模式），自动适配
+    // 音频会话设为 Playback（MixWithOthers 不打断微信其他声音），PiP 才能正常工作
+    AVAudioSession *as = [AVAudioSession sharedInstance];
+    [as setCategory:AVAudioSessionCategoryPlayback
+        withOptions:AVAudioSessionCategoryOptionMixWithOthers error:nil];
+    [as setActive:YES error:nil];
+
+    self.player = [AVPlayer playerWithURL:[NSURL fileURLWithPath:self.path]];
+    self.playerLayer = [AVPlayerLayer playerLayerWithPlayer:self.player];
+    self.playerLayer.videoGravity = AVLayerVideoGravityResizeAspect;
+    self.playerLayer.frame = self.view.bounds;
+    [self.view.layer addSublayer:self.playerLayer];
+
+    if ([AVPictureInPictureController isPictureInPictureSupported]) {
+        self.pip = [[AVPictureInPictureController alloc] initWithPlayerLayer:self.playerLayer];
+    }
+
+    self.navigationItem.leftBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"关闭"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self action:@selector(ddp_dismiss:)];
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"保存"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self action:@selector(ddp_save:)];
+
+    // 点击视频区域切换画中画（自动开启失败时的手势兜底）
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(ddp_tapVideo:)];
+    [self.view addGestureRecognizer:tap];
+
+    [self.player play];
+}
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    self.playerLayer.frame = self.view.bounds;
+}
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    [self ddp_tryStartPip];   // 默认画中画小窗口播放
+}
+// 默认开启画中画；播放器尚未就绪时稍后重试一次
+- (void)ddp_tryStartPip {
+    if (!self.pip) return;
+    if ([self.pip isPictureInPicturePossible]) {
+        [self.pip startPictureInPicture];
+    } else {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (self.pip && [self.pip isPictureInPicturePossible]) {
+                [self.pip startPictureInPicture];
+            }
+        });
+    }
+}
+- (void)ddp_tapVideo:(id)sender {
+    if (!self.pip) return;
+    if (self.pip.pictureInPictureActive) [self.pip stopPictureInPicture];
+    else if ([self.pip isPictureInPicturePossible]) [self.pip startPictureInPicture];
+}
+- (void)ddp_dismiss:(id)sender {
+    [self.player pause];
+    [self.pip stopPictureInPicture];
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+- (void)ddp_save:(id)sender {
+    if (self.onSave) self.onSave(self.path);   // 交给调用方执行保存相册（含成功/失败提示）
 }
 @end
 
@@ -676,11 +758,55 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
 - (NSArray<NSString *> *)extractGalleryImagesFromHTML:(NSString *)html {
     if (!html.length) return @[];
     NSMutableArray *result = [NSMutableArray array];
-    // 1) 图集：class 含 gallery-container ... __carousel__image（options=1 忽略大小写）
+
+    // 还原内嵌 JSON 常见转义，便于匹配其中的图片 URL
+    // 抖音常把 '/' 写成 \u002f 或 \/，JSON 内的引号可能被转义成 \"
+    NSMutableString *decoded = [html mutableCopy];
+    [decoded replaceOccurrencesOfString:@"\\u002f" withString:@"/" options:0 range:NSMakeRange(0, decoded.length)];
+    [decoded replaceOccurrencesOfString:@"\\/" withString:@"/" options:0 range:NSMakeRange(0, decoded.length)];
+    [decoded replaceOccurrencesOfString:@"\\\"" withString:@"\"" options:0 range:NSMakeRange(0, decoded.length)];
+    [decoded replaceOccurrencesOfString:@"&quot;" withString:@"\"" options:0 range:NSMakeRange(0, decoded.length)];
+
+    // 1) 图文帖图集：内嵌 JSON 的 image_list[] 内，每个图片元素都有 url_list[]，取其首项即各张原图
+    //    （分享页图文多图通常只存在于 JSON，DOM 正则只能拿到懒加载出来的首图，故优先 JSON 提取）
+    NSRange search = NSMakeRange(0, decoded.length);
+    while (search.length > 0) {
+        NSRange il = [decoded rangeOfString:@"\"image_list\"" options:NSCaseInsensitiveSearch range:search];
+        if (il.location == NSNotFound) break;
+        NSInteger start = il.location + il.length;
+        NSInteger segLen = MIN(decoded.length - start, 200000);   // 截断到本帖图集范围，避免跨到 video 段
+        NSString *seg = [decoded substringWithRange:NSMakeRange(start, segLen)];
+        NSRegularExpression *reU = [NSRegularExpression
+            regularExpressionWithPattern:@"\"url_list\"\\s*:\\s*\\[\\s*\"(https?://[^\"]+)\""
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        NSArray *um = [reU matchesInString:seg options:0 range:NSMakeRange(0, seg.length)];
+        for (NSTextCheckingResult *m in um) {
+            if (m.numberOfRanges < 2) continue;
+            NSString *u = [seg substringWithRange:[m rangeAtIndex:1]];
+            u = [u stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
+            if (u.length && ![result containsObject:u]) [result addObject:u];
+        }
+        search = NSMakeRange(start + segLen, decoded.length - (start + segLen));
+    }
+
+    // 2) 兜底：若 image_list 未命中，退而全文档提取 url_list 首项（覆盖非 image_list 命名的图集结构）
+    if (result.count == 0) {
+        NSRegularExpression *reAll = [NSRegularExpression
+            regularExpressionWithPattern:@"\"url_list\"\\s*:\\s*\\[\\s*\"(https?://[^\"]+)\""
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        NSArray *am = [reAll matchesInString:decoded options:0 range:NSMakeRange(0, decoded.length)];
+        for (NSTextCheckingResult *m in am) {
+            if (m.numberOfRanges < 2) continue;
+            NSString *u = [decoded substringWithRange:[m rangeAtIndex:1]];
+            u = [u stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
+            if (u.length && ![result containsObject:u]) [result addObject:u];
+        }
+    }
+
+    // 3) DOM 正则兜底：gallery-container __carousel__image / aweme-slides-swiper-item 内的 <img src>
     NSRegularExpression *re1 = [NSRegularExpression
         regularExpressionWithPattern:@"<img[^>]*src=\"([^\"]+)\"[^>]*class=\"[^\"]*gallery-container[^\"]*__carousel__image[^\"]*\""
         options:NSRegularExpressionCaseInsensitive error:nil];
-    // 2) 滑块/幻灯片：aweme-slides-swiper-item 内的 img（options=9 含 DotMatchesLineSeparators，让 .*? 跨换行）
     NSRegularExpression *re2 = [NSRegularExpression
         regularExpressionWithPattern:@"<div[^>]*class=\"aweme-slides-swiper-item[^>]*>.*?<img[^>]*src=\"([^\"]+)\""
         options:(NSRegularExpressionCaseInsensitive | NSRegularExpressionDotMatchesLineSeparators) error:nil];
@@ -1111,7 +1237,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     });
 }
 
-// 解析预览：视频→系统 AVPlayerViewController 播放；图文/滑块→下载后系统 QL 预览
+// 解析预览：视频→自定义播放器（画中画）；图文/滑块→下载后自定义图片浏览器预览
 + (void)handleParsePreview:(NSString *)url fromVC:(UIViewController *)vc {
     DDPShowLoading(@"正在解析…");
     [[DDPEngine shared] parseDouyinURL:url completion:^(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err) {
@@ -1144,25 +1270,21 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     }];
 }
 
-// 视频预览：用系统 AVPlayerViewController 播放本地 mp4，显式开启画中画（PiP）
-// 微信宿主未声明 PiP background mode，需显式开启 allowsPictureInPicturePlayback 并
-// 配置 AVAudioSession 为 Playback，否则系统通常不弹 PiP 按钮。
+// 视频预览：用自定义播放器 DDPVideoPlayer（AVPlayerLayer + AVPictureInPictureController）
+// 导航栏带"关闭/保存"，默认自动开启画中画小窗口播放；不支持 PiP 时退化为内联播放。
 + (void)playVideoAtPath:(NSString *)path fromVC:(UIViewController *)vc {
     if (!path.length || !vc) return;
-    // 音频会话设为 Playback（MixWithOthers 不打断微信其他声音），PiP 才能正常工作
-    AVAudioSession *as = [AVAudioSession sharedInstance];
-    [as setCategory:AVAudioSessionCategoryPlayback
-        withOptions:AVAudioSessionCategoryOptionMixWithOthers error:nil];
-    [as setActive:YES error:nil];
-    AVPlayerViewController *player = [[AVPlayerViewController alloc] init];
-    player.player = [AVPlayer playerWithURL:[NSURL fileURLWithPath:path]];
-    // iOS 14 起该属性标记 deprecated（改由系统自动管理），但仍为控制 PiP 开关的有效属性，
-    // 显式开启以保证在微信宿主下 PiP 按钮出现
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    player.allowsPictureInPicturePlayback = YES;
-#pragma clang diagnostic pop
-    [vc presentViewController:player animated:YES completion:nil];
+    DDPVideoPlayer *player = [[DDPVideoPlayer alloc] init];
+    player.path = path;
+    // 预览页"保存"按钮回调：由本类（DDPPanel）执行相册保存并提示，避免在播放器类里反向依赖 DDPPanel
+    player.onSave = ^(NSString *p) {
+        [DDPPanel saveVideoToAlbumAtPath:p completion:^(BOOL success) {
+            if (success) DDPShowDone(@"保存成功");
+            else DDPShowError(@"保存失败");
+        }];
+    };
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:player];
+    [vc presentViewController:nav animated:YES completion:nil];
 }
 
 // 下载图片直链到本地缓存（供"直接观看"，不存相册；复用 MD5 缓存）
@@ -1187,11 +1309,18 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 }
 
 // 直接观看图片：用自建 UIPageViewController 浏览器预览本地图片（多图左右滑切换、捏合缩放）
-// 用 UINavigationController 包裹以显示导航栏（关闭按钮 + 系统分享保存，恢复原 QL 的分享能力）
+// 用 UINavigationController 包裹以显示导航栏（关闭按钮 + 保存按钮）
 + (void)presentImageViewer:(NSArray<NSString *> *)paths fromVC:(UIViewController *)vc {
     if (!paths.count || !vc) return;
     DDPPhotoBrowser *browser = [[DDPPhotoBrowser alloc] init];
     browser.paths = paths;
+    // 预览页"保存"按钮回调：由本类（DDPPanel）执行相册保存并提示，避免在浏览器类里反向依赖 DDPPanel
+    browser.onSaveCurrent = ^(NSString *path) {
+        [DDPPanel saveImageToAlbumAtPath:path completion:^(BOOL success) {
+            if (success) DDPShowDone(@"保存成功");
+            else DDPShowError(@"保存失败");
+        }];
+    };
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:browser];
     [vc presentViewController:nav animated:YES completion:nil];
 }
