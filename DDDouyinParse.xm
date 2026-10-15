@@ -328,16 +328,9 @@ static inline NSString *DDPImageExt(NSData *data, NSString *url) {
     return @"jpg";
 }
 
-// 取当前 foreground 的 keyWindow（iOS 13+ 多场景）
+// 取微信主窗口（单主窗口 app，直接取 AppDelegate.window，无需遍历场景）
 static inline UIWindow *DDPKeyWindow(void) {
-    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-        UIWindowScene *ws = (UIWindowScene *)scene;
-        if (ws.activationState != UISceneActivationStateForegroundActive) continue;
-        if (ws.keyWindow) return ws.keyWindow;
-        return ws.windows.firstObject;
-    }
-    return nil;
+    return UIApplication.sharedApplication.delegate.window;
 }
 
 // 解析过程提示：参考 DD语音包的方形 WeToast 三态（转圈 / ✓ / 错误）。
@@ -434,11 +427,8 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重试 3 次（配�
 
         _webView.navigationDelegate = self;
 
-        UIWindow *keyWindow = DDPKeyWindow();
-        if (keyWindow) {
-            [keyWindow addSubview:_webView];
-            _webView.frame = keyWindow.bounds;
-        }
+        // 离屏抓取：WKWebView 在独立 WebContent 进程渲染，无需挂到任何窗口即可 loadRequest / 执行 JS，
+        // 故不挂窗口、省掉找 keyWindow 的遍历；hidden 仅防误显示
         _webView.hidden = YES;
     }
     return self;
@@ -749,7 +739,7 @@ static CMessageMgr *DDPMessageMgr(void) {
     return [[(MMContext *)[%c(MMContext) currentContext] serviceCenter] getService:%c(CMessageMgr)];
 }
 
-// 取当前会话名（遍历 VC 响应 getCurrentChatName）
+// 取当前会话名：在 VC 树里找 BaseMsgContentViewController（聊天界面）取其会话名
 static NSString *DDPCurrentChatName(void) {
     UIWindow *window = DDPKeyWindow();
     UIViewController *vc = window.rootViewController;
@@ -759,8 +749,8 @@ static NSString *DDPCurrentChatName(void) {
     while (stack.count) {
         UIViewController *cur = stack.firstObject;
         [stack removeObjectAtIndex:0];
-        // 命中聊天控制器即取其会话名（respondsToSelector 确认后再强转调用）
-        if ([cur respondsToSelector:@selector(getCurrentChatName)]) {
+        // 聊天界面就是 BaseMsgContentViewController，直接按类匹配（不再靠 respondsToSelector 泛化判断）
+        if ([cur isKindOfClass:%c(BaseMsgContentViewController)]) {
             NSString *name = [(BaseMsgContentViewController *)cur getCurrentChatName];
             if (name.length) return name;
         }
