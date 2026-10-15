@@ -112,6 +112,13 @@
 - (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
 @end
 
+// 微信自定义菜单控制器：气泡菜单(TextMessageCellView operationMenuItems) 与
+// 浮窗预览菜单(长按文本/链接) 最终都经 setMenuItems: 装配，故在此统一注入
+@interface MMMenuController : NSObject
+- (id)responder;
+- (void)setMenuItems:(id)items;
+@end
+
 // 可缩放单图页：UIScrollView + UIImageView，支持捏合/双击缩放，背景随深色模式
 @interface DDPPhotoPage : UIViewController <UIScrollViewDelegate>
 @property (nonatomic, copy) NSString *path;
@@ -938,6 +945,23 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     UIResponder *r = (UIResponder *)self;
     while ((r = [r nextResponder]))
         if ([r isKindOfClass:[UIViewController class]]) { [DDPPanel handleParsePreview:url fromVC:(UIViewController *)r]; return; }
+}
+%end
+
+#pragma mark - Hook：MMMenuController setMenuItems（统一菜单注入点）
+
+// 覆盖两条菜单路径：气泡菜单（非链接长按）与浮窗预览菜单（长按文本/链接）。
+// 从 responder(消息 cell) 反查消息内容，命中抖音链接则追加「解析/预览」；
+// 已存在同 token 项时 ddp_inject_item 会跳过，不会与 operationMenuItems 的注入重复。
+%hook MMMenuController
+- (void)setMenuItems:(NSArray *)items {
+    id resp = [self responder];
+    NSString *content = ddp_cellContent(resp);
+    BOOL enabled = DDPConfig.shared.enabled
+                   && DDPContainsDouyinLink(content) && !DDPIsDouyinLiveText(content);
+    NSArray *all = ddp_inject_item(resp, items, enabled, @"解析", @"icons_filled_search", @selector(ddp_onParse:), 1010);
+    all = ddp_inject_item(resp, all, enabled, @"预览", @"icons_filled_play", @selector(ddp_onPreview:), 1011);
+    %orig(all);
 }
 %end
 
