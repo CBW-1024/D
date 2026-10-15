@@ -468,6 +468,7 @@ static NSString *DDPImageIdentityKey(NSString *url) {
 - (NSArray<NSString *> *)extractGalleryImagesFromHTML:(NSString *)html {
     NSMutableArray *result = [NSMutableArray array];
     NSMutableSet *seen = [NSMutableSet set];
+    NSUInteger rawCount = 0, containerIdx = 0;   // 诊断用：去重前总数 / 容器序号
     NSMutableString *decoded = [html mutableCopy];
     [decoded replaceOccurrencesOfString:@"\\u002f" withString:@"/" options:0 range:NSMakeRange(0, decoded.length)];
     [decoded replaceOccurrencesOfString:@"\\/" withString:@"/" options:0 range:NSMakeRange(0, decoded.length)];
@@ -491,7 +492,10 @@ static NSString *DDPImageIdentityKey(NSString *url) {
             NSRegularExpression *reU = [NSRegularExpression
                 regularExpressionWithPattern:@"\"url_list\"\\s*:\\s*\\[\\s*\"(https?://[^\"]+)\""
                 options:NSRegularExpressionCaseInsensitive error:nil];
-            for (NSTextCheckingResult *m in [reU matchesInString:seg options:0 range:NSMakeRange(0, seg.length)]) {
+            NSArray *ms = [reU matchesInString:seg options:0 range:NSMakeRange(0, seg.length)];
+            DDDLog(@"[extractGallery] 容器#%lu url_list=%lu", (unsigned long)containerIdx, (unsigned long)ms.count);
+            for (NSTextCheckingResult *m in ms) {
+                rawCount++;
                 NSString *u = [[seg substringWithRange:[m rangeAtIndex:1]] stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
                 NSString *key = DDPImageIdentityKey(u);
                 if (u.length && key.length && ![seen containsObject:key]) {
@@ -500,9 +504,10 @@ static NSString *DDPImageIdentityKey(NSString *url) {
                 }
             }
         }
+        containerIdx++;
         csearch = NSMakeRange(cr.location + @"\"images\"".length, decoded.length - (cr.location + @"\"images\"".length));
     }
-    DDDLog(@"[extractGallery] 图集候选数=%lu", (unsigned long)result.count);
+    DDDLog(@"[extractGallery] 容器总数=%lu 去重前=%lu 去重后=%lu", (unsigned long)containerIdx, (unsigned long)rawCount, (unsigned long)result.count);
     return [result copy];
 }
 - (void)parseDouyinURL:(NSString *)url
