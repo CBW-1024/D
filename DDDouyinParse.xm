@@ -15,7 +15,6 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <AVKit/AVKit.h>
-#import <QuickLook/QuickLook.h>
 
 #pragma mark - 微信私有类声明（仅声明插件用到的方法）
 
@@ -139,18 +138,77 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
 - (void)showInView:(UIView *)view;
 @end
 
-// 系统图片预览数据源（QLPreviewController 的 dataSource）
-static const void *kDDPImageQLSourceKey = &kDDPImageQLSourceKey;
+// 可缩放单图页：UIScrollView 包 UIImageView，支持捏合/双击缩放
+@interface DDPPhotoPage : UIViewController <UIScrollViewDelegate>
+@property (nonatomic, copy) NSString *path;
+@end
+@implementation DDPPhotoPage
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = UIColor.blackColor;
+    UIScrollView *sv = [[UIScrollView alloc] initWithFrame:self.view.bounds];
+    sv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    sv.minimumZoomScale = 1.0;
+    sv.maximumZoomScale = 4.0;
+    sv.delegate = self;
+    UIImageView *iv = [[UIImageView alloc] initWithImage:[UIImage imageWithContentsOfFile:self.path]];
+    iv.contentMode = UIViewContentModeScaleAspectFit;
+    iv.frame = sv.bounds;
+    iv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [sv addSubview:iv];
+    [self.view addSubview:sv];
+}
+- (UIView *)viewForZoomingInScrollView:(UIScrollView *)scrollView {
+    return scrollView.subviews.firstObject;
+}
+@end
 
-@interface DDPImageQLSource : NSObject <QLPreviewControllerDataSource>
+// 多图浏览器：UIPageViewController 左右滑切换，体验类似系统相册
+@interface DDPPhotoBrowser : UIPageViewController <UIPageViewControllerDataSource>
 @property (nonatomic, copy) NSArray<NSString *> *paths;
 @end
-@implementation DDPImageQLSource
-- (NSInteger)numberOfPreviewItemsInPreviewController:(QLPreviewController *)controller {
-    return (NSInteger)self.paths.count;
+@implementation DDPPhotoBrowser
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = UIColor.blackColor;
+    self.dataSource = self;
+    if (self.paths.count) {
+        [self setViewControllers:@[[self pageAt:0]]
+                       direction:UIPageViewControllerNavigationDirectionForward
+                        animated:NO completion:nil];
+    }
+    self.navigationItem.leftBarButtonItem =
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
+                                                      target:self action:@selector(ddp_dismiss:)];
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAction
+                                                      target:self action:@selector(ddp_share:)];
 }
-- (id<QLPreviewItem>)previewController:(QLPreviewController *)controller previewItemAtIndex:(NSInteger)index {
-    return [NSURL fileURLWithPath:self.paths[index]];
+- (DDPPhotoPage *)pageAt:(NSInteger)i {
+    DDPPhotoPage *p = [[DDPPhotoPage alloc] init];
+    p.path = self.paths[i];
+    return p;
+}
+- (UIViewController *)pageViewController:(UIPageViewController *)pc
+      viewControllerBeforeViewController:(UIViewController *)vc {
+    NSInteger i = [self.paths indexOfObject:[(DDPPhotoPage *)vc path]];
+    return (i > 0) ? [self pageAt:i - 1] : nil;
+}
+- (UIViewController *)pageViewController:(UIPageViewController *)pc
+       viewControllerAfterViewController:(UIViewController *)vc {
+    NSInteger i = [self.paths indexOfObject:[(DDPPhotoPage *)vc path]];
+    return (i < (NSInteger)self.paths.count - 1) ? [self pageAt:i + 1] : nil;
+}
+- (void)ddp_dismiss:(id)sender { [self dismissViewControllerAnimated:YES completion:nil]; }
+- (void)ddp_share:(id)sender {
+    DDPPhotoPage *cur = (DDPPhotoPage *)self.viewControllers.firstObject;
+    if (!cur.path) return;
+    NSURL *url = [NSURL fileURLWithPath:cur.path];
+    UIActivityViewController *av = [[UIActivityViewController alloc] initWithActivityItems:@[url]
+                                                                     applicationActivities:nil];
+    if (av.popoverPresentationController)
+        av.popoverPresentationController.barButtonItem = self.navigationItem.rightBarButtonItem;
+    [self presentViewController:av animated:YES completion:nil];
 }
 @end
 
@@ -1086,11 +1144,24 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     }];
 }
 
-// 视频预览：用系统 AVPlayerViewController 播放本地 mp4（iOS 14+ 画中画自动支持，无需手动开启）
+// 视频预览：用系统 AVPlayerViewController 播放本地 mp4，显式开启画中画（PiP）
+// 微信宿主未声明 PiP background mode，需显式开启 allowsPictureInPicturePlayback 并
+// 配置 AVAudioSession 为 Playback，否则系统通常不弹 PiP 按钮。
 + (void)playVideoAtPath:(NSString *)path fromVC:(UIViewController *)vc {
     if (!path.length || !vc) return;
+    // 音频会话设为 Playback（MixWithOthers 不打断微信其他声音），PiP 才能正常工作
+    AVAudioSession *as = [AVAudioSession sharedInstance];
+    [as setCategory:AVAudioSessionCategoryPlayback
+        withOptions:AVAudioSessionCategoryOptionMixWithOthers error:nil];
+    [as setActive:YES error:nil];
     AVPlayerViewController *player = [[AVPlayerViewController alloc] init];
     player.player = [AVPlayer playerWithURL:[NSURL fileURLWithPath:path]];
+    // iOS 14 起该属性标记 deprecated（改由系统自动管理），但仍为控制 PiP 开关的有效属性，
+    // 显式开启以保证在微信宿主下 PiP 按钮出现
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    player.allowsPictureInPicturePlayback = YES;
+#pragma clang diagnostic pop
     [vc presentViewController:player animated:YES completion:nil];
 }
 
@@ -1115,17 +1186,14 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     });
 }
 
-// 直接观看图片：用系统 QLPreviewController 预览本地图片（多图左右滑切换、捏合缩放均由系统处理）
-// 保存走 QL 系统分享菜单，故不再提供自定义"保存"按钮
+// 直接观看图片：用自建 UIPageViewController 浏览器预览本地图片（多图左右滑切换、捏合缩放）
+// 用 UINavigationController 包裹以显示导航栏（关闭按钮 + 系统分享保存，恢复原 QL 的分享能力）
 + (void)presentImageViewer:(NSArray<NSString *> *)paths fromVC:(UIViewController *)vc {
     if (!paths.count || !vc) return;
-    QLPreviewController *ql = [[QLPreviewController alloc] init];
-    DDPImageQLSource *src = [[DDPImageQLSource alloc] init];
-    src.paths = paths;
-    ql.dataSource = src;
-    // QLPreviewController.dataSource 为 assign（非 weak），用关联对象强持有 src，避免释放后野指针
-    objc_setAssociatedObject(ql, kDDPImageQLSourceKey, src, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    [vc presentViewController:ql animated:YES completion:nil];
+    DDPPhotoBrowser *browser = [[DDPPhotoBrowser alloc] init];
+    browser.paths = paths;
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:browser];
+    [vc presentViewController:nav animated:YES completion:nil];
 }
 
 // 解析链接：把提取到的直链以文本消息发出
