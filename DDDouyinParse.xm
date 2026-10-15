@@ -115,7 +115,6 @@
 // 微信自定义菜单控制器：气泡菜单(TextMessageCellView operationMenuItems) 与
 // 浮窗预览菜单(长按文本/链接) 最终都经 setMenuItems: 装配，故在此统一注入
 @interface MMMenuController : NSObject
-- (id)responder;
 - (void)setMenuItems:(id)items;
 @end
 
@@ -965,7 +964,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
 #pragma mark - Hook：MMMenuController setMenuItems（统一菜单注入点）
 
 // 覆盖两条菜单路径：气泡菜单（非链接长按）与浮窗预览菜单（长按文本/链接）。
-// 从 responder(消息 cell) 反查消息内容，命中抖音链接则追加「解析/预览」；
+// 从 canCellShowOperationMenu 缓存的 cell 取消息内容，命中抖音链接则追加「解析/预览」；
 // 已存在同 token 项时 ddp_inject_item 会跳过，不会与 operationMenuItems 的注入重复。
 // 菜单显示前微信会调此方法，此时 self 即 cell —— 缓存下来供 setMenuItems: 使用
 %hook BaseMessageCellView
@@ -979,7 +978,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
 // 已存在同 token 项时 ddp_inject_item 会跳过，不会与 operationMenuItems 的注入重复。
 %hook MMMenuController
 - (void)setMenuItems:(NSArray *)items {
-    id cell = gDDPMenuCell ?: [self responder];   // 优先用缓存，responder 仅作补充
+    id cell = gDDPMenuCell;                       // 由 canCellShowOperationMenu 缓存
     NSString *content = ddp_cellContent(cell);
     BOOL enabled = DDPConfig.shared.enabled
                    && DDPContainsDouyinLink(content) && !DDPIsDouyinLiveText(content);
