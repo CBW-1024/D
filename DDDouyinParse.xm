@@ -109,6 +109,11 @@
 + (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3;
 @end
 
+@interface WCPluginsMgr : NSObject
++ (instancetype)sharedInstance;
+- (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
+@end
+
 // 可缩放单图页：UIScrollView + UIImageView，支持捏合/双击缩放，背景随深色模式
 @interface DDPPhotoPage : UIViewController <UIScrollViewDelegate>
 @property (nonatomic, copy) NSString *path;
@@ -1022,5 +1027,9 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
 
 %ctor {
     Class mgrCls = objc_getClass("WCPluginsMgr");
-    if (mgrCls) [[mgrCls sharedInstance] registerControllerWithTitle:@"DD抖音解析" version:@"1.0.0" controller:@"DDPDouyinParseSettingsViewController"];
+    if (mgrCls) {
+        [[mgrCls sharedInstance] registerControllerWithTitle:@"DD抖音解析"
+                                                     version:@"1.0.0"
+                                                  controller:@"DDPDouyinParseSettingsViewController"];
+    }
 }
