@@ -14,7 +14,6 @@
 #import <objc/runtime.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreGraphics/CoreGraphics.h>
-#import <string.h>
 
 #pragma mark - 微信私有类声明（仅声明插件用到的方法）
 
@@ -112,6 +111,10 @@
 
 @interface CUtility : NSObject  // 微信 UA（GetMMUserAgent）
 + (NSString *)GetMMUserAgent;
+@end
+
+@interface CRUtils : NSObject   // 通用工具：md5（CRUtils.h:9），用于生成缓存文件名
++ (NSString *)md5:(NSString *)str;
 @end
 
 // 微信头文件里 MMMenuItem 直接继承 NSObject（不是 UIMenuItem），且没有 title 的 getter，
@@ -221,16 +224,28 @@ static NSString * const kDDPEnabledKey   = @"DDDouyinParseEnabled";
 #pragma mark - 工具函数
 
 // 抖音链接检测：仅认这三类官方分享链接
+// 抖音分享链接识别：根域名 douyin.com 一锤定音。
+// 涵盖 v.douyin.com 短链（视频/图文/直播通用）与 www.douyin.com/video、/note 长链；
+// 直播由 DDPIsDouyinLiveText（短链无日期）在调用处单独排除，这里无需区分。
+// （若文本仅口头提及 douyin.com 而无真实链接，下一步 DDPExtractURL 抽不到 URL 会自行返回，无副作用）
 static inline BOOL DDPContainsDouyinLink(NSString *text) {
-    if (!text.length) return NO;
-    return [text containsString:@"douyin.com/video"]
-        || [text containsString:@"v.douyin.com"]
-        || [text containsString:@"douyin.com/note"];
+    return text.length && [text containsString:@"douyin.com"];
 }
 
-// 排除"正在直播"的直播间分享文本
+// 排除抖音直播分享：v.douyin.com 短链分享中，直播文案不含发布日期 MM/DD，
+// 而视频/图文分享均带日期；故"短链 + 链接后无日期"可靠指向直播。
+// （直播间分享文案一般无"正在直播"字样，故改用日期特征区分；
+//   仅当抖音改版致视频/图文分享不再带日期时可能误杀，届时回退即可）
 static inline BOOL DDPIsDouyinLiveText(NSString *text) {
-    return text.length && [text containsString:@"正在直播"];
+    if (!text.length) return NO;
+    // 只检查 v.douyin.com 链接【之后】的尾缀：日期稳定出现在链接后，
+    // 链接前的引导文案（标题）是用户自定义内容、可能碰巧含 MM/DD，不可信。
+    NSRange linkR = [text rangeOfString:@"v.douyin.com"];
+    if (linkR.location == NSNotFound) return NO;
+    NSString *after = [text substringFromIndex:linkR.location];
+    NSRange r = [after rangeOfString:@"\\d{2}/\\d{2}" options:NSRegularExpressionSearch];
+    if (r.location == NSNotFound) { DDDLog(@"直播排除: 短链链接后无日期"); return YES; }
+    return NO;
 }
 
 // 发送方判定：微信原生类方法（CMessageWrap.h:19）
@@ -266,95 +281,19 @@ static inline NSString *DDPRemoveWatermark(NSString *url) {
     return clean;
 }
 
-// 自实现 MD5（RFC1321），避免依赖废弃的 CC_MD5
-static inline uint32_t DDPmd5Rotl(uint32_t x, int c) { return (x << c) | (x >> (32 - c)); }
-
-static inline void DDPmd5Block(uint32_t *s, const uint8_t *p) {
-    static const uint32_t K[64] = {
-        0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,
-        0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,
-        0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,
-        0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,
-        0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,
-        0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,
-        0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,
-        0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391};
-    static const uint8_t R[64] = {7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
-                                  5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
-                                  4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
-                                  6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21};
-    uint32_t a=s[0], b=s[1], c=s[2], d=s[3];
-    uint32_t M[16];
-    for (int i = 0; i < 16; i++)
-        M[i] = (uint32_t)p[i*4] | ((uint32_t)p[i*4+1]<<8) | ((uint32_t)p[i*4+2]<<16) | ((uint32_t)p[i*4+3]<<24);
-    for (int i = 0; i < 64; i++) {
-        uint32_t f; int g;
-        if (i < 16)      { f = (b & c) | (~b & d);      g = i; }
-        else if (i < 32) { f = (d & b) | (~d & c);      g = (5*i + 1) % 16; }
-        else if (i < 48) { f = b ^ c ^ d;               g = (3*i + 5) % 16; }
-        else             { f = c ^ (b | ~d);            g = (7*i) % 16; }
-        uint32_t tmp = d;
-        d = c; c = b;
-        b = b + DDPmd5Rotl(a + f + K[i] + M[g], R[i]);
-        a = tmp;
-    }
-    s[0]+=a; s[1]+=b; s[2]+=c; s[3]+=d;
-}
-
-static inline void DDPmd5(const uint8_t *data, size_t len, uint8_t out[16]) {
-    uint32_t s[4] = {0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476};
-    size_t n = len;
-    uint8_t block[64];
-    size_t i = 0;
-    while (n >= 64) {
-        memcpy(block, data + i, 64);
-        DDPmd5Block(s, block);
-        i += 64; n -= 64;
-    }
-    size_t rem = len - i;
-    memcpy(block, data + i, rem);
-    block[rem] = 0x80;
-    if (rem >= 56) {
-        memset(block + rem + 1, 0, 64 - rem - 1);
-        DDPmd5Block(s, block);
-        memset(block, 0, 56);
-    } else {
-        memset(block + rem + 1, 0, 56 - rem - 1);
-    }
-    uint64_t bitlen = (uint64_t)len * 8;
-    for (int j = 0; j < 8; j++) block[56 + j] = (uint8_t)(bitlen >> (j * 8));
-    DDPmd5Block(s, block);
-    for (int j = 0; j < 4; j++) {
-        out[j*4]   = (uint8_t)(s[j]);
-        out[j*4+1] = (uint8_t)(s[j] >> 8);
-        out[j*4+2] = (uint8_t)(s[j] >> 16);
-        out[j*4+3] = (uint8_t)(s[j] >> 24);
-    }
-}
-
-static inline NSString *DDPMD5(NSString *str) {
-    if (!str.length) return nil;
-    const char *c = [str UTF8String];
-    if (!c) return nil;
-    unsigned char digest[16];
-    DDPmd5((const uint8_t *)c, strlen(c), digest);
-    NSMutableString *out = [NSMutableString stringWithCapacity:32];
-    for (int i = 0; i < 16; i++) [out appendFormat:@"%02x", digest[i]];
-    return out;
-}
-
-// 缓存路径：MD5_1.mp4
+// 缓存路径：<md5>.mp4（md5 走微信原生 CRUtils，不再自己实现 RFC1321）
 static inline NSString *DDPTempPath(NSString *url) {
-    NSString *md5 = DDPMD5(url);
-    if (!md5) return nil;
-    return [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"%@_1.mp4", md5]];
+    NSString *md5 = [%c(CRUtils) md5:url];
+    DDDLog(@"DDPTempPath: md5=%@ 长度=%lu class=%@", md5, (unsigned long)md5.length, md5.class);
+    if (!md5.length) return nil;
+    return [NSTemporaryDirectory() stringByAppendingPathComponent:[md5 stringByAppendingString:@".mp4"]];
 }
 
-// 图片缓存路径 MD5_1.<ext>
+// 图片缓存路径 <md5>.<ext>
 static inline NSString *DDPTempPathExt(NSString *url, NSString *ext) {
-    NSString *md5 = DDPMD5(url);
-    if (!md5) return nil;
-    return [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"%@_1.%@", md5, ext ?: @"dat"]];
+    NSString *md5 = [%c(CRUtils) md5:url];
+    if (!md5.length) return nil;
+    return [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.%@", md5, ext ?: @"dat"]];
 }
 
 // 取当前 foreground 的 keyWindow（iOS 13+ 多场景）
@@ -371,11 +310,16 @@ static inline UIWindow *DDPKeyWindow(void) {
 
 // 文件存在且 >2 字节才复用
 static inline BOOL DDPFileUsable(NSString *path) {
-    if (!path.length) return NO;
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if (![fm fileExistsAtPath:path]) return NO;
-    NSDictionary *attr = [fm attributesOfItemAtPath:path error:nil];
-    return attr.fileSize > 2;
+    BOOL ok = NO;
+    if (path.length) {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if ([fm fileExistsAtPath:path]) {
+            NSDictionary *attr = [fm attributesOfItemAtPath:path error:nil];
+            ok = attr.fileSize > 2;
+        }
+    }
+    DDDLog(@"缓存判断: %@ -> %@", [path lastPathComponent], ok ? @"命中" : @"未命中");
+    return ok;
 }
 
 // 解析过程提示：参考 DD语音包的方形 WeToast 三态（转圈 / ✓ / 错误）。
@@ -861,10 +805,12 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     if (!videoURL.length) { if (finish) finish(); return; }
     NSString *path = DDPTempPath(url);
     if (DDPFileUsable(path)) {
+        DDDLog(@"sendVideoForURL: 命中缓存，跳过下载 path=%@", path);
         [DDPPanel sendVideoAtPath:path toUser:user];
         if (finish) finish();
         return;
     }
+    DDDLog(@"sendVideoForURL: 无缓存，开始下载 → %@", path);
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSData *data = [[DDPEngine shared] downloadVideoFromURL:videoURL];
         BOOL ok = NO;
@@ -883,6 +829,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     if (!urls.count) { if (finish) finish(); return; }
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         for (NSString *imgURL in urls) {
+            DDDLog(@"下载开始(存相册图): %@（本路径恒重新下载，无缓存复用）", [DDPTempPathExt(imgURL, [[imgURL pathExtension].lowercaseString isEqualToString:@"png"]?@"png":@"jpg") lastPathComponent]);
             NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL];
             if (!data.length) continue;
             NSString *ext = @"jpg";
@@ -971,6 +918,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
                     [DDPPanel sendImageAtPath:path toUser:user];
                     continue;
                 }
+                DDDLog(@"下载开始(发图): %@", [path lastPathComponent]);
                 NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL];
                 if (!data.length) continue;
                 NSFileManager *fm = [NSFileManager defaultManager];
@@ -1002,6 +950,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
                 return;
             }
             dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                DDDLog(@"下载开始(预览视频): %@", [path lastPathComponent]);
                 NSData *data = [[DDPEngine shared] downloadVideoFromURL:videoURL];
                 if (data.length) {
                     NSFileManager *fm = [NSFileManager defaultManager];
@@ -1041,6 +990,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
             if ([[imgURL pathExtension].lowercaseString isEqualToString:@"png"]) ext = @"png";
             NSString *path = DDPTempPathExt(imgURL, ext);
             if (![fm fileExistsAtPath:path]) {
+                DDDLog(@"下载开始(本地看图): %@", [path lastPathComponent]);
                 NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL];
                 if (data.length) {
                     if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
@@ -1097,6 +1047,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
                 return;
             }
             dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                DDDLog(@"下载开始(存相册视频): %@", [path lastPathComponent]);
                 NSData *data = [[DDPEngine shared] downloadVideoFromURL:videoURL];
                 BOOL ok = NO;
                 if (data.length) {
@@ -1266,7 +1217,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
         NSString *content = rawContent;
         if (!DDPContainsDouyinLink(content) && DDPContainsDouyinLink(rawTitle)) content = rawTitle;
         if (!DDPContainsDouyinLink(content)) break;              // 三串抖音检测
-        if (DDPIsDouyinLiveText(content)) break;                 // 排除"正在直播"
+        if (DDPIsDouyinLiveText(content)) break;                 // 排除直播（短链无日期）
 
         // user 取 AddMsg 首参（会话对象）
         NSString *target = usr.length ? usr : wrap.m_nsToUsr;
