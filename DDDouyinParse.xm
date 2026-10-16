@@ -436,15 +436,18 @@ static NSString *DDPFirstPlayURL(NSDictionary *video) {
 
 - (void)parseURL:(NSString *)url completion:(void (^)(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err))completion {
     dispatch_async(_apiQueue, ^{
-        NSString *awemeId = DDPExtractAwemeId(url);
+        // workingURL 承载「可能被短链重定向展开后的 URL」，避免直接改参数 url（block 捕获不可赋值）
+        NSString *workingURL = [url copy];
+        NSString *awemeId = DDPExtractAwemeId(workingURL);
         DDDLog(@"[API] 入参=%@ aweme_id=%@", url, awemeId ?: @"(null)");
         // 短链（v.douyin.com/iRxxx 之类）里没有数字 ID，需先展开成真实 URL 才能走 API
         // 对齐 ZDY 的 ZJHRedirectDelegate 重定向捕获手法：跟随 302 拿最终 URL
         if (!awemeId.length) {
-            NSString *resolved = [self resolveCanonicalURL:url];
-            if (resolved && resolved != url && ![resolved isEqualToString:url]) {
-                url = resolved;
-                awemeId = DDPExtractAwemeId(url);
+            NSString *resolved = [self resolveCanonicalURL:workingURL];
+            if (resolved.length && ![resolved isEqualToString:workingURL]) {
+                workingURL = resolved;
+                awemeId = DDPExtractAwemeId(workingURL);
+                DDDLog(@"[API] 短链重定向解析: %@ → %@", url, workingURL);
                 DDDLog(@"[API] 短链展开后 aweme_id=%@", awemeId ?: @"(null)");
             }
         }
