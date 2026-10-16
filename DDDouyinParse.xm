@@ -345,6 +345,7 @@ static const NSInteger DDPCodeGallery = 0x4161;   // 图集类型标记
     NSString *u = webView.URL.absoluteString ?: @"";
     NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"/share/(note|video)/(\\d+)" options:NSRegularExpressionCaseInsensitive error:nil];
     NSTextCheckingResult *m = [re firstMatchInString:u options:0 range:NSMakeRange(0, u.length)];
+    DDDLog(@"[fetch] didFinish url=%@ share匹配=%@", u, m ? @"YES" : @"NO");
     if (m) {
         NSString *type = [u substringWithRange:[m rangeAtIndex:1]];
         NSString *awemeId = [u substringWithRange:[m rangeAtIndex:2]];
@@ -352,6 +353,7 @@ static const NSInteger DDPCodeGallery = 0x4161;   // 图集类型标记
         // 图集：分享页只有渲染后的 DOM <img>、没有内嵌 JSON "images"，必须跳规范地址才取得到 url_list
         if ([type caseInsensitiveCompare:@"note"] == NSOrderedSame) {
             self.fetchStart = CFAbsoluteTimeGetCurrent();
+            DDDLog(@"[fetch] note → 跳规范 %@", canon);
             [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:canon]]];
             return;
         }
@@ -373,10 +375,14 @@ static const NSInteger DDPCodeGallery = 0x4161;   // 图集类型标记
         if ([html containsString:@"playwm"] ||
             [html containsString:@"aweme-share-swiper-item"] ||
             [html containsString:@"aweme-slides-swiper-item"]) {
+            DDDLog(@"[fetch] 轮询命中标记 len=%lu waited=%.1f", (unsigned long)html.length, waited);
             [strong handleRenderedHTML:html];
             return;
         }
-        if (waited > 5.0) { [strong handleRenderedHTML:html]; return; }
+        if (waited > 5.0) {
+            DDDLog(@"[fetch] 超时收尾 len=%lu（无 playwm/swiper 标记）", (unsigned long)html.length);
+            [strong handleRenderedHTML:html]; return;
+        }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [strong pollHTML:webView attempt:attempt + 1];
         });
@@ -527,6 +533,7 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
 - (void)parseDouyinURL:(NSString *)url
             completion:(void (^)(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err))completion {
     [[DDPWebFetcher sharedFetcher] fetchHTMLFromURL:url completion:^(NSString *html, NSInteger errCode) {
+        DDDLog(@"[parse] 收到 HTML errCode=%ld len=%lu url=%@", (long)errCode, (unsigned long)html.length, url);
         if (!html.length) { if (completion) completion(DDPMediaTypeUnknown, nil, nil, [NSError errorWithDomain:@"DDP" code:-2 userInfo:nil]); return; }
         NSArray *videos = [self extractVideoLinksFromHTML:html];
         if (videos.count) { if (completion) completion(DDPMediaTypeVideo, videos.firstObject, nil, nil); return; }
