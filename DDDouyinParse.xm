@@ -221,6 +221,9 @@ static void DDDClearLog(void) {
 
 // 同一 key 只落一次：用于高频路径（每来一条消息都会跑的判定），
 // 既能看出「这段到底走没走过」，又不会把日志刷爆。用来甄别死代码。
+// ⚠️ 坑：clang 的 ObjC 预处理不把 [...] 当保护组，方括号里的逗号会被切成多个宏实参。
+//    所以 key 不要写成 DDDLogOnce([NSString stringWithFormat:@"x-%u", n], ...)，
+//    必须先算成局部变量再传（CI 已在 arm64/arm64e 上验证过这个写法会编译失败）。
 static NSMutableSet *gDDDOnceKeys(void) {
     static NSMutableSet *s; static dispatch_once_t once;
     dispatch_once(&once, ^{ s = [NSMutableSet set]; });
@@ -1211,8 +1214,9 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
         if (!DDPIsOutgoing(wrap)) { DDDLogOnce(@"addmsg-in", @"[Hook] AddMsg 跳过：非本人发出"); break; }
         unsigned int mt = wrap.m_uiMessageType;
         if (mt != 1 && mt != 49 && mt != 62) {
-            DDDLogOnce([NSString stringWithFormat:@"addmsg-mt-%u", mt],
-                       @"[Hook] AddMsg 跳过：消息类型 %u 不在 1/49/62（若恒不出现则 49/62 判定可简化）", mt);
+            // key 必须先算成变量再传：宏参数按逗号切分，直接把 stringWithFormat: 写进去会被切成两半
+            NSString *mtKey = [NSString stringWithFormat:@"addmsg-mt-%u", mt];
+            DDDLogOnce(mtKey, @"[Hook] AddMsg 跳过：消息类型 %u 不在 1/49/62（记录实际出现过的类型）", mt);
             break;
         }
         BOOL bypass = gDDPDyTcEnable; gDDPDyTcEnable = NO;       // 复位须在检测前
