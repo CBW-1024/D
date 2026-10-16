@@ -304,20 +304,15 @@ static void DDPShowDone(NSString *text) {
 #pragma mark - 抓取（离屏 WKWebView，轮询 playwm）
 
 static const NSInteger DDPCodeGallery = 0x4161;   // 图集类型标记
-
-// 抓取用 UA：抖音按 UA 分流，视频与图集诉求冲突，必须按类型分别设置：
-// ① 移动版 Safari（默认）：视频短链 302 到 iesdouyin.com/share/video/<id> 分享页，内嵌 playwm，视频解析可用；
-//    但移动 UA 下 www.douyin.com/note/<id> 会给壳页，图集取不到数据。
-// ② 桌面版 Safari：www.douyin.com/note/<id> 给 900KB 真页（含图集数据）；但桌面 UA 下视频短链 302 到
-//    www.douyin.com/video/<id> 的 SPA 壳页（数据走 XHR，outerHTML 无 playwm），视频解析失败。
-// ③ 微信 UA(原 GetMMUserAgent) 最差：被当 App 内嵌 webview，图集/视频都发壳页。
-// 统一策略：全程只用移动版 Safari UA（视频/图集/下载都一致）。
-static NSString *const DDPMobileUA  = @"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1";
+static const NSInteger DDPMaxRetries = 3;          // 最多重载 3 次（实测 1~2 轮即出直链）
 
 @interface DDPWebFetcher : NSObject <WKNavigationDelegate>
 @property (nonatomic, readonly) WKWebView *webView;
+@property (nonatomic, assign) unsigned int retries;
 @property (nonatomic, assign) BOOL hasCompleted;
+@property (nonatomic, strong) NSURLRequest *ddpRequest;
 @property (nonatomic, assign) NSTimeInterval fetchStart;
+@property (nonatomic, assign) NSUInteger lastCleanLen;
 @property (nonatomic, copy) void (^completion)(NSString *html, NSInteger errCode);
 - (void)fetchHTMLFromURL:(NSString *)url completion:(void (^)(NSString *html, NSInteger errCode))completion;
 - (void)ddFinishWithHTML:(NSString *)html code:(NSInteger)code;
@@ -335,28 +330,43 @@ static NSString *const DDPMobileUA  = @"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 
         WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
         config.defaultWebpagePreferences.allowsContentJavaScript = YES;   // 替代已废弃的 javaScriptEnabled
         _webView = [[WKWebView alloc] initWithFrame:CGRectZero configuration:config];
-        _webView.customUserAgent = DDPMobileUA;   // 全程移动 UA
+        _webView.customUserAgent = [%c(CUtility) GetMMUserAgent];
         _webView.navigationDelegate = self;
         _webView.hidden = YES;   // WKWebView 独立进程渲染，无需挂窗口；hidden 防误显示
     }
     return self;
 }
 - (void)fetchHTMLFromURL:(NSString *)url completion:(void (^)(NSString *html, NSInteger errCode))completion {
-    self.completion = completion;     self.hasCompleted = NO;
-    // 全程移动 UA（已统一，无需按类型切换）
-    self.webView.customUserAgent = DDPMobileUA;
+    self.completion = completion; self.hasCompleted = NO;
     NSURL *nsurl = [NSURL URLWithString:url];
     NSURLRequest *request = [NSURLRequest requestWithURL:nsurl cachePolicy:NSURLRequestUseProtocolCachePolicy timeoutInterval:30.0];
+    self.ddpRequest = request; self.retries = 0; self.lastCleanLen = 0;
     self.fetchStart = CFAbsoluteTimeGetCurrent();
     dispatch_async(dispatch_get_main_queue(), ^{ [self.webView loadRequest:request]; });
 }
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
-    // v.douyin.com 短链会 302 到 iesdouyin.com/share/<type>/<id>，统一留在当前分享页轮询即可：
-    // 视频靠分享页内嵌 playwm；图集靠分享页内嵌 urlList（移动 UA 下 www.douyin.com/note 只给壳页，故不跳）。
+    // v.douyin.com 短链会 302 到 iesdouyin.com/share/<type>/<id>，该落地页无图集/直链数据；
+    // 提取 type+id 改加载规范 www.douyin.com/<type>/<id>（已非 share 路径，不会循环重导）
     NSString *u = webView.URL.absoluteString ?: @"";
     NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"/share/(note|video)/(\\d+)" options:NSRegularExpressionCaseInsensitive error:nil];
     NSTextCheckingResult *m = [re firstMatchInString:u options:0 range:NSMakeRange(0, u.length)];
-    DDDLog(@"[fetch] didFinish url=%@ share匹配=%@", u, m ? @"YES" : @"NO");
+    if (m) {
+        NSString *type = [u substringWithRange:[m rangeAtIndex:1]];
+        NSString *awemeId = [u substringWithRange:[m rangeAtIndex:2]];
+        NSString *canon = [NSString stringWithFormat:@"https://www.douyin.com/%@/%@", type, awemeId];
+        // 图集：分享页只有渲染后的 DOM <img>、没有内嵌 JSON "images"，必须跳规范地址才取得到 url_list。
+        // 同时把 ddpRequest 换成规范地址——否则 handleRenderedHTML 的重试会重载原始短链，
+        // 再次 302 回 share 页并触发本跳转，形成「短链↔规范地址」死循环。
+        if ([type caseInsensitiveCompare:@"note"] == NSOrderedSame) {
+            NSURLRequest *canonReq = [NSURLRequest requestWithURL:[NSURL URLWithString:canon]];
+            self.ddpRequest = canonReq;
+            self.fetchStart = CFAbsoluteTimeGetCurrent();
+            [webView loadRequest:canonReq];
+            return;
+        }
+        // 视频：分享页自带播放器，JS 执行后 playwm 会进 DOM，留在当前页轮询即可
+        // （实测 attempt=0 即命中；跳到裸规范地址反而会丢分享授权参数）
+    }
     [self pollHTML:webView attempt:0];
 }
 // 抖音 H5 懒加载：首轮 outerHTML 常无 playwm，故每 0.5s 轮询，命中即收，最多 5s
@@ -370,16 +380,12 @@ static NSString *const DDPMobileUA  = @"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 
         NSString *html = result ? [NSString stringWithFormat:@"%@", result] : @"";
         NSTimeInterval waited = CFAbsoluteTimeGetCurrent() - strong.fetchStart;
         if ([html containsString:@"playwm"] ||
-            [html containsString:@"urlList"] ||
-            [html containsString:@"\"images\""]) {
-            DDDLog(@"[fetch] 轮询命中标记 len=%lu waited=%.1f", (unsigned long)html.length, waited);
+            [html containsString:@"aweme-share-swiper-item"] ||
+            [html containsString:@"aweme-slides-swiper-item"]) {
             [strong handleRenderedHTML:html];
             return;
         }
-        if (waited > 5.0) {
-            DDDLog(@"[fetch] 超时收尾 len=%lu（无 playwm/swiper 标记）", (unsigned long)html.length);
-            [strong handleRenderedHTML:html]; return;
-        }
+        if (waited > 5.0) { [strong handleRenderedHTML:html]; return; }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [strong pollHTML:webView attempt:attempt + 1];
         });
@@ -399,6 +405,7 @@ static NSString *const DDPMobileUA  = @"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 
     if (self.hasCompleted) return;
     self.hasCompleted = YES;
     if (self.completion) self.completion(html, code);
+    self.retries = 0;
 }
 - (void)handleRenderedHTML:(NSString *)html {
     if (!html.length) { [self ddFinishWithHTML:nil code:-2]; return; }
@@ -415,9 +422,17 @@ static NSString *const DDPMobileUA  = @"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 
     full = NSMakeRange(0, clean.length);
     [clean replaceOccurrencesOfString:@"\u001D" withString:@"" options:NSLiteralSearch range:full];
 
-    NSInteger code = ([clean containsString:@"urlList"] || [clean containsString:@"\"images\""]) ? DDPCodeGallery : 0;
-    // 不重试：命中与否都把 HTML 交出去，由解析层（直链正则 / 图集容器）做最终判定
-    [self ddFinishWithHTML:clean code:code];
+    NSInteger code = ([clean containsString:@"aweme-share-swiper-item"] || [clean containsString:@"aweme-slides-swiper-item"]) ? DDPCodeGallery : 0;
+    if (code == DDPCodeGallery || [clean containsString:@"playwm"]) { [self ddFinishWithHTML:clean code:code]; return; }
+    // 重载拿回完全相同的 HTML：再试也不会有新内容，直接放弃
+    if (self.lastCleanLen == clean.length) { [self ddFinishWithHTML:nil code:500]; return; }
+    self.lastCleanLen = clean.length;
+    if (self.retries < DDPMaxRetries) {
+        self.retries += 1;
+        [self.webView loadRequest:self.ddpRequest];
+        return;
+    }
+    [self ddFinishWithHTML:nil code:500];
 }
 - (WKWebView *)webView { return _webView; }
 @end
@@ -457,58 +472,39 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
     return [result copy];
 }
 
-// 图集：抖音图集数据内嵌在页面 JSON 的 "images":[ ... ] 容器里，每个对象形如
-//   {"uri":"...", "url_list":["https://p26-sign.douyinpic.com/...", ...]}   （手机分享页，蛇形字段）
-//   {"uri":"...", "urlList":["https://p3-pc-sign.douyinpic.com/...", ...]}   （桌面规范页，驼峰字段）
-// 两种字段名都要认；每个对象取首个 URL。页面会重复嵌入同一份图集，首个 images 容器即完整图集。
+// 图集：只取第一个 "images" 容器（页面会把同一份图集重复嵌入多次，实测首个容器即完整图集）
 - (NSArray<NSString *> *)extractGalleryImagesFromHTML:(NSString *)html {
     NSMutableArray *result = [NSMutableArray array];
     NSMutableString *decoded = [html mutableCopy];
     [decoded replaceOccurrencesOfString:@"\\u002f" withString:@"/" options:0 range:NSMakeRange(0, decoded.length)];
     [decoded replaceOccurrencesOfString:@"\\/" withString:@"/" options:0 range:NSMakeRange(0, decoded.length)];
-    [decoded replaceOccurrencesOfString:@"&amp;" withString:@"&" options:0 range:NSMakeRange(0, decoded.length)];
+    [decoded replaceOccurrencesOfString:@"\\\"" withString:@"\"" options:0 range:NSMakeRange(0, decoded.length)];
+    [decoded replaceOccurrencesOfString:@"&quot;" withString:@"\"" options:0 range:NSMakeRange(0, decoded.length)];
 
-    // urlList / url_list 首个 URL（兼容 https:// 与协议相对 // 两种写法）
-    NSRegularExpression *re = [NSRegularExpression
-        regularExpressionWithPattern:@"(?:urlList|url_list)\\s*:\\s*\\[\\s*\"((?:https?://|//)[^\"]+)\""
-        options:NSRegularExpressionCaseInsensitive error:nil];
-
-    // 主路径：取第一个 "images":[ 容器（括号配平拿完整数组），在其内抓取
     NSRange cr = [decoded rangeOfString:@"\"images\"" options:NSCaseInsensitiveSearch];
-    NSString *scope = decoded;
-    if (cr.location != NSNotFound) {
-        NSRange br = [decoded rangeOfString:@":[" options:0 range:NSMakeRange(cr.location, MIN(decoded.length - cr.location, 64))];
-        NSInteger arrOpen = (br.location != NSNotFound) ? ((NSInteger)br.location + (NSInteger)br.length - 1) : -1;
-        NSInteger arrEnd = -1, depth = 0;
-        for (NSInteger i = arrOpen; i >= 0 && i < (NSInteger)decoded.length; i++) {
-            unichar ch = [decoded characterAtIndex:i];
-            if (ch == '[') depth++;
-            else if (ch == ']') { depth--; if (depth == 0) { arrEnd = i; break; } }
-        }
-        if (arrEnd > arrOpen) scope = [decoded substringWithRange:NSMakeRange(arrOpen, arrEnd - arrOpen + 1)];
+    if (cr.location == NSNotFound) return @[];
+    NSRange br = [decoded rangeOfString:@":[" options:0 range:NSMakeRange(cr.location, MIN(decoded.length - cr.location, 64))];
+    NSInteger arrOpen = (br.location != NSNotFound) ? ((NSInteger)br.location + (NSInteger)br.length - 1) : -1;
+    NSInteger arrEnd = -1, depth = 0;
+    for (NSInteger i = arrOpen; i >= 0 && i < (NSInteger)decoded.length; i++) {
+        unichar ch = [decoded characterAtIndex:i];
+        if (ch == '[') depth++;
+        else if (ch == ']') { depth--; if (depth == 0) { arrEnd = i; break; } }
     }
-    for (NSTextCheckingResult *m in [re matchesInString:scope options:0 range:NSMakeRange(0, scope.length)]) {
-        NSString *src = [scope substringWithRange:[m rangeAtIndex:1]];
-        if ([src hasPrefix:@"//"]) src = [@"https:" stringByAppendingString:src];
-        src = [src stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
-        if (src.length && ![result containsObject:src]) [result addObject:src];
-    }
-    // 兜底：images 容器缺失时，直接扫整页（同族、低风险）
-    if (result.count == 0) {
-        for (NSTextCheckingResult *m in [re matchesInString:decoded options:0 range:NSMakeRange(0, decoded.length)]) {
-            NSString *src = [decoded substringWithRange:[m rangeAtIndex:1]];
-            if ([src hasPrefix:@"//"]) src = [@"https:" stringByAppendingString:src];
-            src = [src stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
-            if (src.length && ![result containsObject:src]) [result addObject:src];
+    if (arrEnd > arrOpen) {
+        NSString *seg = [decoded substringWithRange:NSMakeRange(arrOpen, arrEnd - arrOpen + 1)];
+        NSRegularExpression *reU = [NSRegularExpression
+            regularExpressionWithPattern:@"\"url_list\"\\s*:\\s*\\[\\s*\"(https?://[^\"]+)\""
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        for (NSTextCheckingResult *m in [reU matchesInString:seg options:0 range:NSMakeRange(0, seg.length)]) {
+            [result addObject:[[seg substringWithRange:[m rangeAtIndex:1]] stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"]];
         }
     }
-    DDDLog(@"[gallery] 命中 %lu 张", (unsigned long)result.count);
     return [result copy];
 }
 - (void)parseDouyinURL:(NSString *)url
             completion:(void (^)(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err))completion {
     [[DDPWebFetcher sharedFetcher] fetchHTMLFromURL:url completion:^(NSString *html, NSInteger errCode) {
-        DDDLog(@"[parse] 收到 HTML errCode=%ld len=%lu url=%@", (long)errCode, (unsigned long)html.length, url);
         if (!html.length) { if (completion) completion(DDPMediaTypeUnknown, nil, nil, [NSError errorWithDomain:@"DDP" code:-2 userInfo:nil]); return; }
         NSArray *videos = [self extractVideoLinksFromHTML:html];
         if (videos.count) { if (completion) completion(DDPMediaTypeVideo, videos.firstObject, nil, nil); return; }
@@ -527,7 +523,8 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
     [request setValue:@"bytes=0-" forHTTPHeaderField:@"Range"];
     [request setValue:url forHTTPHeaderField:@"Referer"];
     [request setValue:@"*/*" forHTTPHeaderField:@"Accept"];
-    [request setValue:DDPMobileUA forHTTPHeaderField:@"User-Agent"];
+    NSString *ua = [%c(CUtility) GetMMUserAgent];
+    [request setValue:(ua.length ? ua : @"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15") forHTTPHeaderField:@"User-Agent"];
 
     NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
     cfg.timeoutIntervalForRequest = 60;
