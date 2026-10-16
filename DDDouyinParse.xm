@@ -16,7 +16,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <AVKit/AVKit.h>
-#import <unistd.h>     // sleep() —— PKC 重载循环原样用的就是这个
+#import <unistd.h>     // usleep() —— 重载循环的等待节拍（PKC 原样用的是 sleep 死等，已改）
 
 #pragma mark - 微信私有类声明
 
@@ -400,6 +400,9 @@ static UIWindow *DDPHostWindow(void) {
 @property (nonatomic, assign) BOOL hasCompleted;
 @property (nonatomic, assign) BOOL warmingUp;      // 预热导航期间跳过抠 HTML
 @property (nonatomic, assign) int  pollTicks;      // 本轮 reload 内已轮询到第几拍
+@property (nonatomic, assign) NSUInteger lastHTMLLen;   // 上一拍的 HTML 长度
+@property (nonatomic, assign) int  sameLenTicks;   // 长度连续相同的拍数
+@property (nonatomic, assign) BOOL reloadNow;      // 本轮已判定无望，通知重载循环提前 reload
 @property (nonatomic, assign) double startAt;      // 本次抓取起点（CFAbsoluteTime），用于耗时日志
 @property (nonatomic, copy) void (^completion)(NSString *html, NSInteger code, NSError *error);
 + (instancetype)sharedFetcher;
@@ -472,6 +475,10 @@ static UIWindow *DDPHostWindow(void) {
     // 预热导航可能还没回来（WebContent 进程启动慢），此时用户就开始解析了；
     // 若不清标志，这次真实导航的 didFinish 会被当成预热而跳过，白白吃掉首轮机会。
     self.warmingUp = NO;
+    self.pollTicks = 0;         // 每轮状态一并重置，防止上一次解析的残留串到这次
+    self.lastHTMLLen = 0;
+    self.sameLenTicks = 0;
+    self.reloadNow = NO;
     NSURL *u = [NSURL URLWithString:url];
     if (!u) {
         NSError *err = [NSError errorWithDomain:@"InvalidURL" code:1001
@@ -517,15 +524,24 @@ static UIWindow *DDPHostWindow(void) {
             [self.webView loadRequest:req];
             self.retries = self.retries + 1;
         });
-        // 这里读到的 retries 可能是 1 也可能是 2：主队列那个 block 是否已执行不确定（PKC 原样竞态）
-        unsigned sl = (unsigned)(self.retries + 10);
-        DDDLog(@"[轮%d] sleep(%u)s 开始（累计%.1fs）", round, sl, CFAbsoluteTimeGetCurrent() - self.startAt);
-        sleep(sl);
+        // 这里也偏离 PKC：PKC 是 sleep(retries+10) 死等，页面早就判完了也照样睡满。
+        // 实测视频页轮1 拿到的是固定中间页（长度 7 拍恒为 50993，等也没用），
+        // 于是这 11 秒纯属白睡。改成：可被「已命中」或「本轮已判定无望」提前唤醒。
+        unsigned budget = (unsigned)(self.retries + 10);
+        DDDLog(@"[轮%d] 等待本轮结果（上限 %us，可提前唤醒）", round, budget);
+        double deadline = CFAbsoluteTimeGetCurrent() + budget;
+        while (!self.hasCompleted && !self.reloadNow && CFAbsoluteTimeGetCurrent() < deadline) {
+            usleep(200 * 1000);      // 0.2s 一跳
+        }
+        if (self.reloadNow) {
+            self.reloadNow = NO;
+            DDDLog(@"[轮%d] 本轮已判定无望 → 提前 reload（累计%.1fs）", round, CFAbsoluteTimeGetCurrent() - self.startAt);
+        }
         if (self.hasCompleted) {
-            DDDLog(@"[轮%d] 唤醒，已命中 → 退出（累计%.1fs）", round, CFAbsoluteTimeGetCurrent() - self.startAt);
+            DDDLog(@"[轮%d] 已命中 → 退出（累计%.1fs）", round, CFAbsoluteTimeGetCurrent() - self.startAt);
             break;
         }
-        DDDLog(@"[轮%d] 唤醒，未命中 → 再来一轮（累计%.1fs）", round, CFAbsoluteTimeGetCurrent() - self.startAt);
+        DDDLog(@"[轮%d] 等待结束仍未命中 → 再来一轮（累计%.1fs）", round, CFAbsoluteTimeGetCurrent() - self.startAt);
     }
     if (self.retries >= 11 && self.completion && !self.hasCompleted) {
         self.hasCompleted = YES;
@@ -570,11 +586,19 @@ static const double    DDMPollGap = 1.2;         // 每次间隔 1.2 秒（12 �
         if (self.hasCompleted) return;                       // 已被别的拍命中
         [webView evaluateJavaScript:@"document.documentElement.outerHTML" completionHandler:^(id result, NSError *error) {
             BOOL hit = [self ddpHandleHTML:result error:error];
-            if (!hit && !self.hasCompleted && tick < DDPMaxPoll) {
+            if (hit || self.hasCompleted) return;                        // 命中，收工
+            if (self.sameLenTicks >= 1) {
+                // 连续两拍长度一模一样 → 页面已经定型且没有我们要的标记，再等无意义
+                DDDLog(@"[轮询] 第 %d 拍长度与上一拍相同（%lu）→ 本轮无望，提前 reload（累计%.1fs）",
+                       tick, (unsigned long)self.lastHTMLLen, CFAbsoluteTimeGetCurrent() - self.startAt);
+                self.reloadNow = YES;
+                return;
+            }
+            if (tick < DDPMaxPoll) {
                 DDDLog(@"[轮询] 第 %d 拍未命中，再来（累计%.1fs）", tick, CFAbsoluteTimeGetCurrent() - self.startAt);
                 [self ddpPollHTML:webView];
-            } else if (!hit) {
-                DDDLog(@"[轮询] 第 %d 拍仍未命中，已达上限 → 交给重载循环 reload（累计%.1fs）",
+            } else {
+                DDDLog(@"[轮询] 第 %d 拍仍未命中，已达上限 → 交给重载循环（累计%.1fs）",
                        tick, CFAbsoluteTimeGetCurrent() - self.startAt);
             }
         }];
@@ -600,6 +624,12 @@ static const double    DDMPollGap = 1.2;         // 每次间隔 1.2 秒（12 �
     DDDLog(@"[清洗] 长度 %lu→%lu｜amp;→空 %lu 处｜u002F→/ %lu 处｜\\→空 %lu 处",
            (unsigned long)len0, (unsigned long)html.length,
            (unsigned long)n2, (unsigned long)n3, (unsigned long)n4);
+
+    // 长度连续不变 = 页面不会再变。实测视频页首次返回的是固定中间页（长度 7 拍恒为 50993），
+    // 再等也等不出内容，只有 reload 才拿得到真页面，所以用这个信号触发提前 reload。
+    if (html.length == self.lastHTMLLen) self.sameLenTicks = self.sameLenTicks + 1;
+    else self.sameLenTicks = 0;
+    self.lastHTMLLen = html.length;
 
     BOOL risk = [html containsString:@"验证码中间页"];
     if (risk) [DDPToast() showToastWithText:@"被检测了，请验证后再试"];
@@ -1322,7 +1352,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     Class mgrCls = objc_getClass("WCPluginsMgr");
     if (mgrCls) {
         [[mgrCls sharedInstance] registerControllerWithTitle:@"DD抖音解析"
-                                                     version:@"1.3.0"
+                                                     version:@"1.3.1"
                                                   controller:@"DDPDouyinParseSettingsViewController"];
     }
     // 预热：把 WebContent 进程冷启动的成本提前付掉（tweak 加载时就在后台建好 WebView 并跑一个空文档）。
