@@ -386,8 +386,8 @@ static NSString *const DDPDesktopUA = @"Mozilla/5.0 (Macintosh; Intel Mac OS X 1
         NSString *html = result ? [NSString stringWithFormat:@"%@", result] : @"";
         NSTimeInterval waited = CFAbsoluteTimeGetCurrent() - strong.fetchStart;
         if ([html containsString:@"playwm"] ||
-            [html containsString:@"aweme-share-swiper-item"] ||
-            [html containsString:@"aweme-slides-swiper-item"]) {
+            [html containsString:@"urlList"] ||
+            [html containsString:@"\"images\""]) {
             DDDLog(@"[fetch] 轮询命中标记 len=%lu waited=%.1f", (unsigned long)html.length, waited);
             [strong handleRenderedHTML:html];
             return;
@@ -431,7 +431,7 @@ static NSString *const DDPDesktopUA = @"Mozilla/5.0 (Macintosh; Intel Mac OS X 1
     full = NSMakeRange(0, clean.length);
     [clean replaceOccurrencesOfString:@"\u001D" withString:@"" options:NSLiteralSearch range:full];
 
-    NSInteger code = ([clean containsString:@"aweme-share-swiper-item"] || [clean containsString:@"aweme-slides-swiper-item"]) ? DDPCodeGallery : 0;
+    NSInteger code = ([clean containsString:@"urlList"] || [clean containsString:@"\"images\""]) ? DDPCodeGallery : 0;
     // 不重试：命中与否都把 HTML 交出去，由解析层（直链正则 / 图集容器）做最终判定
     [self ddFinishWithHTML:clean code:code];
 }
@@ -470,126 +470,68 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
         if (![result containsObject:clean]) [result addObject:clean];
     }
     DDDLog(@"extractVideoLinks: 候选数=%lu", (unsigned long)result.count);
-    // 临时调试：大页却 0 候选，扫出视频 URL 候选，看清抖音当前结构
-    if (result.count == 0 && html.length > 100000) {
-        NSRegularExpression *reV = [NSRegularExpression
-            regularExpressionWithPattern:@"https?://[^\"\\\\ ]*?(aweme\\.snssdk\\.com|playwm|/play/|v[0-9]+\\.douyin\\.com|douyinvod|bytecdn|/video/)[^\"\\\\ ]*?\\.(mp4|m3u8|js\\?|play\\?)"
-            options:NSRegularExpressionCaseInsensitive error:nil];
-        NSArray *ms = [reV matchesInString:html options:0 range:NSMakeRange(0, html.length)];
-        DDDLog(@"[video][debug] 大页(%.0fKB)视频候选 %lu 个，样例:", (double)html.length/1024.0, (unsigned long)ms.count);
-        for (NSUInteger i = 0; i < MIN(ms.count, 6); i++) {
-            NSString *s = [html substringWithRange:[ms[i] range]];
-            DDDLog(@"[video][debug]   v%d: %@", (int)i, s);
-        }
-    }
     return [result copy];
 }
 
-// 图集：只取第一个 "images" 容器（页面会把同一份图集重复嵌入多次，实测首个容器即完整图集）
+// 图集：抖音当前结构 "images":[{ "width":.., "uri":"..", "urlList":["https://...", ...] }]
+// 关键：字段是驼峰 urlList（非旧版 url_list）；整页已无 gallery-container / swiper 等 DOM 标记，PKC 老正则失效。
+// 只取第一个 images 容器（页面会把同一份图集重复嵌入，首个即完整图集），每个对象取 urlList 首个 URL。
 - (NSArray<NSString *> *)extractGalleryImagesFromHTML:(NSString *)html {
     NSMutableArray *result = [NSMutableArray array];
     NSMutableString *decoded = [html mutableCopy];
     [decoded replaceOccurrencesOfString:@"\\u002f" withString:@"/" options:0 range:NSMakeRange(0, decoded.length)];
     [decoded replaceOccurrencesOfString:@"\\/" withString:@"/" options:0 range:NSMakeRange(0, decoded.length)];
-    [decoded replaceOccurrencesOfString:@"\\\"" withString:@"\"" options:0 range:NSMakeRange(0, decoded.length)];
-    [decoded replaceOccurrencesOfString:@"&quot;" withString:@"\"" options:0 range:NSMakeRange(0, decoded.length)];
     [decoded replaceOccurrencesOfString:@"&amp;" withString:@"&" options:0 range:NSMakeRange(0, decoded.length)];
 
-    // —— 对齐 PKC extractGalleryImagesFromHTML:：直接抠渲染后 DOM 的 <img src> ——
-    // 1) 图集轮播：class 同时含 gallery-container 与 __carousel__image 的 <img>
-    NSRegularExpression *re1 = [NSRegularExpression
-        regularExpressionWithPattern:@"<img[^>]*src=\"([^\"]+)\"[^>]*class=\"[^\"]*galler[^\"]*__carousel__image[^\"]*\""
-        options:NSRegularExpressionCaseInsensitive error:nil];
-    NSArray *m1 = [re1 matchesInString:decoded options:0 range:NSMakeRange(0, decoded.length)];
-    for (NSTextCheckingResult *m in m1) {
-        NSString *src = [self ddpNormalizeImgURL:[decoded substringWithRange:[m rangeAtIndex:1]]];
-        if (src.length && ![result containsObject:src]) [result addObject:src];
-    }
-    DDDLog(@"[gallery] re1(轮播)命中 %lu 张", (unsigned long)m1.count);
-    // 2) 幻灯片：aweme-slides-swiper-item 块内的 <img>（options=9 = 忽略大小写 | 让 . 跨换行）
-    NSRegularExpression *re2 = [NSRegularExpression
-        regularExpressionWithPattern:@"aweme-slides-swiper-item.{0,6000}?<img[^>]*src=\"([^\"]+)\""
-        options:(NSRegularExpressionCaseInsensitive | NSRegularExpressionDotMatchesLineSeparators) error:nil];
-    NSArray *m2 = [re2 matchesInString:decoded options:0 range:NSMakeRange(0, decoded.length)];
-    for (NSTextCheckingResult *m in m2) {
-        NSString *src = [self ddpNormalizeImgURL:[decoded substringWithRange:[m rangeAtIndex:1]]];
-        if (src.length && ![result containsObject:src]) [result addObject:src];
-    }
-    DDDLog(@"[gallery] re2(幻灯片)命中 %lu 张，累计 %lu 张", (unsigned long)m2.count, (unsigned long)result.count);
-
-    // 兜底：内联 JSON "images":[{url_list}]（仅当上面两段正则都抠不到时才用，防 DOM 改版）
-    NSUInteger jsonHit = 0;
-    if (result.count == 0) {
-        NSRange cr = [decoded rangeOfString:@"\"images\"" options:NSCaseInsensitiveSearch];
-        if (cr.location != NSNotFound) {
-            NSRange br = [decoded rangeOfString:@":[" options:0 range:NSMakeRange(cr.location, MIN(decoded.length - cr.location, 64))];
-            NSInteger arrOpen = (br.location != NSNotFound) ? ((NSInteger)br.location + (NSInteger)br.length - 1) : -1;
-            NSInteger arrEnd = -1, depth = 0;
-            for (NSInteger i = arrOpen; i >= 0 && i < (NSInteger)decoded.length; i++) {
-                unichar ch = [decoded characterAtIndex:i];
-                if (ch == '[') depth++;
-                else if (ch == ']') { depth--; if (depth == 0) { arrEnd = i; break; } }
+    // 主路径：取第一个 "images":[ 容器，内部每个 "urlList":[ 取首个 https URL
+    NSRange cr = [decoded rangeOfString:@"\"images\"" options:NSCaseInsensitiveSearch];
+    if (cr.location != NSNotFound) {
+        NSRange br = [decoded rangeOfString:@":[" options:0 range:NSMakeRange(cr.location, MIN(decoded.length - cr.location, 64))];
+        NSInteger arrOpen = (br.location != NSNotFound) ? ((NSInteger)br.location + (NSInteger)br.length - 1) : -1;
+        NSInteger arrEnd = -1, depth = 0;
+        for (NSInteger i = arrOpen; i >= 0 && i < (NSInteger)decoded.length; i++) {
+            unichar ch = [decoded characterAtIndex:i];
+            if (ch == '[') depth++;
+            else if (ch == ']') { depth--; if (depth == 0) { arrEnd = i; break; } }
+        }
+        if (arrEnd > arrOpen) {
+            NSString *seg = [decoded substringWithRange:NSMakeRange(arrOpen, arrEnd - arrOpen + 1)];
+            NSRegularExpression *reU = [NSRegularExpression
+                regularExpressionWithPattern:@"\"urlList\"\\s*:\\s*\\[\\s*\"(https?://[^\"]+)\""
+                options:NSRegularExpressionCaseInsensitive error:nil];
+            for (NSTextCheckingResult *m in [reU matchesInString:seg options:0 range:NSMakeRange(0, seg.length)]) {
+                NSString *src = [[seg substringWithRange:[m rangeAtIndex:1]] stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
+                if (src.length && ![result containsObject:src]) [result addObject:src];
             }
-            if (arrEnd > arrOpen) {
-                NSString *seg = [decoded substringWithRange:NSMakeRange(arrOpen, arrEnd - arrOpen + 1)];
+        }
+    }
+
+    // 兜底：urlList 改名/降级时，回退蛇形 url_list（同族、低风险，仍限定在 images 容器内）
+    if (result.count == 0) {
+        NSRange cr2 = [decoded rangeOfString:@"\"url_list\"" options:NSCaseInsensitiveSearch];
+        if (cr2.location != NSNotFound) {
+            NSRange br2 = [decoded rangeOfString:@":[" options:0 range:NSMakeRange(cr2.location, MIN(decoded.length - cr2.location, 64))];
+            NSInteger a2 = (br2.location != NSNotFound) ? ((NSInteger)br2.location + (NSInteger)br2.length - 1) : -1;
+            NSInteger e2 = -1, d2 = 0;
+            for (NSInteger i = a2; i >= 0 && i < (NSInteger)decoded.length; i++) {
+                unichar ch = [decoded characterAtIndex:i];
+                if (ch == '[') d2++;
+                else if (ch == ']') { d2--; if (d2 == 0) { e2 = i; break; } }
+            }
+            if (e2 > a2) {
+                NSString *seg = [decoded substringWithRange:NSMakeRange(a2, e2 - a2 + 1)];
                 NSRegularExpression *reU = [NSRegularExpression
                     regularExpressionWithPattern:@"\"url_list\"\\s*:\\s*\\[\\s*\"(https?://[^\"]+)\""
                     options:NSRegularExpressionCaseInsensitive error:nil];
                 for (NSTextCheckingResult *m in [reU matchesInString:seg options:0 range:NSMakeRange(0, seg.length)]) {
-                    NSString *src = [seg substringWithRange:[m rangeAtIndex:1]];
-                    if (![result containsObject:src]) { [result addObject:src]; jsonHit++; }
+                    NSString *src = [[seg substringWithRange:[m rangeAtIndex:1]] stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
+                    if (src.length && ![result containsObject:src]) [result addObject:src];
                 }
             }
         }
-        DDDLog(@"[gallery] 正则全空 → 兜底 JSON 命中 %lu 张", (unsigned long)jsonHit);
-    } else {
-        DDDLog(@"[gallery] 正则已命中，未走兜底 JSON");
     }
-    DDDLog(@"[gallery] 最终 %lu 张", (unsigned long)result.count);
-    // 临时调试：大页却 0 张，一次性摸清抖音当前图集结构
-    if (result.count == 0 && decoded.length > 100000) {
-        // 1) 不限域名的任意图片 URL，看清图片到底从哪个 host 出、有无 url_list/JSON 之外的 DOM 直链
-        NSRegularExpression *reAll = [NSRegularExpression
-            regularExpressionWithPattern:@"https?://[^\"\\\\ )]+\\.(?:jpg|jpeg|png|webp)"
-            options:NSRegularExpressionCaseInsensitive error:nil];
-        NSArray *all = [reAll matchesInString:decoded options:0 range:NSMakeRange(0, decoded.length)];
-        NSMutableSet *hosts = [NSMutableSet set];
-        for (NSUInteger i = 0; i < all.count; i++) {
-            NSString *s = [decoded substringWithRange:[all[i] range]];
-            NSRange h = [s rangeOfString:@"://"];
-            if (h.location != NSNotFound) {
-                NSString *host = [s substringFromIndex:h.location + 3];
-                NSRange slash = [host rangeOfString:@"/"];
-                if (slash.location != NSNotFound) host = [host substringToIndex:slash.location];
-                [hosts addObject:host];
-            }
-        }
-        DDDLog(@"[gallery][debug] 大页(%.0fKB) 任意图片URL %lu 个, host: %@",
-               (double)decoded.length/1024.0, (unsigned long)all.count,
-               [[hosts allObjects] componentsJoinedByString:@", "]);
-        for (NSUInteger i = 0; i < MIN(all.count, 8); i++) {
-            DDDLog(@"[gallery][debug]   img%d: %@", (int)i, [decoded substringWithRange:[all[i] range]]);
-        }
-        // 2) 探测数据容器与图集相关键
-        for (NSString *key in @[@"RENDER_DATA", @"_ROUTER_DATA", @"aweme_detail", @"image_urls", @"url_list", @"\"images\"", @"origin_url", @"url_prefix", @"aweme"]) {
-            if ([decoded rangeOfString:key options:NSCaseInsensitiveSearch].location != NSNotFound)
-                DDDLog(@"[gallery][debug]   含键 '%@'", key);
-        }
-        // 3) 若有 "images" 键，dump 一段看真实 JSON 结构（键名/嵌套）
-        NSRange ir = [decoded rangeOfString:@"\"images\"" options:NSCaseInsensitiveSearch];
-        if (ir.location != NSNotFound) {
-            NSUInteger to = MIN(ir.location + 700, decoded.length);
-            DDDLog(@"[gallery][debug]   images窗口: %@", [decoded substringWithRange:NSMakeRange(ir.location, to - ir.location)]);
-        }
-    }
+    DDDLog(@"[gallery] urlList命中 %lu 张", (unsigned long)result.count);
     return [result copy];
-}
-
-// 图片 URL 归一化：补 https: 前缀（DOM 里常见 // 协议相对地址，NSURL 不能直接用）
-- (NSString *)ddpNormalizeImgURL:(NSString *)url {
-    if (!url.length) return url;
-    if ([url hasPrefix:@"//"]) return [@"https:" stringByAppendingString:url];
-    return url;
 }
 - (void)parseDouyinURL:(NSString *)url
             completion:(void (^)(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err))completion {
