@@ -546,21 +546,40 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
         DDDLog(@"[gallery] 正则已命中，未走兜底 JSON");
     }
     DDDLog(@"[gallery] 最终 %lu 张", (unsigned long)result.count);
-    // 临时调试：大页却 0 张，扫出图片 URL 候选，看清抖音当前结构
+    // 临时调试：大页却 0 张，一次性摸清抖音当前图集结构
     if (result.count == 0 && decoded.length > 100000) {
-        NSRegularExpression *reImg = [NSRegularExpression
-            regularExpressionWithPattern:@"https?://[^\"\\\\ ]*?(douyinpic|douyinstatic|byteimg|p[0-9]+-nocdn|imgcache)[^\"\\\\ ]*?\\.(jpg|jpeg|png|webp)"
+        // 1) 不限域名的任意图片 URL，看清图片到底从哪个 host 出、有无 url_list/JSON 之外的 DOM 直链
+        NSRegularExpression *reAll = [NSRegularExpression
+            regularExpressionWithPattern:@"https?://[^\"\\\\ )]+\\.(?:jpg|jpeg|png|webp)"
             options:NSRegularExpressionCaseInsensitive error:nil];
-        NSArray *ms = [reImg matchesInString:decoded options:0 range:NSMakeRange(0, decoded.length)];
-        DDDLog(@"[gallery][debug] 大页(%.0fKB)图片候选 %lu 个，样例:", (double)decoded.length/1024.0, (unsigned long)ms.count);
-        for (NSUInteger i = 0; i < MIN(ms.count, 6); i++) {
-            NSString *s = [decoded substringWithRange:[ms[i] range]];
-            DDDLog(@"[gallery][debug]   img%d: %@", (int)i, s);
+        NSArray *all = [reAll matchesInString:decoded options:0 range:NSMakeRange(0, decoded.length)];
+        NSMutableSet *hosts = [NSMutableSet set];
+        for (NSUInteger i = 0; i < all.count; i++) {
+            NSString *s = [decoded substringWithRange:[all[i] range]];
+            NSRange h = [s rangeOfString:@"://"];
+            if (h.location != NSNotFound) {
+                NSString *host = [s substringFromIndex:h.location + 3];
+                NSRange slash = [host rangeOfString:@"/"];
+                if (slash.location != NSNotFound) host = [host substringToIndex:slash.location];
+                [hosts addObject:host];
+            }
         }
-        // 再扫一次 swiper/gallery/class 等容器标记，确认标记是否换名
-        for (NSString *tag in @[@"swiper", @"gallery", @"carousel", @"slide", @"note-item", @"album"]) {
-            NSUInteger c = [decoded rangeOfString:tag options:NSCaseInsensitiveSearch].location != NSNotFound ? 1 : 0;
-            if (c) DDDLog(@"[gallery][debug]   含标记 '%@'", tag);
+        DDDLog(@"[gallery][debug] 大页(%.0fKB) 任意图片URL %lu 个, host: %@",
+               (double)decoded.length/1024.0, (unsigned long)all.count,
+               [[hosts allObjects] componentsJoinedByString:@", "]);
+        for (NSUInteger i = 0; i < MIN(all.count, 8); i++) {
+            DDDLog(@"[gallery][debug]   img%d: %@", (int)i, [decoded substringWithRange:[all[i] range]]);
+        }
+        // 2) 探测数据容器与图集相关键
+        for (NSString *key in @[@"RENDER_DATA", @"_ROUTER_DATA", @"aweme_detail", @"image_urls", @"url_list", @"\"images\"", @"origin_url", @"url_prefix", @"aweme"]) {
+            if ([decoded rangeOfString:key options:NSCaseInsensitiveSearch].location != NSNotFound)
+                DDDLog(@"[gallery][debug]   含键 '%@'", key);
+        }
+        // 3) 若有 "images" 键，dump 一段看真实 JSON 结构（键名/嵌套）
+        NSRange ir = [decoded rangeOfString:@"\"images\"" options:NSCaseInsensitiveSearch];
+        if (ir.location != NSNotFound) {
+            NSUInteger to = MIN(ir.location + 700, decoded.length);
+            DDDLog(@"[gallery][debug]   images窗口: %@", [decoded substringWithRange:NSMakeRange(ir.location, to - ir.location)]);
         }
     }
     return [result copy];
