@@ -34,7 +34,8 @@
 @property (nonatomic) unsigned int m_uiMessageType;
 @property (retain, nonatomic) NSString *m_nsFromUsr;
 @property (retain, nonatomic) NSString *m_nsToUsr;
-@property (retain, nonatomic) NSString *m_nsTitle;
+// 注：不要声明/使用 m_nsTitle —— 已核 8.0.79 头文件，CMessageWrap : NSObject 没有这个方法，
+// 也没有任何分类补充它，访问会 unrecognized selector 崩溃。链接卡片的 URL 同样在 m_nsContent（XML）里。
 @property (nonatomic) unsigned int m_uiStatus;
 @property (nonatomic) unsigned int m_uiCreateTime;
 - (id)initWithMsgType:(long long)type;
@@ -219,6 +220,12 @@ static void DDDClearLog(void) {
 }
 #define DDDLog(fmt, ...) do { NSString *__s = [NSString stringWithFormat:fmt, ##__VA_ARGS__]; NSLog(@"[DDDParse] %@", __s); DDDWriteLog(__s); } while (0)
 
+// 正则只编译一次并缓存：原先每处都在函数里现编译，
+// 其中 extractDurationFromHTML 会被轮询每 1.2s 调一次（最多 12 次），白白重复编译。
+#define DDPRegex(var, pattern, opts) \
+    static NSRegularExpression *var; static dispatch_once_t var##_once; \
+    dispatch_once(&var##_once, ^{ var = [NSRegularExpression regularExpressionWithPattern:(pattern) options:(opts) error:nil]; })
+
 // 同一 key 只落一次：用于高频路径（每来一条消息都会跑的判定），
 // 既能看出「这段到底走没走过」，又不会把日志刷爆。用来甄别死代码。
 // ⚠️ 坑：clang 的 ObjC 预处理不把 [...] 当保护组，方括号里的逗号会被切成多个宏实参。
@@ -275,7 +282,9 @@ static BOOL DDPIsOutgoing(CMessageWrap *wrap) { return [%c(CMessageWrap) isSende
 
 // 抽取文本中的第一个抖音 http(s) URL（只认 douyin.com，避免文案里其他链接抢先被抠走）
 static NSString *DDPExtractURL(NSString *text) {
-    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"https?://[^\\s\"']+" options:0 error:nil];
+    // 排除 < > ：链接卡片的 m_nsContent 是 XML（<url>https://...</url>），
+    // 不排除的话会把 </url> 一并吃进 URL 里
+    DDPRegex(re, @"https?://[^\\s\"'<>]+", 0);
     NSUInteger seen = 0;
     for (NSTextCheckingResult *m in [re matchesInString:text options:0 range:NSMakeRange(0, text.length)]) {
         seen++;
@@ -292,7 +301,7 @@ static NSString *DDPExtractURL(NSString *text) {
 // 去水印：/playwm/ → /play/，清晰度固定 720p
 static NSString *DDPRemoveWatermark(NSString *url) {
     NSString *clean = [url stringByReplacingOccurrencesOfString:@"/playwm/" withString:@"/play/"];
-    NSRegularExpression *reRatio = [NSRegularExpression regularExpressionWithPattern:@"ratio=\\d+p" options:0 error:nil];
+    DDPRegex(reRatio, @"ratio=\\d+p", 0);
     clean = [reRatio stringByReplacingMatchesInString:clean options:0 range:NSMakeRange(0, clean.length) withTemplate:@"ratio=720p"];
     if ([clean rangeOfString:@"ratio="].location == NSNotFound) {
         NSString *sep = ([clean rangeOfString:@"?"].location == NSNotFound) ? @"?" : @"&";
@@ -304,21 +313,19 @@ static NSString *DDPRemoveWatermark(NSString *url) {
     return clean;
 }
 
-// 视频缓存路径 <md5>.mp4（md5 用微信原生 CRUtils）
-static NSString *DDPTempPath(NSString *url) {
-    NSString *md5 = [%c(CRUtils) md5:url];
-    return [NSTemporaryDirectory() stringByAppendingPathComponent:[md5 stringByAppendingString:@".mp4"]];
-}
-// 图片缓存路径 <md5>.<ext>
+// 缓存路径 <md5>.<ext>（md5 用微信原生 CRUtils）
 static NSString *DDPTempPathExt(NSString *url, NSString *ext) {
     NSString *md5 = [%c(CRUtils) md5:url];
     return [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.%@", md5, ext]];
 }
+// 视频缓存路径固定 .mp4
+static NSString *DDPTempPath(NSString *url) { return DDPTempPathExt(url, @"mp4"); }
 // 取 URL 后缀作为临时文件扩展名（默认 jpg）
 // 必须先截掉 ?/# 再取：图片直链形如 ...q80.webp?lk3s=xxx&x-expires=xxx，
 // 直接 pathExtension 会把整个 query 当成扩展名，临时文件名变成 <md5>.webp?lk3s=... 又脏又长
 static NSString *DDPImageExt(NSString *url) {
-    NSString *s = url ?: @"";
+    // 不需要 url 的 nil 兜底：传 nil 时 pathExtension 也返回 nil，照样走下面的 @\"jpg\"
+    NSString *s = url;
     NSRange t = [s rangeOfCharacterFromSet:[NSCharacterSet characterSetWithCharactersInString:@"?#"]];
     if (t.location != NSNotFound) s = [s substringToIndex:t.location];
     NSString *ue = [s pathExtension].lowercaseString;
@@ -381,15 +388,14 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
 static const NSInteger DDPCodeGallery = 0xF4161;   // PKC 的图集标记，原值就是 0xF4161
 
 // PKC 的窗口容器（sub_0x3c5f0）
+// 不需要支持 iOS 13 以下，故去掉 @available 判断，直接用 UIWindowScene。
 static UIWindow *DDPHostWindow(void) {
     UIWindow *w = UIApplication.sharedApplication.delegate.window;
     if (w) return w;
-    if (@available(iOS 13.0, *)) {
-        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
-            UIWindow *fw = [(UIWindowScene *)sc windows].firstObject;
-            if (fw) return fw;
-        }
+    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+        if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindow *fw = [(UIWindowScene *)sc windows].firstObject;
+        if (fw) return fw;
     }
     return nil;
 }
@@ -407,7 +413,6 @@ static UIWindow *DDPHostWindow(void) {
 @property (nonatomic, copy) void (^completion)(NSString *html, NSInteger code, NSError *error);
 + (instancetype)sharedFetcher;
 + (void)ddpWarmup;                                              // 预热：建单例 + 挂窗 + 冷启动 WebContent
-+ (void)ddpWarmupStep:(int)step;                                // 预热内部：主窗口未就绪时退避重试挂窗
 - (void)fetchHTMLFromURL:(NSString *)url completion:(void (^)(NSString *html, NSInteger code, NSError *error))completion;
 - (void)cleanupWebView;
 - (void)ddpRetryLoop:(NSURLRequest *)req;                       // PKC block@0x3cae8
@@ -445,26 +450,19 @@ static UIWindow *DDPHostWindow(void) {
 // 冷启动 WebContent 进程 2 秒根本不够 → 首轮必 miss → 只能靠后面几轮硬撞，实测 58 秒。
 // 这里把冷启动成本提前付掉：建单例 + 挂窗 + 跑一个空文档把 WebContent 进程拉起来。
 + (void)ddpWarmup {
-    dispatch_async(dispatch_get_main_queue(), ^{ [self ddpWarmupStep:0]; });
-}
-+ (void)ddpWarmupStep:(int)step {
-    DDPWebFetcher *f = [self sharedFetcher];
-    if (!f.webView.window) {                       // 还没真正挂到窗口层级上
-        UIWindow *win = DDPHostWindow();
-        if (!win) {
-            if (step >= 20) { DDDLog(@"预热：等了 20 次仍无主窗口，放弃（将退化为懒加载+补挂）"); return; }
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ [self ddpWarmupStep:step + 1]; });
-            return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        DDPWebFetcher *f = [self sharedFetcher];
+        // init 时若主窗口尚未就绪会挂不上，这里补一次；再挂不上就交给 fetchHTMLFromURL 的补挂分支。
+        // 原先这里有 0.5s×20 的退避重试，实测 init 的 delegate.window 每次都直接可用（日志恒为 step=0），
+        // 重试路径从未走到，已删。
+        if (!f.webView.window) {
+            UIWindow *win = DDPHostWindow();
+            if (win) { [win addSubview:f.webView]; f.webView.frame = win.bounds; f.webView.hidden = YES; }
         }
-        [win addSubview:f.webView];
-        f.webView.frame = win.bounds;
-        f.webView.hidden = YES;
-        DDDLog(@"预热：第 %d 次尝试挂窗成功", step);
-    }
-    f.warmingUp = YES;                             // 预热导航不参与抠 HTML
-    [f.webView loadHTMLString:@"<!DOCTYPE html><html><body>ddp</body></html>" baseURL:nil];
-    DDDLog(@"预热：已发起空文档导航 step=%d", step);
+        f.warmingUp = YES;                             // 预热导航不参与抠 HTML
+        [f.webView loadHTMLString:@"<!DOCTYPE html><html><body>ddp</body></html>" baseURL:nil];
+        DDDLog(@"预热：已发起空文档导航（挂窗=%@）", f.webView.window ? @"是" : @"否，抓取时会补挂");
+    });
 }
 
 // PKC -fetchHTMLFromURL:completion:@0x3c6d8
@@ -536,12 +534,13 @@ static UIWindow *DDPHostWindow(void) {
         if (self.reloadNow) {
             self.reloadNow = NO;
             DDDLog(@"[轮%d] 本轮已判定无望 → 提前 reload（累计%.1fs）", round, CFAbsoluteTimeGetCurrent() - self.startAt);
+            continue;                                                    // 直接进下一轮
         }
         if (self.hasCompleted) {
             DDDLog(@"[轮%d] 已命中 → 退出（累计%.1fs）", round, CFAbsoluteTimeGetCurrent() - self.startAt);
             break;
         }
-        DDDLog(@"[轮%d] 等待结束仍未命中 → 再来一轮（累计%.1fs）", round, CFAbsoluteTimeGetCurrent() - self.startAt);
+        DDDLog(@"[轮%d] 等到上限仍未判定 → 再来一轮（累计%.1fs）", round, CFAbsoluteTimeGetCurrent() - self.startAt);
     }
     if (self.retries >= 11 && self.completion && !self.hasCompleted) {
         self.hasCompleted = YES;
@@ -660,10 +659,8 @@ static const double    DDMPollGap = 1.2;         // 每次间隔 1.2 秒（12 �
 // PKC -extractDurationFromHTML:@0xe2210：正则 "bit_rate":null,"duration":(\d+)，组1 / 1000
 - (NSInteger)extractDurationFromHTML:(NSString *)html {
     if (!html.length) return 0;
-    NSError *err = nil;
-    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"\"bit_rate\":null,\"duration\":(\\d+)"
-                                                                       options:0 error:&err];
-    if (err) return 0;
+    DDPRegex(re, @"\"bit_rate\":null,\"duration\":(\\d+)", 0);
+    if (!re) return 0;                       // 正则编译失败（pattern 写错时才会发生）
     NSTextCheckingResult *m = [re firstMatchInString:html options:0 range:NSMakeRange(0, html.length)];
     if (!m || m.numberOfRanges < 2) {
         DDDLog(@"[抽取·时长] 未匹配到 \"bit_rate\":null,\"duration\" → 0（图集页正常；视频页若恒 0 则正则需修）");
@@ -696,9 +693,7 @@ static const double    DDMPollGap = 1.2;         // 每次间隔 1.2 秒（12 �
 // 视频：正则抠 playwm 直链并去水印、去重
 - (NSArray<NSString *> *)extractVideoLinksFromHTML:(NSString *)html {
     NSMutableArray *result = [NSMutableArray array];
-    NSRegularExpression *re = [NSRegularExpression
-        regularExpressionWithPattern:@"https://aweme\\.snssdk\\.com/aweme/v1/playwm/\\?[^\"\\s]+"
-        options:NSRegularExpressionCaseInsensitive error:nil];
+    DDPRegex(re, @"https://aweme\\.snssdk\\.com/aweme/v1/playwm/\\?[^\"\\s]+", NSRegularExpressionCaseInsensitive);
     NSUInteger raw = 0, skipped = 0, dup = 0;
     for (NSTextCheckingResult *m in [re matchesInString:html options:0 range:NSMakeRange(0, html.length)]) {
         raw++;
@@ -723,22 +718,12 @@ static const double    DDMPollGap = 1.2;         // 每次间隔 1.2 秒（12 �
     DDDLog(@"[抽取·图集] 解码 %lu→%lu｜&quot;→\" %lu 处",
            (unsigned long)len0, (unsigned long)decoded.length, (unsigned long)g4);
 
-    // 统计 "images" 出现次数：若多于 1 次，说明「只取第一个容器」这条假设有风险
-    NSUInteger imgCount = 0;
-    NSRange sr = NSMakeRange(0, decoded.length);
-    while (sr.length > 0) {
-        NSRange f = [decoded rangeOfString:@"\"images\"" options:NSCaseInsensitiveSearch range:sr];
-        if (f.location == NSNotFound) break;
-        imgCount++;
-        NSUInteger next = NSMaxRange(f);
-        if (next >= decoded.length) break;
-        sr = NSMakeRange(next, decoded.length - next);
-    }
+    // 取首个 "images" 容器。这条假设经两次采样验证：
+    //   单图图集 → 1 处容器，抠出 1 张；7 图图集 → 3 处容器，首容器即含全部 7 张。
+    // 原先这里还额外遍历全文统计出现次数（只为打日志），与下面这次查找重复，已删。
     NSRange cr = [decoded rangeOfString:@"\"images\"" options:NSCaseInsensitiveSearch];
     if (cr.location == NSNotFound) { DDDLog(@"[抽取·图集] 无 \"images\" 容器 → 空"); return @[]; }
-    DDDLog(@"[抽取·图集] \"images\" 共 %lu 处，取首个 @%lu%@",
-           (unsigned long)imgCount, (unsigned long)cr.location,
-           imgCount > 1 ? @"（多处：首容器即完整图集 这条假设需复核）" : @"");
+    DDDLog(@"[抽取·图集] 首个 \"images\" @%lu", (unsigned long)cr.location);
     NSRange br = [decoded rangeOfString:@":[" options:0 range:NSMakeRange(cr.location, MIN(decoded.length - cr.location, 64))];
     NSInteger arrOpen = (br.location != NSNotFound) ? ((NSInteger)br.location + (NSInteger)br.length - 1) : -1;
     NSInteger arrEnd = -1, depth = 0;
@@ -749,9 +734,7 @@ static const double    DDMPollGap = 1.2;         // 每次间隔 1.2 秒（12 �
     }
     if (arrEnd > arrOpen) {
         NSString *seg = [decoded substringWithRange:NSMakeRange(arrOpen, arrEnd - arrOpen + 1)];
-        NSRegularExpression *reU = [NSRegularExpression
-            regularExpressionWithPattern:@"\"url_list\"\\s*:\\s*\\[\\s*\"(https?://[^\"]+)\""
-            options:NSRegularExpressionCaseInsensitive error:nil];
+        DDPRegex(reU, @"\"url_list\"\\s*:\\s*\\[\\s*\"(https?://[^\"]+)\"", NSRegularExpressionCaseInsensitive);
         for (NSTextCheckingResult *m in [reU matchesInString:seg options:0 range:NSMakeRange(0, seg.length)]) {
             [result addObject:[[seg substringWithRange:[m rangeAtIndex:1]] stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"]];
         }
@@ -801,8 +784,8 @@ static const double    DDMPollGap = 1.2;         // 每次间隔 1.2 秒（12 �
     // 只让 CDN 统一回 206 而不是 200，已删。
     [request setValue:url forHTTPHeaderField:@"Referer"];
     [request setValue:@"*/*" forHTTPHeaderField:@"Accept"];
-    NSString *ua = [%c(CUtility) GetMMUserAgent];
-    [request setValue:(ua.length ? ua : @"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15") forHTTPHeaderField:@"User-Agent"];
+    // 头文件已确认 CUtility.GetMMUserAgent 存在，且实测稳定返回 171 字符，去掉写死的 UA 兜底
+    [request setValue:[%c(CUtility) GetMMUserAgent] forHTTPHeaderField:@"User-Agent"];
 
     NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
     cfg.timeoutIntervalForRequest = 60;
@@ -867,6 +850,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 + (BOOL)showForContent:(NSString *)content user:(NSString *)user;
 + (void)handleDirectSend:(NSString *)content user:(NSString *)user;
 + (void)handleParseSend:(NSString *)url user:(NSString *)user;
++ (void)ddpParse:(NSString *)url then:(void (^)(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs))then;
 + (void)handleParsePreview:(NSString *)url fromVC:(UIViewController *)vc;
 + (void)handleParseLink:(NSString *)url user:(NSString *)user;
 + (void)handleSaveAlbum:(NSString *)url;
@@ -879,6 +863,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 + (void)saveImageToAlbumAtPath:(NSString *)path completion:(void(^)(BOOL success))completion;
 + (void)downloadAndSaveImages:(NSArray<NSString *> *)urls finish:(void(^)(void))finish;
 + (NSArray<NSString *> *)ddpFetchImages:(NSArray<NSString *> *)urls;   // 「存相册」与「预览」共用的串行下载
++ (NSString *)ddpFetchToPath:(NSString *)path fromURL:(NSString *)url;  // 单个下载+落盘，失败返回 nil
 + (void)sendVideoForURL:(NSString *)videoURL shareURL:(NSString *)shareURL user:(NSString *)user finish:(void(^)(void))finish;
 + (void)downloadImagesLocally:(NSArray<NSString *> *)urls completion:(void (^)(NSArray<NSString *> *paths))completion;
 + (void)presentImageViewer:(NSArray<NSString *> *)paths fromVC:(UIViewController *)vc;
@@ -906,10 +891,19 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     DDPSendTextMsg(content, user);
 }
 
-+ (void)handleParseSend:(NSString *)url user:(NSString *)user {
+// 四个解析入口（发送/预览/链接/存相册）共用的样板：
+// loading → 解析 → 失败统一提示，成功才回调 then
++ (void)ddpParse:(NSString *)url then:(void (^)(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs))then {
     DDPShowLoading(@"正在解析…");
     [[DDPEngine shared] parseDouyinURL:url completion:^(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err) {
-        if (err || type == DDPMediaTypeUnknown) { DDPShowError(@"解析失败"); return; }
+        if (err || type == DDPMediaTypeUnknown) { DDDLog(@"[面板] 解析失败 err=%@", err); DDPShowError(@"解析失败"); return; }
+        DDDLog(@"[面板] 解析成功 type=%ld", (long)type);
+        if (then) then(type, videoURL, imageURLs);
+    }];
+}
+
++ (void)handleParseSend:(NSString *)url user:(NSString *)user {
+    [self ddpParse:url then:^(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs) {
         void (^finish)(void) = ^{ DDPHideLoading(); };
         if (type == DDPMediaTypeVideo) [self sendVideoForURL:videoURL shareURL:url user:user finish:finish];
         else [self sendImagesForURLs:imageURLs user:user finish:finish];
@@ -920,29 +914,31 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 + (void)sendVideoForURL:(NSString *)videoURL shareURL:(NSString *)url user:(NSString *)user finish:(void(^)(void))finish {
     NSString *path = DDPTempPath(url);
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSData *data = [[DDPEngine shared] downloadVideoFromURL:videoURL];
-        NSFileManager *fm = [NSFileManager defaultManager];
-        if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
-        if (![data writeToFile:path atomically:YES]) { DDPShowError(@"解析失败"); return; }
+        if (![DDPPanel ddpFetchToPath:path fromURL:videoURL]) { DDPShowError(@"解析失败"); return; }
         if (finish) finish();
         [DDPPanel sendVideoAtPath:path toUser:user];
     });
 }
 
-// 下载图片直链并批量存相册
+// 下载并落盘到指定路径，失败返回 nil。视频与图片共用——原先这 5 处各抄了一遍
+// 「downloadVideoFromURL → 删旧文件 → writeToFile」，现统一。
++ (NSString *)ddpFetchToPath:(NSString *)path fromURL:(NSString *)url {
+    NSData *data = [[DDPEngine shared] downloadVideoFromURL:url];
+    if (!data.length) return nil;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
+    return [data writeToFile:path atomically:YES] ? path : nil;
+}
+
 // 串行下载一组图片直链到本地缓存，返回成功落盘的路径。
 // 原先 downloadAndSaveImages: 与 downloadImagesLocally: 各抄了一遍这段循环，现合并。
 + (NSArray<NSString *> *)ddpFetchImages:(NSArray<NSString *> *)urls {
     double t0 = CFAbsoluteTimeGetCurrent();
     DDDLog(@"[下载·图集] 开始串行下载 %lu 张", (unsigned long)urls.count);
     NSMutableArray *out = [NSMutableArray array];
-    NSFileManager *fm = [NSFileManager defaultManager];
     for (NSString *imgURL in urls) {
-        NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL];
-        if (!data.length) continue;
-        NSString *path = DDPTempPathExt(imgURL, DDPImageExt(imgURL));
-        if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
-        if ([data writeToFile:path atomically:YES]) [out addObject:path];
+        NSString *p = [self ddpFetchToPath:DDPTempPathExt(imgURL, DDPImageExt(imgURL)) fromURL:imgURL];
+        if (p) [out addObject:p];
     }
     DDDLog(@"[下载·图集] %lu 张串行下载完成 成功 %lu 张 总耗时 %.2fs",
            (unsigned long)urls.count, (unsigned long)out.count, CFAbsoluteTimeGetCurrent() - t0);
@@ -997,8 +993,8 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         if (!chatName.length) return;
         NSString *thumbPath = [self generateThumbnailForVideoPath:path];
 
+        // 头文件已确认 CaptureVideoInfo 在 8.0.79 存在，init 不会返回 nil
         id info = [[%c(CaptureVideoInfo) alloc] init];
-        if (!info) return;   // info 为空时传给 AddVideoMsg 会崩
 
         NSFileManager *fm = [NSFileManager defaultManager];
         unsigned long long fileSize = 0;
@@ -1058,15 +1054,10 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         BOOL anySent = NO;
         for (NSString *imgURL in urls) {
             @autoreleasepool {
-                NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL];
-                if (!data.length) continue;
-                NSString *path = DDPTempPathExt(imgURL, DDPImageExt(imgURL));
-                NSFileManager *fm = [NSFileManager defaultManager];
-                if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
-                if ([data writeToFile:path atomically:YES]) {
-                    [DDPPanel sendImageAtPath:path toUser:user];
-                    anySent = YES;
-                }
+                NSString *p = [self ddpFetchToPath:DDPTempPathExt(imgURL, DDPImageExt(imgURL)) fromURL:imgURL];
+                if (!p) continue;
+                [DDPPanel sendImageAtPath:p toUser:user];    // 下一张发一张，保持渐进
+                anySent = YES;
             }
         }
         if (!anySent) DDPShowError(@"解析失败");
@@ -1075,17 +1066,12 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 }
 
 + (void)handleParsePreview:(NSString *)url fromVC:(UIViewController *)vc {
-    DDPShowLoading(@"正在解析…");
-    [[DDPEngine shared] parseDouyinURL:url completion:^(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err) {
-        if (err || type == DDPMediaTypeUnknown) { DDPShowError(@"解析失败"); return; }
+    [self ddpParse:url then:^(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs) {
         void (^finish)(void) = ^{ DDPHideLoading(); };
         if (type == DDPMediaTypeVideo) {
             NSString *path = DDPTempPath(url);
             dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                NSData *data = [[DDPEngine shared] downloadVideoFromURL:videoURL];
-                NSFileManager *fm = [NSFileManager defaultManager];
-                if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
-                if ([data writeToFile:path atomically:YES])
+                if ([DDPPanel ddpFetchToPath:path fromURL:videoURL])
                     dispatch_async(dispatch_get_main_queue(), ^{ [DDPPanel playVideoAtPath:path fromVC:vc]; });
                 finish();
             });
@@ -1128,11 +1114,8 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 
 + (void)handleParseLink:(NSString *)url user:(NSString *)user {
     DDDLog(@"[面板] handleParseLink 入口 url=%@ user=%@", url, user.length ? user : @"(空→取当前会话)");
-    DDPShowLoading(@"正在解析…");
-    [[DDPEngine shared] parseDouyinURL:url completion:^(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err) {
+    [self ddpParse:url then:^(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (err || type == DDPMediaTypeUnknown) { DDDLog(@"[面板] handleParseLink 失败 err=%@", err); DDPShowError(@"解析失败"); return; }
-            DDDLog(@"[面板] handleParseLink 成功 type=%ld", (long)type);
             DDPHideLoading();
             NSString *link = (type == DDPMediaTypeVideo) ? videoURL : [imageURLs componentsJoinedByString:@"\n"];
             NSString *target = user.length ? user : DDPCurrentChatName();
@@ -1142,17 +1125,12 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 }
 
 + (void)handleSaveAlbum:(NSString *)url {
-    DDPShowLoading(@"正在解析…");
-    [[DDPEngine shared] parseDouyinURL:url completion:^(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err) {
-        if (err || type == DDPMediaTypeUnknown) { DDPShowError(@"解析失败"); return; }
+    [self ddpParse:url then:^(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs) {
         void (^finish)(void) = ^{ DDPHideLoading(); };
         if (type == DDPMediaTypeVideo) {
             NSString *path = DDPTempPath(url);
             dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                NSData *data = [[DDPEngine shared] downloadVideoFromURL:videoURL];
-                NSFileManager *fm = [NSFileManager defaultManager];
-                if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
-                if ([data writeToFile:path atomically:YES])
+                if ([DDPPanel ddpFetchToPath:path fromURL:videoURL])
                     [DDPPanel saveVideoToAlbumAtPath:path completion:^(BOOL success) {
                         if (success) DDPShowDone(@"保存成功"); else DDPShowError(@"保存失败");
                     }];
@@ -1197,9 +1175,11 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 
 #pragma mark - Hook：长按菜单「解析 / 预览」
 
-// 从消息对象取判定文本：文本消息用 m_nsContent，其余（分享卡片等）用 m_nsTitle
+// 从消息对象取判定文本。链接卡片（类型 49）的 URL 也在 m_nsContent 里（XML appmsg 的 <url>），
+// 所以统一取 m_nsContent 即可——原先按类型分流到 m_nsTitle，但该方法在 8.0.79 的 CMessageWrap 上不存在，
+// 长按非文本消息会直接 unrecognized selector 崩溃。
 static NSString *ddp_wrapContent(CMessageWrap *wrap) {
-    return wrap ? ((wrap.m_uiMessageType == 1) ? wrap.m_nsContent : wrap.m_nsTitle) : nil;
+    return wrap.m_nsContent;
 }
 // 菜单对应的消息与宿主 VC：由 BaseMsgContentViewController willShowMenuController: 直传并缓存。
 // 微信在该回调里把消息对象(inMsgWrap)直接交给插件，无需从 cell 反查，也没有时序风险。
@@ -1215,8 +1195,9 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
             DDDLogOnce([@"skipdup-" stringByAppendingString:token], @"[Hook] 菜单项已存在 → 跳过重复注入（%@）", token);
             return original;
         }
+    // 头文件已确认 MMMenuItem / initWithTitle:svgName:target:action: 在 8.0.79 存在，
+    // 不再需要「创建失败」的兜底（原先那句 if (!item) return original; 永不可能命中）
     MMMenuItem *item = [[%c(MMMenuItem) alloc] initWithTitle:title svgName:svgName target:cell action:action];
-    if (!item) return original;   // item 为空时 addObject:nil 会崩
     [item setUserInfo:token];
     [item setMenuType:menuType];
     NSMutableArray *items = [NSMutableArray arrayWithArray:original];
@@ -1282,8 +1263,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
         BOOL bypass = gDDPDyTcEnable; gDDPDyTcEnable = NO;       // 复位须在检测前
         if (bypass) { DDDLogOnce(@"addmsg-bypass", @"[Hook] AddMsg 放行：一次性 bypass（直接发送的重发）"); break; }
         NSString *content = wrap.m_nsContent;
-        if (!DDPContainsDouyinLink(content)) content = wrap.m_nsTitle;
-        if (!DDPContainsDouyinLink(content)) { DDDLogOnce(@"addmsg-nolink", @"[Hook] AddMsg 跳过：正文与 m_nsTitle 都不含 douyin.com"); break; }
+        if (!DDPContainsDouyinLink(content)) { DDDLogOnce(@"addmsg-nolink", @"[Hook] AddMsg 跳过：m_nsContent 不含 douyin.com"); break; }
         if (DDPIsDouyinLiveText(content)) { DDDLogOnce(@"addmsg-live", @"[Hook] AddMsg 跳过：直播文案"); break; }
         NSString *target = usr.length ? usr : wrap.m_nsToUsr;
         DDDLog(@"[Hook] AddMsg 命中抖音链接 → 弹面板（user=%@ 类型=%u）", target, mt);
@@ -1352,7 +1332,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     Class mgrCls = objc_getClass("WCPluginsMgr");
     if (mgrCls) {
         [[mgrCls sharedInstance] registerControllerWithTitle:@"DD抖音解析"
-                                                     version:@"1.3.1"
+                                                     version:@"1.3.4"
                                                   controller:@"DDPDouyinParseSettingsViewController"];
     }
     // 预热：把 WebContent 进程冷启动的成本提前付掉（tweak 加载时就在后台建好 WebView 并跑一个空文档）。
