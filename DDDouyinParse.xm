@@ -424,6 +424,7 @@ static NSString *DDPFirstPlayURL(NSDictionary *video) {
 @interface DDPApiParser : NSObject
 + (instancetype)shared;
 - (void)parseURL:(NSString *)url completion:(void (^)(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err))completion;
+- (NSString *)resolveCanonicalURL:(NSString *)url;   // 跟随 302 把短链展开成带 aweme_id 的真实 URL
 @end
 
 @implementation DDPApiParser {
@@ -436,9 +437,19 @@ static NSString *DDPFirstPlayURL(NSDictionary *video) {
 - (void)parseURL:(NSString *)url completion:(void (^)(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err))completion {
     dispatch_async(_apiQueue, ^{
         NSString *awemeId = DDPExtractAwemeId(url);
-        DDDLog(@"[API] 入参=%@ aweme_id=%@", url, awemeId);
+        DDDLog(@"[API] 入参=%@ aweme_id=%@", url, awemeId ?: @"(null)");
+        // 短链（v.douyin.com/iRxxx 之类）里没有数字 ID，需先展开成真实 URL 才能走 API
+        // 对齐 ZDY 的 ZJHRedirectDelegate 重定向捕获手法：跟随 302 拿最终 URL
         if (!awemeId.length) {
-            DDDLog(@"[API] 未提取到 aweme_id，放弃 API 路线");
+            NSString *resolved = [self resolveCanonicalURL:url];
+            if (resolved && resolved != url && ![resolved isEqualToString:url]) {
+                url = resolved;
+                awemeId = DDPExtractAwemeId(url);
+                DDDLog(@"[API] 短链展开后 aweme_id=%@", awemeId ?: @"(null)");
+            }
+        }
+        if (!awemeId.length) {
+            DDDLog(@"[API] 未提取到 aweme_id，放弃 API 路线（交给 WebView 兜底）");
             if (completion) completion(DDPMediaTypeUnknown, nil, nil, [NSError errorWithDomain:@"DDP-API" code:-10 userInfo:@{@"reason":@"no aweme_id"}]);
             return;
         }
@@ -514,6 +525,32 @@ static NSString *DDPFirstPlayURL(NSDictionary *video) {
     NSDictionary *d = DDPJsonFindAweme(json, awemeId);
     if (d) DDDLog(@"[API] iesdouyin 命中详情对象");
     return d;
+}
+
+// 跟随 HTTP 302 把短链（v.douyin.com/iRxxx 等）展开成真实 URL。
+// 默认 NSURLSession 会自动跟随重定向，最终 response.URL 即规范页地址（含数字 aweme_id）。
+// 对齐 ZDY 的 ZJHRedirectDelegate：捕获重定向目标，得到 www.douyin.com/video/<id> 这类带 ID 的 URL。
+- (NSString *)resolveCanonicalURL:(NSString *)url {
+    NSURL *u = [NSURL URLWithString:url];
+    if (!u) return url;
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:u cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:20];
+    req.HTTPMethod = @"GET";
+    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
+    __block NSString *final = url;
+    dispatch_semaphore_t sema = dispatch_semaphore_create(0);
+    [[session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        if (resp.URL.absoluteString.length) final = resp.URL.absoluteString;
+        dispatch_semaphore_signal(sema);
+    }] resume];
+    long ws = dispatch_semaphore_wait(sema, dispatch_time(DISPATCH_TIME_NOW, (int64_t)20 * NSEC_PER_SEC));
+    [session finishTasksAndInvalidate];
+    if (ws != 0) { DDDLog(@"[API] 短链展开超时/失败，沿用原 URL"); return url; }
+    if (final.length && ![final isEqualToString:url]) {
+        DDDLog(@"[API] 短链重定向解析: %@ → %@", url, final);
+        return final;
+    }
+    return url;
 }
 @end
 
