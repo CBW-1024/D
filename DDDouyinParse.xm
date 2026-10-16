@@ -305,11 +305,11 @@ static void DDPShowDone(NSString *text) {
 
 static const NSInteger DDPCodeGallery = 0x4161;   // 图集类型标记
 
-// 抓取/下载用 UA：必须是真实浏览器 UA。抖音按 UA 分流——微信 UA(原 GetMMUserAgent)
-// 会被当成 App 内嵌 webview，发壳页 / 跳 App 提示，导致图集取不到数据；桌面 Safari 才能拿到完整页面。
-// 若视频流程因此回归，可换移动版 Safari：
-//   @"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
-static NSString *const DDPFetchUA = @"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15";
+// 抓取/下载用 UA：必须是真实浏览器 UA。抖音按 UA 分流——
+// ① 微信 UA(原 GetMMUserAgent) 会被当成 App 内嵌 webview，发壳页/跳 App，图集取不到数据；
+// ② 桌面 Safari 会让视频短链 302 到 www.douyin.com/video/<id> 的 SPA 壳页（数据走 XHR，outerHTML 无 playwm），视频解析失败；
+// ③ 移动版 Safari：视频走回 iesdouyin.com/share/video/<id> 分享页（内嵌 playwm），图集也不被当微信壳页 —— 两端兼顾。
+static NSString *const DDPFetchUA = @"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1";
 
 @interface DDPWebFetcher : NSObject <WKNavigationDelegate>
 @property (nonatomic, readonly) WKWebView *webView;
@@ -463,6 +463,18 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
         if (![result containsObject:clean]) [result addObject:clean];
     }
     DDDLog(@"extractVideoLinks: 候选数=%lu", (unsigned long)result.count);
+    // 临时调试：大页却 0 候选，扫出视频 URL 候选，看清抖音当前结构
+    if (result.count == 0 && html.length > 100000) {
+        NSRegularExpression *reV = [NSRegularExpression
+            regularExpressionWithPattern:@"https?://[^\"\\\\ ]*?(aweme\\.snssdk\\.com|playwm|/play/|v[0-9]+\\.douyin\\.com|douyinvod|bytecdn|/video/)[^\"\\\\ ]*?\\.(mp4|m3u8|js\\?|play\\?)"
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        NSArray *ms = [reV matchesInString:html options:0 range:NSMakeRange(0, html.length)];
+        DDDLog(@"[video][debug] 大页(%.0fKB)视频候选 %lu 个，样例:", (double)html.length/1024.0, (unsigned long)ms.count);
+        for (NSUInteger i = 0; i < MIN(ms.count, 6); i++) {
+            NSString *s = [html substringWithRange:[ms[i] range]];
+            DDDLog(@"[video][debug]   v%d: %@", (int)i, s);
+        }
+    }
     return [result copy];
 }
 
@@ -527,6 +539,23 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
         DDDLog(@"[gallery] 正则已命中，未走兜底 JSON");
     }
     DDDLog(@"[gallery] 最终 %lu 张", (unsigned long)result.count);
+    // 临时调试：大页却 0 张，扫出图片 URL 候选，看清抖音当前结构
+    if (result.count == 0 && decoded.length > 100000) {
+        NSRegularExpression *reImg = [NSRegularExpression
+            regularExpressionWithPattern:@"https?://[^\"\\\\ ]*?(douyinpic|douyinstatic|byteimg|p[0-9]+-nocdn|imgcache)[^\"\\\\ ]*?\\.(jpg|jpeg|png|webp)"
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        NSArray *ms = [reImg matchesInString:decoded options:0 range:NSMakeRange(0, decoded.length)];
+        DDDLog(@"[gallery][debug] 大页(%.0fKB)图片候选 %lu 个，样例:", (double)decoded.length/1024.0, (unsigned long)ms.count);
+        for (NSUInteger i = 0; i < MIN(ms.count, 6); i++) {
+            NSString *s = [decoded substringWithRange:[ms[i] range]];
+            DDDLog(@"[gallery][debug]   img%d: %@", (int)i, s);
+        }
+        // 再扫一次 swiper/gallery/class 等容器标记，确认标记是否换名
+        for (NSString *tag in @[@"swiper", @"gallery", @"carousel", @"slide", @"note-item", @"album"]) {
+            NSUInteger c = [decoded rangeOfString:tag options:NSCaseInsensitiveSearch].location != NSNotFound ? 1 : 0;
+            if (c) DDDLog(@"[gallery][debug]   含标记 '%@'", tag);
+        }
+    }
     return [result copy];
 }
 
