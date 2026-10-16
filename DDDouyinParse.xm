@@ -305,6 +305,12 @@ static void DDPShowDone(NSString *text) {
 
 static const NSInteger DDPCodeGallery = 0x4161;   // 图集类型标记
 
+// 抓取/下载用 UA：必须是真实浏览器 UA。抖音按 UA 分流——微信 UA(原 GetMMUserAgent)
+// 会被当成 App 内嵌 webview，发壳页 / 跳 App 提示，导致图集取不到数据；桌面 Safari 才能拿到完整页面。
+// 若视频流程因此回归，可换移动版 Safari：
+//   @"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
+static NSString *const DDPFetchUA = @"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15";
+
 @interface DDPWebFetcher : NSObject <WKNavigationDelegate>
 @property (nonatomic, readonly) WKWebView *webView;
 @property (nonatomic, assign) BOOL hasCompleted;
@@ -326,7 +332,7 @@ static const NSInteger DDPCodeGallery = 0x4161;   // 图集类型标记
         WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
         config.defaultWebpagePreferences.allowsContentJavaScript = YES;   // 替代已废弃的 javaScriptEnabled
         _webView = [[WKWebView alloc] initWithFrame:CGRectZero configuration:config];
-        _webView.customUserAgent = [%c(CUtility) GetMMUserAgent];
+        _webView.customUserAgent = DDPFetchUA;
         _webView.navigationDelegate = self;
         _webView.hidden = YES;   // WKWebView 独立进程渲染，无需挂窗口；hidden 防误显示
     }
@@ -552,8 +558,7 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
     [request setValue:@"bytes=0-" forHTTPHeaderField:@"Range"];
     [request setValue:url forHTTPHeaderField:@"Referer"];
     [request setValue:@"*/*" forHTTPHeaderField:@"Accept"];
-    NSString *ua = [%c(CUtility) GetMMUserAgent];
-    [request setValue:(ua.length ? ua : @"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15") forHTTPHeaderField:@"User-Agent"];
+    [request setValue:DDPFetchUA forHTTPHeaderField:@"User-Agent"];
 
     NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
     cfg.timeoutIntervalForRequest = 60;
