@@ -219,6 +219,22 @@ static void DDDClearLog(void) {
 }
 #define DDDLog(fmt, ...) do { NSString *__s = [NSString stringWithFormat:fmt, ##__VA_ARGS__]; NSLog(@"[DDDParse] %@", __s); DDDWriteLog(__s); } while (0)
 
+// 同一 key 只落一次：用于高频路径（每来一条消息都会跑的判定），
+// 既能看出「这段到底走没走过」，又不会把日志刷爆。用来甄别死代码。
+static NSMutableSet *gDDDOnceKeys(void) {
+    static NSMutableSet *s; static dispatch_once_t once;
+    dispatch_once(&once, ^{ s = [NSMutableSet set]; });
+    return s;
+}
+// 注意：AddMsg 在微信消息线程、菜单在主线程，set 会被并发访问，故加锁（锁内只做查/插，很快）
+#define DDDLogOnce(key, fmt, ...) do { \
+    NSString *__k = (key); \
+    BOOL __first = NO; \
+    NSMutableSet *__s = gDDDOnceKeys(); \
+    @synchronized (__s) { if (![__s containsObject:__k]) { [__s addObject:__k]; __first = YES; } } \
+    if (__first) DDDLog(fmt, ##__VA_ARGS__); \
+} while (0)
+
 #pragma mark - 配置
 
 static NSString * const kDDPEnabledKey = @"DDDouyinParseEnabled";
@@ -239,20 +255,34 @@ static NSString * const kDDPEnabledKey = @"DDDouyinParseEnabled";
 
 #pragma mark - 工具函数
 
-static BOOL DDPContainsDouyinLink(NSString *text) { return [text containsString:@"douyin.com"]; }
+static BOOL DDPContainsDouyinLink(NSString *text) {
+    BOOL r = [text containsString:@"douyin.com"];
+    DDDLogOnce((r ? @"contain-Y" : @"contain-N"), @"[工具] DDPContainsDouyinLink=%d", r);
+    return r;
+}
 
 // 排除直播：抖音直播分享文案含「正在直播」
-static BOOL DDPIsDouyinLiveText(NSString *text) { return [text containsString:@"正在直播"]; }
+static BOOL DDPIsDouyinLiveText(NSString *text) {
+    BOOL r = [text containsString:@"正在直播"];
+    DDDLogOnce((r ? @"live-Y" : @"live-N"), @"[工具] DDPIsDouyinLiveText=%d", r);
+    return r;
+}
 
 static BOOL DDPIsOutgoing(CMessageWrap *wrap) { return [%c(CMessageWrap) isSenderFromMsgWrap:wrap]; }
 
 // 抽取文本中的第一个抖音 http(s) URL（只认 douyin.com，避免文案里其他链接抢先被抠走）
 static NSString *DDPExtractURL(NSString *text) {
     NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"https?://[^\\s\"']+" options:0 error:nil];
+    NSUInteger seen = 0;
     for (NSTextCheckingResult *m in [re matchesInString:text options:0 range:NSMakeRange(0, text.length)]) {
+        seen++;
         NSString *u = [text substringWithRange:m.range];
-        if ([u containsString:@"douyin.com"]) return u;
+        if ([u containsString:@"douyin.com"]) {
+            DDDLog(@"[工具] DDPExtractURL：扫到第 %lu 个 URL 命中 → %@", (unsigned long)seen, u);
+            return u;
+        }
     }
+    DDDLog(@"[工具] DDPExtractURL：扫了 %lu 个 URL，无 douyin.com", (unsigned long)seen);
     return nil;
 }
 
@@ -265,6 +295,9 @@ static NSString *DDPRemoveWatermark(NSString *url) {
         NSString *sep = ([clean rangeOfString:@"?"].location == NSNotFound) ? @"?" : @"&";
         clean = [clean stringByAppendingFormat:@"%@ratio=720p", sep];
     }
+    BOOL changed = ![clean isEqualToString:url];
+    DDDLogOnce((changed ? @"wm-Y" : @"wm-N"), @"[工具] 去水印%@\n    前 %@\n    后 %@",
+               changed ? @"生效" : @"无变化（若恒无变化则本函数可简化）", url, clean);
     return clean;
 }
 
@@ -281,11 +314,18 @@ static NSString *DDPTempPathExt(NSString *url, NSString *ext) {
 // 取 URL 后缀作为临时文件扩展名（默认 jpg）
 static NSString *DDPImageExt(NSString *url) {
     NSString *ue = [url pathExtension].lowercaseString;
-    return ue.length ? ue : @"jpg";
+    NSString *r = ue.length ? ue : @"jpg";
+    DDDLogOnce([@"ext-" stringByAppendingString:r], @"[工具] DDPImageExt：%@ → %@%@", url, r, ue.length ? @"" : @"（走默认 jpg 兜底）");
+    return r;
 }
 
 // 主窗口：单主窗口 app，直接取 AppDelegate.window，不遍历场景
-static inline UIWindow *DDPKeyWindow(void) { return UIApplication.sharedApplication.delegate.window; }
+// 注：与上面的 DDPHostWindow() 功能重复（后者多了 connectedScenes 兜底），留着看日志确认调用点
+static inline UIWindow *DDPKeyWindow(void) {
+    UIWindow *w = UIApplication.sharedApplication.delegate.window;
+    DDDLogOnce((w ? @"keywin-Y" : @"keywin-N"), @"[工具] DDPKeyWindow 被调用，返回%@", w ? @"窗口" : @"nil");
+    return w;
+}
 
 static WeToast *DDPToast(void) { return [%c(WeToast) toast]; }
 static WeToast *gDDPBusyToast;
@@ -521,13 +561,18 @@ static UIWindow *DDPHostWindow(void) {
     NSMutableString *html = [NSMutableString string];
     [html setString:result];
     NSRange full = NSMakeRange(0, html.length);
-    [html replaceOccurrencesOfString:@"\\u0026" withString:@"&" options:NSCaseInsensitiveSearch range:full];
+    // 逐步记录替换处数：哪一步恒为 0 就说明它没在干活，可以删
+    NSUInteger len0 = html.length;
+    NSUInteger n1 = [html replaceOccurrencesOfString:@"\\u0026" withString:@"&" options:NSCaseInsensitiveSearch range:full];
     full = NSMakeRange(0, html.length);
-    [html replaceOccurrencesOfString:@"amp;" withString:@"" options:NSCaseInsensitiveSearch range:full];
+    NSUInteger n2 = [html replaceOccurrencesOfString:@"amp;" withString:@"" options:NSCaseInsensitiveSearch range:full];
     full = NSMakeRange(0, html.length);
-    [html replaceOccurrencesOfString:@"u002F" withString:@"/" options:NSCaseInsensitiveSearch range:full];
+    NSUInteger n3 = [html replaceOccurrencesOfString:@"u002F" withString:@"/" options:NSCaseInsensitiveSearch range:full];
     full = NSMakeRange(0, html.length);
-    [html replaceOccurrencesOfString:@"\\" withString:@"" options:NSCaseInsensitiveSearch range:full];
+    NSUInteger n4 = [html replaceOccurrencesOfString:@"\\" withString:@"" options:NSCaseInsensitiveSearch range:full];
+    DDDLog(@"[清洗] 长度 %lu→%lu｜\\u0026→& %lu 处｜amp;→空 %lu 处｜u002F→/ %lu 处｜\\→空 %lu 处",
+           (unsigned long)len0, (unsigned long)html.length,
+           (unsigned long)n1, (unsigned long)n2, (unsigned long)n3, (unsigned long)n4);
 
     BOOL risk = [html containsString:@"验证码中间页"];
     if (risk) [DDPToast() showToastWithText:@"被检测了，请验证后再试"];
@@ -562,8 +607,13 @@ static UIWindow *DDPHostWindow(void) {
                                                                        options:0 error:&err];
     if (err) return 0;
     NSTextCheckingResult *m = [re firstMatchInString:html options:0 range:NSMakeRange(0, html.length)];
-    if (!m || m.numberOfRanges < 2) return 0;
-    return [[html substringWithRange:[m rangeAtIndex:1]] intValue] / 1000;
+    if (!m || m.numberOfRanges < 2) {
+        DDDLog(@"[抽取·时长] 未匹配到 \"bit_rate\":null,\"duration\" → 0（图集页正常；视频页若恒 0 则正则需修）");
+        return 0;
+    }
+    NSInteger d = [[html substringWithRange:[m rangeAtIndex:1]] intValue] / 1000;
+    DDDLog(@"[抽取·时长] 原始 %@ → %ld 秒", [html substringWithRange:[m rangeAtIndex:1]], (long)d);
+    return d;
 }
 
 // PKC -cleanupWebView@0x3d148：webView.hidden=YES（并清掉 RwFlag，我们无此标志位）
@@ -591,13 +641,16 @@ static UIWindow *DDPHostWindow(void) {
     NSRegularExpression *re = [NSRegularExpression
         regularExpressionWithPattern:@"https://aweme\\.snssdk\\.com/aweme/v1/playwm/\\?[^\"\\s]+"
         options:NSRegularExpressionCaseInsensitive error:nil];
+    NSUInteger raw = 0, skipped = 0, dup = 0;
     for (NSTextCheckingResult *m in [re matchesInString:html options:0 range:NSMakeRange(0, html.length)]) {
+        raw++;
         NSString *u = [[html substringWithRange:m.range] stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
-        if ([u containsString:@"video_id=https:"]) continue;
+        if ([u containsString:@"video_id=https:"]) { skipped++; continue; }
         NSString *clean = DDPRemoveWatermark(u);
-        if (![result containsObject:clean]) [result addObject:clean];
+        if (![result containsObject:clean]) [result addObject:clean]; else dup++;
     }
-    DDDLog(@"extractVideoLinks: 候选数=%lu", (unsigned long)result.count);
+    DDDLog(@"[抽取·视频] 正则命中 %lu 个｜video_id 过滤掉 %lu 个｜重复去重 %lu 个｜最终 %lu 个",
+           (unsigned long)raw, (unsigned long)skipped, (unsigned long)dup, (unsigned long)result.count);
     return [result copy];
 }
 
@@ -605,13 +658,31 @@ static UIWindow *DDPHostWindow(void) {
 - (NSArray<NSString *> *)extractGalleryImagesFromHTML:(NSString *)html {
     NSMutableArray *result = [NSMutableArray array];
     NSMutableString *decoded = [html mutableCopy];
-    [decoded replaceOccurrencesOfString:@"\\u002f" withString:@"/" options:0 range:NSMakeRange(0, decoded.length)];
-    [decoded replaceOccurrencesOfString:@"\\/" withString:@"/" options:0 range:NSMakeRange(0, decoded.length)];
-    [decoded replaceOccurrencesOfString:@"\\\"" withString:@"\"" options:0 range:NSMakeRange(0, decoded.length)];
-    [decoded replaceOccurrencesOfString:@"&quot;" withString:@"\"" options:0 range:NSMakeRange(0, decoded.length)];
+    NSUInteger len0 = decoded.length;
+    NSUInteger g1 = [decoded replaceOccurrencesOfString:@"\\u002f" withString:@"/" options:0 range:NSMakeRange(0, decoded.length)];
+    NSUInteger g2 = [decoded replaceOccurrencesOfString:@"\\/" withString:@"/" options:0 range:NSMakeRange(0, decoded.length)];
+    NSUInteger g3 = [decoded replaceOccurrencesOfString:@"\\\"" withString:@"\"" options:0 range:NSMakeRange(0, decoded.length)];
+    NSUInteger g4 = [decoded replaceOccurrencesOfString:@"&quot;" withString:@"\"" options:0 range:NSMakeRange(0, decoded.length)];
+    DDDLog(@"[抽取·图集] 解码 %lu→%lu｜\\u002f→/ %lu｜\\/→/ %lu｜\\\"→\" %lu｜&quot;→\" %lu",
+           (unsigned long)len0, (unsigned long)decoded.length,
+           (unsigned long)g1, (unsigned long)g2, (unsigned long)g3, (unsigned long)g4);
 
+    // 统计 "images" 出现次数：若多于 1 次，说明「只取第一个容器」这条假设有风险
+    NSUInteger imgCount = 0;
+    NSRange sr = NSMakeRange(0, decoded.length);
+    while (sr.length > 0) {
+        NSRange f = [decoded rangeOfString:@"\"images\"" options:NSCaseInsensitiveSearch range:sr];
+        if (f.location == NSNotFound) break;
+        imgCount++;
+        NSUInteger next = NSMaxRange(f);
+        if (next >= decoded.length) break;
+        sr = NSMakeRange(next, decoded.length - next);
+    }
     NSRange cr = [decoded rangeOfString:@"\"images\"" options:NSCaseInsensitiveSearch];
-    if (cr.location == NSNotFound) return @[];
+    if (cr.location == NSNotFound) { DDDLog(@"[抽取·图集] 无 \"images\" 容器 → 空"); return @[]; }
+    DDDLog(@"[抽取·图集] \"images\" 共 %lu 处，取首个 @%lu%@",
+           (unsigned long)imgCount, (unsigned long)cr.location,
+           imgCount > 1 ? @"（多处：首容器即完整图集 这条假设需复核）" : @"");
     NSRange br = [decoded rangeOfString:@":[" options:0 range:NSMakeRange(cr.location, MIN(decoded.length - cr.location, 64))];
     NSInteger arrOpen = (br.location != NSNotFound) ? ((NSInteger)br.location + (NSInteger)br.length - 1) : -1;
     NSInteger arrEnd = -1, depth = 0;
@@ -628,6 +699,9 @@ static UIWindow *DDPHostWindow(void) {
         for (NSTextCheckingResult *m in [reU matchesInString:seg options:0 range:NSMakeRange(0, seg.length)]) {
             [result addObject:[[seg substringWithRange:[m rangeAtIndex:1]] stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"]];
         }
+        DDDLog(@"[抽取·图集] 容器长度 %lu，url_list 抠出 %lu 张", (unsigned long)seg.length, (unsigned long)result.count);
+    } else {
+        DDDLog(@"[抽取·图集] 数组边界未闭合（arrOpen=%ld arrEnd=%ld）→ 空", (long)arrOpen, (long)arrEnd);
     }
     return [result copy];
 }
@@ -677,6 +751,7 @@ static UIWindow *DDPHostWindow(void) {
     cfg.timeoutIntervalForRequest = 60;
     NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
     __block NSData *result = nil; __block NSInteger dcode = -1; __block NSString *derr = nil;
+    double t0 = CFAbsoluteTimeGetCurrent();
     dispatch_semaphore_t sema = dispatch_semaphore_create(0);
     [[session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
         if ([resp isKindOfClass:[NSHTTPURLResponse class]]) dcode = (NSInteger)((NSHTTPURLResponse *)resp).statusCode;
@@ -686,7 +761,9 @@ static UIWindow *DDPHostWindow(void) {
     }] resume];
     dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
     [session finishTasksAndInvalidate];
-    DDDLog(@"downloadMedia: 字节=%lu HTTP=%ld err=%@ url=%@", (unsigned long)(result ? result.length : 0), (long)dcode, derr ?: @"nil", ([url length] > 120) ? [[url substringToIndex:120] stringByAppendingString:@"…"] : url);
+    DDDLog(@"[下载] 字节=%lu HTTP=%ld 耗时=%.2fs err=%@ url=%@",
+           (unsigned long)(result ? result.length : 0), (long)dcode, CFAbsoluteTimeGetCurrent() - t0, derr ?: @"nil",
+           ([url length] > 120) ? [[url substringToIndex:120] stringByAppendingString:@"…"] : url);
     return result;
 }
 @end
@@ -954,6 +1031,8 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 
 // 下载图片直链到本地缓存（供预览，不存相册；复用 MD5 缓存）
 + (void)downloadImagesLocally:(NSArray<NSString *> *)urls completion:(void (^)(NSArray<NSString *> *paths))completion {
+    double t0 = CFAbsoluteTimeGetCurrent();
+    DDDLog(@"[下载·图集] 开始串行下载 %lu 张", (unsigned long)urls.count);
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSMutableArray *out = [NSMutableArray array];
         NSFileManager *fm = [NSFileManager defaultManager];
@@ -966,6 +1045,8 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
             }
             if ([fm fileExistsAtPath:path]) [out addObject:path];
         }
+        DDDLog(@"[下载·图集] %lu 张串行下载完成 成功 %lu 张 总耗时 %.2fs",
+               (unsigned long)urls.count, (unsigned long)out.count, CFAbsoluteTimeGetCurrent() - t0);
         dispatch_async(dispatch_get_main_queue(), ^{ if (completion) completion(out); });
     });
 }
@@ -983,10 +1064,12 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 }
 
 + (void)handleParseLink:(NSString *)url user:(NSString *)user {
+    DDDLog(@"[面板] handleParseLink 入口 url=%@ user=%@", url, user.length ? user : @"(空→取当前会话)");
     DDPShowLoading(@"正在解析…");
     [[DDPEngine shared] parseDouyinURL:url completion:^(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (err || type == DDPMediaTypeUnknown) { DDPShowError(@"解析失败"); return; }
+            if (err || type == DDPMediaTypeUnknown) { DDDLog(@"[面板] handleParseLink 失败 err=%@", err); DDPShowError(@"解析失败"); return; }
+            DDDLog(@"[面板] handleParseLink 成功 type=%ld", (long)type);
             DDPHideLoading();
             NSString *link = (type == DDPMediaTypeVideo) ? videoURL : [imageURLs componentsJoinedByString:@"\n"];
             NSString *target = user.length ? user : DDPCurrentChatName();
@@ -1065,7 +1148,10 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     if (!enabled) return original;
     NSString *token = [@"ddp:" stringByAppendingString:NSStringFromSelector(action)];
     for (MMMenuItem *it in original)
-        if ([it.userInfo isKindOfClass:[NSString class]] && [(NSString *)it.userInfo isEqualToString:token]) return original;
+        if ([it.userInfo isKindOfClass:[NSString class]] && [(NSString *)it.userInfo isEqualToString:token]) {
+            DDDLogOnce([@"skipdup-" stringByAppendingString:token], @"[Hook] 菜单项已存在 → 跳过重复注入（%@）", token);
+            return original;
+        }
     MMMenuItem *item = [[%c(MMMenuItem) alloc] initWithTitle:title svgName:svgName target:cell action:action];
     if (!item) return original;   // item 为空时 addObject:nil 会崩
     [item setUserInfo:token];
@@ -1105,6 +1191,10 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     NSString *content = ddp_wrapContent(gDDPMenuWrap);
     BOOL enabled = DDPConfig.shared.enabled
                    && DDPContainsDouyinLink(content) && !DDPIsDouyinLiveText(content);
+    DDDLogOnce((enabled ? @"menu-Y" : @"menu-N"),
+               @"[Hook] setMenuItems：注入=%d（开关=%d 含抖音=%d 直播=%d）原始项数=%lu",
+               enabled, DDPConfig.shared.enabled, content ? DDPContainsDouyinLink(content) : 0,
+               content ? DDPIsDouyinLiveText(content) : 0, (unsigned long)items.count);
     NSArray *all = ddp_inject_item(gDDPMenuVC, items, enabled, @"解析", @"icons_filled_search", @selector(ddp_vcParse:), 1010);
     all = ddp_inject_item(gDDPMenuVC, all, enabled, @"预览", @"icons_filled_play", @selector(ddp_vcPreview:), 1011);
     %orig(all);
@@ -1117,17 +1207,22 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
 %hook CMessageMgr
 - (void)AddMsg:(NSString *)usr MsgWrap:(CMessageWrap *)wrap {
     do {
-        if (!DDPConfig.shared.enabled || !wrap) break;
-        if (!DDPIsOutgoing(wrap)) break;                       // 仅自己发出的消息
+        if (!DDPConfig.shared.enabled || !wrap) { DDDLogOnce(@"addmsg-off", @"[Hook] AddMsg 跳过：开关=%d wrap=%@", DDPConfig.shared.enabled, wrap ? @"有" : @"nil"); break; }
+        if (!DDPIsOutgoing(wrap)) { DDDLogOnce(@"addmsg-in", @"[Hook] AddMsg 跳过：非本人发出"); break; }
         unsigned int mt = wrap.m_uiMessageType;
-        if (mt != 1 && mt != 49 && mt != 62) break;            // 文本 / 链接卡片 / 其他
+        if (mt != 1 && mt != 49 && mt != 62) {
+            DDDLogOnce([NSString stringWithFormat:@"addmsg-mt-%u", mt],
+                       @"[Hook] AddMsg 跳过：消息类型 %u 不在 1/49/62（若恒不出现则 49/62 判定可简化）", mt);
+            break;
+        }
         BOOL bypass = gDDPDyTcEnable; gDDPDyTcEnable = NO;       // 复位须在检测前
-        if (bypass) break;
+        if (bypass) { DDDLogOnce(@"addmsg-bypass", @"[Hook] AddMsg 放行：一次性 bypass（直接发送的重发）"); break; }
         NSString *content = wrap.m_nsContent;
         if (!DDPContainsDouyinLink(content)) content = wrap.m_nsTitle;
-        if (!DDPContainsDouyinLink(content)) break;
-        if (DDPIsDouyinLiveText(content)) break;
+        if (!DDPContainsDouyinLink(content)) { DDDLogOnce(@"addmsg-nolink", @"[Hook] AddMsg 跳过：正文与 m_nsTitle 都不含 douyin.com"); break; }
+        if (DDPIsDouyinLiveText(content)) { DDDLogOnce(@"addmsg-live", @"[Hook] AddMsg 跳过：直播文案"); break; }
         NSString *target = usr.length ? usr : wrap.m_nsToUsr;
+        DDDLog(@"[Hook] AddMsg 命中抖音链接 → 弹面板（user=%@ 类型=%u）", target, mt);
         if ([DDPPanel showForContent:content user:target]) return;   // 命中后拦截
     } while (0);
     %orig;
@@ -1193,7 +1288,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     Class mgrCls = objc_getClass("WCPluginsMgr");
     if (mgrCls) {
         [[mgrCls sharedInstance] registerControllerWithTitle:@"DD抖音解析"
-                                                     version:@"1.2.1"
+                                                     version:@"1.2.2"
                                                   controller:@"DDPDouyinParseSettingsViewController"];
     }
     // 预热：把 WebContent 进程冷启动的成本提前付掉（tweak 加载时就在后台建好 WebView 并跑一个空文档）。
