@@ -326,39 +326,65 @@ static NSString *DDPExtractAwemeId(NSString *text) {
     return nil;
 }
 
-// 取 douyin.com / iesdouyin.com 域名的 cookie 拼成 Cookie 头；extraTtwid 非 nil 时追加到最前
+// 取 douyin.com / iesdouyin.com / bytedance.com 域名的 cookie 拼成 Cookie 头；extraTtwid 非 nil 时追加到最前
 static NSString *DDPDouyinCookieHeader(NSString *extraTtwid) {
     NSMutableArray *parts = [NSMutableArray array];
     if (extraTtwid.length) [parts addObject:[NSString stringWithFormat:@"ttwid=%@", extraTtwid]];
     NSHTTPCookieStorage *store = [NSHTTPCookieStorage sharedHTTPCookieStorage];
     for (NSHTTPCookie *c in store.cookies) {
         NSString *dom = c.domain ?: @"";
-        if ([dom containsString:@"douyin.com"] || [dom containsString:@"iesdouyin.com"])
+        if ([dom containsString:@"douyin.com"] || [dom containsString:@"iesdouyin.com"] || [dom containsString:@"bytedance.com"])
             [parts addObject:[NSString stringWithFormat:@"%@=%@", c.name, c.value]];
     }
     return [parts componentsJoinedByString:@"; "];
 }
 
-// 同步 HTTP（后台线程调用，信号量阻塞）。返回 data；HTTP 状态码写入 *outCode（失败写 -1）
-static NSData *DDPApiHttp(NSString *url, NSString *method, NSDictionary *headers, NSData *body, NSTimeInterval timeout, NSInteger *outCode) {
+// 从响应头（Set-Cookie）抠出 ttwid。ttwid 端点把 ttwid 放在 Set-Cookie: ttwid=... 下发（值含 %7C 即 |，需解码）
+static NSString *DDPParseTtwidFromHeaders(NSDictionary<NSString *, id> *hdrs) {
+    if (!hdrs) return nil;
+    id sc = hdrs[@"Set-Cookie"];
+    NSArray *list = nil;
+    if ([sc isKindOfClass:[NSString class]]) list = @[sc];
+    else if ([sc isKindOfClass:[NSArray class]]) list = sc;
+    for (NSString *c in list) {
+        NSRange r = [c rangeOfString:@"ttwid=" options:NSCaseInsensitiveSearch];
+        if (r.location == NSNotFound) continue;
+        NSString *rest = [c substringFromIndex:r.location + r.length];
+        NSRange semi = [rest rangeOfString:@";"];
+        NSString *val = (semi.location != NSNotFound) ? [rest substringToIndex:semi.location] : rest;
+        NSString *decoded = [val stringByRemovingPercentEncoding];
+        if (decoded.length) return decoded;
+        return val;
+    }
+    return nil;
+}
+
+// 同步 HTTP（后台线程调用，信号量阻塞）。返回 data；HTTP 状态码写入 *outCode（失败写 -1）；
+// *outHeaders 写出响应头（含 Set-Cookie），可为 NULL。用 defaultSession 让 cookie 落共享罐、跨请求复用。
+static NSData *DDPApiHttp(NSString *url, NSString *method, NSDictionary *headers, NSData *body, NSTimeInterval timeout, NSInteger *outCode, NSDictionary<NSString *, id> **outHeaders) {
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
     req.HTTPMethod = method ?: @"GET";
     req.timeoutInterval = timeout;
     [req setValue:kDDPDesktopUA forHTTPHeaderField:@"User-Agent"];
     [headers enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) { [req setValue:v forHTTPHeaderField:k]; }];
     if (body) { [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"]; req.HTTPBody = body; }
-    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
     NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
-    __block NSData *result = nil; __block NSInteger code = -1;
+    __block NSData *result = nil; __block NSInteger code = -1; __block NSDictionary *hdrOut = nil;
     dispatch_semaphore_t sema = dispatch_semaphore_create(0);
     [[session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-        if ([resp isKindOfClass:[NSHTTPURLResponse class]]) code = (NSInteger)((NSHTTPURLResponse *)resp).statusCode;
+        if ([resp isKindOfClass:[NSHTTPURLResponse class]]) {
+            NSHTTPURLResponse *h = (NSHTTPURLResponse *)resp;
+            code = (NSInteger)h.statusCode;
+            hdrOut = h.allHeaderFields;
+        }
         if (!err && data) result = data;
         dispatch_semaphore_signal(sema);
     }] resume];
     dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
     [session finishTasksAndInvalidate];
     if (outCode) *outCode = code;
+    if (outHeaders) *outHeaders = hdrOut;
     return result;
 }
 
@@ -458,6 +484,9 @@ static NSString *DDPFirstPlayURL(NSDictionary *video) {
         }
         NSString *ttwid = [self registerTtwid];
         DDDLog(@"[API] ttwid=%@", ttwid ?: @"(空)");
+        // best-effort 预热：打 feed 端点种 UIFID_TEMP（aweme/detail 的 uifid 风控来源）。
+        // 用 defaultSession + 共享 cookie 罐，ttwid 已落罐会自动带上。失败不致命，最终会回退 WebView。
+        [self warmupFeed];
         NSDictionary *detail = [self fetchDetail:awemeId ttwid:ttwid];
         if (!detail) detail = [self fetchIesDouyin:awemeId ttwid:ttwid];
         if (!detail) {
@@ -477,15 +506,17 @@ static NSString *DDPFirstPlayURL(NSDictionary *video) {
 
 - (NSString *)registerTtwid {
     @synchronized (self) { if (_cachedTtwid.length) return _cachedTtwid; }
-    NSDictionary *body = @{@"region":@"cn", @"aid":@6383, @"needFid":@NO, @"service":@"www.douyin.com",
-        @"migrate_info":@{@"ticket":@"source", @"source":@"node"}, @"cbUrlProtocol":@"https", @"union":@YES};
+    // 注意：union / needFid 必须是整型（1/0），用布尔 @YES/@NO 会被服务端拒（parse params fail）
+    NSDictionary *body = @{@"region":@"cn", @"aid":@6383, @"needFid":@0, @"service":@"www.douyin.com",
+        @"migrate_info":@{@"ticket":@"source", @"source":@"node"}, @"cbUrlProtocol":@"https", @"union":@1};
     NSData *data = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
-    NSInteger code = 0;
+    NSInteger code = 0; NSDictionary *hdrs = nil;
     NSData *resp = DDPApiHttp(@"https://ttwid.bytedance.com/ttwid/union/register/", @"POST",
-        @{@"Accept":@"application/json"}, data, 20.0, &code);
+        @{@"Accept":@"application/json"}, data, 20.0, &code, &hdrs);
     DDDLog(@"[API] ttwid注册 HTTP=%ld 字节=%lu", (long)code, (unsigned long)(resp ? resp.length : 0));
-    NSString *t = nil;
-    if (resp.length) {
+    // ttwid 实际由响应头 Set-Cookie: ttwid=... 下发（body 里只有 redirect_url），优先从这里抠
+    NSString *t = DDPParseTtwidFromHeaders(hdrs);
+    if (!t.length && resp.length) {
         id json = [NSJSONSerialization JSONObjectWithData:resp options:0 error:nil];
         if ([json isKindOfClass:[NSDictionary class]]) {
             id d = json[@"data"];
@@ -493,8 +524,50 @@ static NSString *DDPFirstPlayURL(NSDictionary *video) {
             if (!t) t = json[@"ttwid"];
         }
     }
-    if ([t isKindOfClass:[NSString class]] && ((NSString *)t).length) { @synchronized (self) { _cachedTtwid = t; } }
+    DDDLog(@"[API] ttwid=%@", t ?: @"(空)");
+    if ([t isKindOfClass:[NSString class]] && ((NSString *)t).length) {
+        @synchronized (self) { _cachedTtwid = t; }
+        [self ddpSeedCookieName:@"ttwid" value:t domain:@".douyin.com"];
+    }
     return t;
+}
+
+// 把 cookie 写进共享 NSHTTPCookieStorage，让后续 defaultSession 请求自动携带（绕过 ephemeral 不落盘的问题）
+- (void)ddpSeedCookieName:(NSString *)name value:(NSString *)value domain:(NSString *)domain {
+    NSMutableDictionary *props = [NSMutableDictionary dictionary];
+    props[NSHTTPCookieName] = name;
+    props[NSHTTPCookieValue] = value;
+    props[NSHTTPCookieDomain] = domain;
+    props[NSHTTPCookiePath] = @"/";
+    props[NSHTTPCookieSecure] = @"TRUE";
+    NSHTTPCookie *c = [NSHTTPCookie cookieWithProperties:props];
+    if (c) { [[NSHTTPCookieStorage sharedHTTPCookieStorage] setCookie:c]; DDDLog(@"[API] 已写入共享 cookie: %@=%@", name, value); }
+}
+
+// best-effort：访问 feed 端点，服务端通过 Set-Cookie 下发 UIFID_TEMP，写进共享 cookie 罐。
+// 这是 aweme/detail 的「uifid Not Found」风控的唯一合法来源（ArgusSecurityPlugin 要求）。
+// 注意：纯 NSURLSession 在抖音反爬挑战（__ac_nonce）下可能偶发拿不到，失败不致命。
+- (void)warmupFeed {
+    NSString *url = @"https://www.douyin.com/aweme/v1/web/tab/feed/?aid=6383&device_platform=webapp&channel=channel_pc_web&version_code=170400&version_name=17.4.0&pc_client_type=1&platform=PC";
+    NSMutableDictionary *headers = [@{@"Accept":@"application/json, text/plain, */*", @"Referer":@"https://www.douyin.com/", @"Origin":@"https://www.douyin.com/"} mutableCopy];
+    NSString *cookie = DDPDouyinCookieHeader(nil);
+    if (cookie.length) headers[@"Cookie"] = cookie;
+    NSInteger code = 0; NSDictionary *hdrs = nil;
+    NSData *resp = DDPApiHttp(url, @"GET", headers, nil, 15.0, &code, &hdrs);
+    // 把响应里的 UIFID_TEMP（若有）也写进共享罐，确保后续 detail 请求带得上
+    if (hdrs) {
+        id sc = hdrs[@"Set-Cookie"];
+        NSArray *list = [sc isKindOfClass:[NSArray class]] ? sc : (sc ? @[sc] : nil);
+        for (NSString *c in list) {
+            NSRange r = [c rangeOfString:@"UIFID_TEMP=" options:NSCaseInsensitiveSearch];
+            if (r.location == NSNotFound) continue;
+            NSString *rest = [c substringFromIndex:r.location + r.length];
+            NSRange semi = [rest rangeOfString:@";"];
+            NSString *val = (semi.location != NSNotFound) ? [rest substringToIndex:semi.location] : rest;
+            if (val.length) { [self ddpSeedCookieName:@"UIFID_TEMP" value:val domain:@".douyin.com"]; break; }
+        }
+    }
+    DDDLog(@"[API] feed预热 HTTP=%ld 字节=%lu（UIFID_TEMP 已尝试写入）", (long)code, (unsigned long)(resp ? resp.length : 0));
 }
 
 - (NSDictionary *)fetchDetail:(NSString *)awemeId ttwid:(NSString *)ttwid {
@@ -504,7 +577,7 @@ static NSString *DDPFirstPlayURL(NSDictionary *video) {
     NSString *cookie = DDPDouyinCookieHeader(ttwid);
     if (cookie.length) headers[@"Cookie"] = cookie;
     NSInteger code = 0;
-    NSData *resp = DDPApiHttp(url, @"GET", headers, nil, 25.0, &code);
+    NSData *resp = DDPApiHttp(url, @"GET", headers, nil, 25.0, &code, NULL);
     DDDLog(@"[API] aweme/detail HTTP=%ld 字节=%lu", (long)code, (unsigned long)(resp ? resp.length : 0));
     if (!resp.length) return nil;
     id json = [NSJSONSerialization JSONObjectWithData:resp options:0 error:nil];
@@ -520,7 +593,7 @@ static NSString *DDPFirstPlayURL(NSDictionary *video) {
     NSString *cookie = DDPDouyinCookieHeader(ttwid);
     if (cookie.length) headers[@"Cookie"] = cookie;
     NSInteger code = 0;
-    NSData *resp = DDPApiHttp(url, @"GET", headers, nil, 20.0, &code);
+    NSData *resp = DDPApiHttp(url, @"GET", headers, nil, 20.0, &code, NULL);
     DDDLog(@"[API] iesdouyin HTTP=%ld 字节=%lu", (long)code, (unsigned long)(resp ? resp.length : 0));
     if (!resp.length) return nil;
     id json = [NSJSONSerialization JSONObjectWithData:resp options:0 error:nil];
