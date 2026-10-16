@@ -515,6 +515,30 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
         }
     }
     DDDLog(@"[gallery] urlList命中 %lu 张", (unsigned long)result.count);
+    // 临时调试：大页却 0 张，dump 真实结构（定位 share/note 页字段名/URL 格式差异）
+    if (result.count == 0 && decoded.length > 50000) {
+        DDDLog(@"[gallery][debug] 大页(%.0fKB) urlList=0 探测键:", (double)decoded.length/1024.0);
+        for (NSString *k in @[@"\"images\"", @"\"urlList\"", @"\"url_list\"", @"playwm", @"\"imageUrls\"", @"\"image_urls\"", @"\"originUrl\"", @"\"urlPrefix\"", @"\"uri\""]) {
+            if ([decoded rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound)
+                DDDLog(@"[gallery][debug]   含键 %@", k);
+        }
+        NSRange ir = [decoded rangeOfString:@"\"images\"" options:NSCaseInsensitiveSearch];
+        if (ir.location != NSNotFound) {
+            NSRange w = NSMakeRange(ir.location, MIN(decoded.length - ir.location, 600));
+            DDDLog(@"[gallery][debug] images窗口: %@", [decoded substringWithRange:w]);
+        }
+        NSRange ur = [decoded rangeOfString:@"urlList" options:NSCaseInsensitiveSearch];
+        if (ur.location != NSNotFound) {
+            NSInteger s = MAX(0, (NSInteger)ur.location - 40);
+            NSRange w = NSMakeRange(s, MIN(300, decoded.length - s));
+            DDDLog(@"[gallery][debug] urlList窗口: %@", [decoded substringWithRange:w]);
+        }
+        NSRegularExpression *reP = [NSRegularExpression
+            regularExpressionWithPattern:@"//[a-z0-9.-]*(douyinpic|byteimg|sign)[^\" ]*?\\.(jpg|jpeg|png|webp)"
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        NSArray *pm = [reP matchesInString:decoded options:0 range:NSMakeRange(0, decoded.length)];
+        if (pm.count) DDDLog(@"[gallery][debug]   协议相对图URL样例: %@", [decoded substringWithRange:[pm.firstObject range]]);
+    }
     return [result copy];
 }
 - (void)parseDouyinURL:(NSString *)url
