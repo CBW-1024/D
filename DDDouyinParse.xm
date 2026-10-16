@@ -351,26 +351,12 @@ static NSString *const DDPMobileUA  = @"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 
     dispatch_async(dispatch_get_main_queue(), ^{ [self.webView loadRequest:request]; });
 }
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
-    // v.douyin.com 短链会 302 到 iesdouyin.com/share/<type>/<id>，该落地页无图集/直链数据；
-    // 提取 type+id 改加载规范 www.douyin.com/<type>/<id>（已非 share 路径，不会循环重导）
+    // v.douyin.com 短链会 302 到 iesdouyin.com/share/<type>/<id>，统一留在当前分享页轮询即可：
+    // 视频靠分享页内嵌 playwm；图集靠分享页内嵌 urlList（移动 UA 下 www.douyin.com/note 只给壳页，故不跳）。
     NSString *u = webView.URL.absoluteString ?: @"";
     NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"/share/(note|video)/(\\d+)" options:NSRegularExpressionCaseInsensitive error:nil];
     NSTextCheckingResult *m = [re firstMatchInString:u options:0 range:NSMakeRange(0, u.length)];
     DDDLog(@"[fetch] didFinish url=%@ share匹配=%@", u, m ? @"YES" : @"NO");
-    if (m) {
-        NSString *type = [u substringWithRange:[m rangeAtIndex:1]];
-        NSString *awemeId = [u substringWithRange:[m rangeAtIndex:2]];
-        NSString *canon = [NSString stringWithFormat:@"https://www.douyin.com/%@/%@", type, awemeId];
-        // 图集：移动 UA 下统一跳规范地址（不再切桌面 UA）。若仍拿壳页，下一步考虑不跳、留在 iesdouyin.com/share/note
-        if ([type caseInsensitiveCompare:@"note"] == NSOrderedSame) {
-            self.fetchStart = CFAbsoluteTimeGetCurrent();
-            DDDLog(@"[fetch] note → 跳规范 %@", canon);
-            [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:canon]]];
-            return;
-        }
-        // 视频：分享页自带播放器，JS 执行后 playwm 会进 DOM，留在当前页轮询即可
-        // （实测 attempt=0 即命中；跳到裸规范地址反而会丢分享授权参数）
-    }
     [self pollHTML:webView attempt:0];
 }
 // 抖音 H5 懒加载：首轮 outerHTML 常无 playwm，故每 0.5s 轮询，命中即收，最多 5s
