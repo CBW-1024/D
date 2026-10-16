@@ -301,6 +301,222 @@ static void DDPShowDone(NSString *text) {
     dispatch_async(dispatch_get_main_queue(), ^{ DDPHideLoading(); [DDPToast() showDoneToastWithText:text]; });
 }
 
+#pragma mark - 抖音官方 API 路线（对齐 ZDY：ttwid 注册 + aweme/detail + iesdouyin 兜底）
+
+// 枚举提前到此处，供 API 模块与 DDPEngine 共用
+typedef NS_ENUM(NSInteger, DDPMediaType) {
+    DDPMediaTypeUnknown = -1,
+    DDPMediaTypeVideo   = 0,
+    DDPMediaTypeImage   = 1,
+};
+
+static NSString * const kDDPDesktopUA = @"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+// 从 URL/文本提取 aweme_id（优先 /video|note|slides/<id>，后备 modal_id|aweme_id|item_ids?|itemId=）
+static NSString *DDPExtractAwemeId(NSString *text) {
+    NSArray *pres = @[
+        @"/(?:share/)?(?:video|note|slides)/(\\d{15,25})",
+        @"(?:modal_id|aweme_id|item_ids?|itemId)[=:\"](\\d{15,25})"
+    ];
+    for (NSString *pat in pres) {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pat options:NSRegularExpressionCaseInsensitive error:nil];
+        NSArray *ms = [re matchesInString:text options:0 range:NSMakeRange(0, text.length)];
+        if (ms.count) return [text substringWithRange:[ms.firstObject rangeAtIndex:1]];
+    }
+    return nil;
+}
+
+// 取 douyin.com / iesdouyin.com 域名的 cookie 拼成 Cookie 头；extraTtwid 非 nil 时追加到最前
+static NSString *DDPDouyinCookieHeader(NSString *extraTtwid) {
+    NSMutableArray *parts = [NSMutableArray array];
+    if (extraTtwid.length) [parts addObject:[NSString stringWithFormat:@"ttwid=%@", extraTtwid]];
+    NSHTTPCookieStorage *store = [NSHTTPCookieStorage sharedHTTPCookieStorage];
+    for (NSHTTPCookie *c in store.cookies) {
+        NSString *dom = c.domain ?: @"";
+        if ([dom containsString:@"douyin.com"] || [dom containsString:@"iesdouyin.com"])
+            [parts addObject:[NSString stringWithFormat:@"%@=%@", c.name, c.value]];
+    }
+    return [parts componentsJoinedByString:@"; "];
+}
+
+// 同步 HTTP（后台线程调用，信号量阻塞）。返回 data；HTTP 状态码写入 *outCode（失败写 -1）
+static NSData *DDPApiHttp(NSString *url, NSString *method, NSDictionary *headers, NSData *body, NSTimeInterval timeout, NSInteger *outCode) {
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
+    req.HTTPMethod = method ?: @"GET";
+    req.timeoutInterval = timeout;
+    [req setValue:kDDPDesktopUA forHTTPHeaderField:@"User-Agent"];
+    [headers enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) { [req setValue:v forHTTPHeaderField:k]; }];
+    if (body) { [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"]; req.HTTPBody = body; }
+    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
+    __block NSData *result = nil; __block NSInteger code = -1;
+    dispatch_semaphore_t sema = dispatch_semaphore_create(0);
+    [[session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        if ([resp isKindOfClass:[NSHTTPURLResponse class]]) code = (NSInteger)((NSHTTPURLResponse *)resp).statusCode;
+        if (!err && data) result = data;
+        dispatch_semaphore_signal(sema);
+    }] resume];
+    dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
+    [session finishTasksAndInvalidate];
+    if (outCode) *outCode = code;
+    return result;
+}
+
+// 递归定位含 aweme_id==targetId 且带 video/images/image_post_info 的详情对象
+static id DDPJsonFindAweme(id obj, NSString *targetId) {
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *d = (NSDictionary *)obj;
+        id aid = d[@"aweme_id"];
+        if (aid != nil) {
+            BOOL match = [[NSString stringWithFormat:@"%@", aid] isEqualToString:targetId];
+            BOOL hasMedia = d[@"video"] != nil || d[@"images"] != nil || d[@"image_post_info"] != nil;
+            if (match && hasMedia) return d;
+        }
+        for (id key in d) { id r = DDPJsonFindAweme(d[key], targetId); if (r) return r; }
+    } else if ([obj isKindOfClass:[NSArray class]]) {
+        for (id el in (NSArray *)obj) { id r = DDPJsonFindAweme(el, targetId); if (r) return r; }
+    }
+    return nil;
+}
+
+// 水印/官方 logo 链判定（命中即丢弃）
+static BOOL DDPUrlIsWatermark(NSString *u) {
+    NSArray *bad = @[@"playwm", @"watermark", @"tplv-dy-water", @"/logo/", @"logo_type", @"wm_video", @"_wm_"];
+    for (NSString *b in bad) if ([u containsString:b]) return YES;
+    return NO;
+}
+
+// 图集：images[].download_addr.url_list[0]（回退 image_post_info.images）
+static NSArray *DDPExtractImageURLsFromJson(NSDictionary *aweme) {
+    NSMutableArray *out = [NSMutableArray array];
+    NSArray *images = aweme[@"images"];
+    if (![images isKindOfClass:[NSArray class]]) {
+        NSDictionary *ipo = aweme[@"image_post_info"];
+        if ([ipo isKindOfClass:[NSDictionary class]]) images = ipo[@"images"];
+    }
+    for (NSDictionary *img in images) {
+        if (![img isKindOfClass:[NSDictionary class]]) continue;
+        NSString *u = nil;
+        NSDictionary *da = img[@"download_addr"];
+        if ([da isKindOfClass:[NSDictionary class]]) u = [da[@"url_list"] firstObject] ?: [da[@"download_url_list"] firstObject];
+        if (!u.length) u = [img[@"url_list"] firstObject];
+        if (u.length && ![out containsObject:u]) [out addObject:u];
+    }
+    return out;
+}
+
+// 视频：play_addr → play_addr_h264 → play_addr_265 → download_addr → play_addr_lowbr，遍历 url_list 取首条干净直链
+static NSString *DDPFirstPlayURL(NSDictionary *video) {
+    NSArray *keys = @[@"play_addr", @"play_addr_h264", @"play_addr_265", @"download_addr", @"play_addr_lowbr"];
+    for (NSString *k in keys) {
+        NSDictionary *pa = video[k];
+        if (![pa isKindOfClass:[NSDictionary class]]) continue;
+        NSArray *list = pa[@"url_list"];
+        if (![list isKindOfClass:[NSArray class]]) list = pa[@"download_url_list"];
+        if (![list isKindOfClass:[NSArray class]] && pa[@"url"]) list = @[pa[@"url"]];
+        for (id u in list) {
+            if ([u isKindOfClass:[NSString class]] && ((NSString *)u).length && !DDPUrlIsWatermark(u)) return u;
+        }
+    }
+    return nil;
+}
+
+@interface DDPApiParser : NSObject
++ (instancetype)shared;
+- (void)parseURL:(NSString *)url completion:(void (^)(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err))completion;
+@end
+
+@implementation DDPApiParser {
+    dispatch_queue_t _apiQueue;
+    NSString *_cachedTtwid;
+}
++ (instancetype)shared { static DDPApiParser *i; static dispatch_once_t once; dispatch_once(&once, ^{ i = [[self alloc] init]; }); return i; }
+- (instancetype)init { if (self = [super init]) _apiQueue = dispatch_queue_create("ddp.api", DISPATCH_QUEUE_SERIAL); return self; }
+
+- (void)parseURL:(NSString *)url completion:(void (^)(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err))completion {
+    dispatch_async(_apiQueue, ^{
+        NSString *awemeId = DDPExtractAwemeId(url);
+        DDDLog(@"[API] 入参=%@ aweme_id=%@", url, awemeId);
+        if (!awemeId.length) {
+            DDDLog(@"[API] 未提取到 aweme_id，放弃 API 路线");
+            if (completion) completion(DDPMediaTypeUnknown, nil, nil, [NSError errorWithDomain:@"DDP-API" code:-10 userInfo:@{@"reason":@"no aweme_id"}]);
+            return;
+        }
+        NSString *ttwid = [self registerTtwid];
+        DDDLog(@"[API] ttwid=%@", ttwid ?: @"(空)");
+        NSDictionary *detail = [self fetchDetail:awemeId ttwid:ttwid];
+        if (!detail) detail = [self fetchIesDouyin:awemeId ttwid:ttwid];
+        if (!detail) {
+            DDDLog(@"[API] 主/备端点均无数据，交给 WebView 兜底");
+            if (completion) completion(DDPMediaTypeUnknown, nil, nil, [NSError errorWithDomain:@"DDP-API" code:-11 userInfo:@{@"reason":@"no api data"}]);
+            return;
+        }
+        NSArray *images = DDPExtractImageURLsFromJson(detail);
+        NSString *video = nil;
+        NSDictionary *videoObj = detail[@"video"];
+        if ([videoObj isKindOfClass:[NSDictionary class]]) video = DDPFirstPlayURL(videoObj);
+        if (video.length) { DDDLog(@"[API] ★视频直链命中"); if (completion) completion(DDPMediaTypeVideo, video, nil, nil); }
+        else if (images.count) { DDDLog(@"[API] ★图集命中 数=%lu", (unsigned long)images.count); if (completion) completion(DDPMediaTypeImage, nil, images, nil); }
+        else { DDDLog(@"[API] 取到详情对象但无直链字段，交给 WebView 兜底"); if (completion) completion(DDPMediaTypeUnknown, nil, nil, [NSError errorWithDomain:@"DDP-API" code:-12 userInfo:@{@"reason":@"no media field"}]); }
+    });
+}
+
+- (NSString *)registerTtwid {
+    @synchronized (self) { if (_cachedTtwid.length) return _cachedTtwid; }
+    NSDictionary *body = @{@"region":@"cn", @"aid":@6383, @"needFid":@NO, @"service":@"www.douyin.com",
+        @"migrate_info":@{@"ticket":@"source", @"source":@"node"}, @"cbUrlProtocol":@"https", @"union":@YES};
+    NSData *data = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+    NSInteger code = 0;
+    NSData *resp = DDPApiHttp(@"https://ttwid.bytedance.com/ttwid/union/register/", @"POST",
+        @{@"Accept":@"application/json"}, data, 20.0, &code);
+    DDDLog(@"[API] ttwid注册 HTTP=%ld 字节=%lu", (long)code, (unsigned long)(resp ? resp.length : 0));
+    NSString *t = nil;
+    if (resp.length) {
+        id json = [NSJSONSerialization JSONObjectWithData:resp options:0 error:nil];
+        if ([json isKindOfClass:[NSDictionary class]]) {
+            id d = json[@"data"];
+            if ([d isKindOfClass:[NSDictionary class]]) t = d[@"ttwid"];
+            if (!t) t = json[@"ttwid"];
+        }
+    }
+    if ([t isKindOfClass:[NSString class]] && ((NSString *)t).length) { @synchronized (self) { _cachedTtwid = t; } }
+    return t;
+}
+
+- (NSDictionary *)fetchDetail:(NSString *)awemeId ttwid:(NSString *)ttwid {
+    NSString *url = [NSString stringWithFormat:@"https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=%@&aid=6383&device_platform=webapp&channel=channel_pc_web&version_code=170400&version_name=17.4.0&request_from=web&pc_client_type=1&os_version=10.15.7&browser_language=zh-CN&browser_platform=MacIntel&browser_name=Chrome&browser_version=120.0.0.0&platform=PC&cookie_enabled=true", awemeId];
+    NSMutableDictionary *headers = [@{@"Accept":@"application/json, text/plain, */*", @"Accept-Language":@"zh-CN,zh;q=0.9",
+        @"Referer":@"https://www.douyin.com/", @"Origin":@"https://www.douyin.com"} mutableCopy];
+    NSString *cookie = DDPDouyinCookieHeader(ttwid);
+    if (cookie.length) headers[@"Cookie"] = cookie;
+    NSInteger code = 0;
+    NSData *resp = DDPApiHttp(url, @"GET", headers, nil, 25.0, &code);
+    DDDLog(@"[API] aweme/detail HTTP=%ld 字节=%lu", (long)code, (unsigned long)(resp ? resp.length : 0));
+    if (!resp.length) return nil;
+    id json = [NSJSONSerialization JSONObjectWithData:resp options:0 error:nil];
+    if (![json isKindOfClass:[NSDictionary class]]) return nil;
+    NSDictionary *d = DDPJsonFindAweme(json, awemeId);
+    if (d) DDDLog(@"[API] aweme/detail 命中详情对象");
+    return d;
+}
+
+- (NSDictionary *)fetchIesDouyin:(NSString *)awemeId ttwid:(NSString *)ttwid {
+    NSString *url = [NSString stringWithFormat:@"https://www.iesdouyin.com/web/api/v2/aweme/iteminfo/?item_ids=%@", awemeId];
+    NSMutableDictionary *headers = [@{@"Accept":@"application/json", @"Referer":@"https://www.iesdouyin.com/"} mutableCopy];
+    NSString *cookie = DDPDouyinCookieHeader(ttwid);
+    if (cookie.length) headers[@"Cookie"] = cookie;
+    NSInteger code = 0;
+    NSData *resp = DDPApiHttp(url, @"GET", headers, nil, 20.0, &code);
+    DDDLog(@"[API] iesdouyin HTTP=%ld 字节=%lu", (long)code, (unsigned long)(resp ? resp.length : 0));
+    if (!resp.length) return nil;
+    id json = [NSJSONSerialization JSONObjectWithData:resp options:0 error:nil];
+    if (![json isKindOfClass:[NSDictionary class]]) return nil;
+    NSDictionary *d = DDPJsonFindAweme(json, awemeId);
+    if (d) DDDLog(@"[API] iesdouyin 命中详情对象");
+    return d;
+}
+@end
+
 #pragma mark - 抓取（离屏 WKWebView，轮询 playwm）
 
 static const NSInteger DDPCodeGallery = 0x4161;   // 图集类型标记
@@ -439,12 +655,6 @@ static const NSInteger DDPMaxRetries = 3;          // 最多重载 3 次（实�
 
 #pragma mark - 解析引擎
 
-typedef NS_ENUM(NSInteger, DDPMediaType) {
-    DDPMediaTypeUnknown = -1,
-    DDPMediaTypeVideo   = 0,
-    DDPMediaTypeImage   = 1,
-};
-
 @interface DDPEngine : NSObject
 + (instancetype)shared;
 - (void)parseDouyinURL:(NSString *)url
@@ -504,13 +714,23 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
 }
 - (void)parseDouyinURL:(NSString *)url
             completion:(void (^)(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err))completion {
-    [[DDPWebFetcher sharedFetcher] fetchHTMLFromURL:url completion:^(NSString *html, NSInteger errCode) {
-        if (!html.length) { if (completion) completion(DDPMediaTypeUnknown, nil, nil, [NSError errorWithDomain:@"DDP" code:-2 userInfo:nil]); return; }
-        NSArray *videos = [self extractVideoLinksFromHTML:html];
-        if (videos.count) { if (completion) completion(DDPMediaTypeVideo, videos.firstObject, nil, nil); return; }
-        NSArray *images = [self extractGalleryImagesFromHTML:html];
-        if (images.count) { if (completion) completion(DDPMediaTypeImage, nil, images, nil); return; }
-        if (completion) completion(DDPMediaTypeUnknown, nil, nil, [NSError errorWithDomain:@"DDP" code:-3 userInfo:nil]);
+    DDDLog(@"parseDouyinURL 入参=%@", url);
+    // API 优先（对齐 ZDY 官方路线：ttwid + aweme/detail，能过分享页 sec_did 封锁），失败再回退 WebView SSR 路线
+    [[DDPApiParser shared] parseURL:url completion:^(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err) {
+        if (err == nil && type != DDPMediaTypeUnknown && (videoURL.length || imageURLs.count)) {
+            DDDLog(@"parseDouyinURL → API 命中 type=%ld", (long)type);
+            if (completion) completion(type, videoURL, imageURLs, nil);
+            return;
+        }
+        DDDLog(@"parseDouyinURL → API 未命中(err=%@)，回退 WebView 路线", err);
+        [[DDPWebFetcher sharedFetcher] fetchHTMLFromURL:url completion:^(NSString *html, NSInteger errCode) {
+            if (!html.length) { if (completion) completion(DDPMediaTypeUnknown, nil, nil, [NSError errorWithDomain:@"DDP" code:-2 userInfo:nil]); return; }
+            NSArray *videos = [self extractVideoLinksFromHTML:html];
+            if (videos.count) { if (completion) completion(DDPMediaTypeVideo, videos.firstObject, nil, nil); return; }
+            NSArray *images = [self extractGalleryImagesFromHTML:html];
+            if (images.count) { if (completion) completion(DDPMediaTypeImage, nil, images, nil); return; }
+            if (completion) completion(DDPMediaTypeUnknown, nil, nil, [NSError errorWithDomain:@"DDP" code:-3 userInfo:nil]);
+        }];
     }];
 }
 // 同步下载（信号量阻塞）
@@ -529,14 +749,17 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
     NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
     cfg.timeoutIntervalForRequest = 60;
     NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
-    __block NSData *result = nil;
+    __block NSData *result = nil; __block NSInteger dcode = -1; __block NSString *derr = nil;
     dispatch_semaphore_t sema = dispatch_semaphore_create(0);
     [[session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        if ([resp isKindOfClass:[NSHTTPURLResponse class]]) dcode = (NSInteger)((NSHTTPURLResponse *)resp).statusCode;
+        derr = err.localizedDescription;
         if (!err && data) result = data;
         dispatch_semaphore_signal(sema);
     }] resume];
     dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
     [session finishTasksAndInvalidate];
+    DDDLog(@"downloadMedia: 字节=%lu HTTP=%ld err=%@ url=%@", (unsigned long)(result ? result.length : 0), (long)dcode, derr ?: @"nil", ([url length] > 120) ? [[url substringToIndex:120] stringByAppendingString:@"…"] : url);
     return result;
 }
 @end
@@ -1043,7 +1266,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     Class mgrCls = objc_getClass("WCPluginsMgr");
     if (mgrCls) {
         [[mgrCls sharedInstance] registerControllerWithTitle:@"DD抖音解析"
-                                                     version:@"1.0.0"
+                                                     version:@"1.1.0"
                                                   controller:@"DDPDouyinParseSettingsViewController"];
     }
 }
