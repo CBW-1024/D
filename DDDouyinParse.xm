@@ -311,9 +311,8 @@ static const NSInteger DDPCodeGallery = 0x4161;   // 图集类型标记
 // ② 桌面版 Safari：www.douyin.com/note/<id> 给 900KB 真页（含图集数据）；但桌面 UA 下视频短链 302 到
 //    www.douyin.com/video/<id> 的 SPA 壳页（数据走 XHR，outerHTML 无 playwm），视频解析失败。
 // ③ 微信 UA(原 GetMMUserAgent) 最差：被当 App 内嵌 webview，图集/视频都发壳页。
-// 策略：默认移动 UA（视频开箱即用）；图集在跳规范地址前临时切桌面 UA 再加载。
+// 统一策略：全程只用移动版 Safari UA（视频/图集/下载都一致）。
 static NSString *const DDPMobileUA  = @"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1";
-static NSString *const DDPDesktopUA = @"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15";
 
 @interface DDPWebFetcher : NSObject <WKNavigationDelegate>
 @property (nonatomic, readonly) WKWebView *webView;
@@ -336,7 +335,7 @@ static NSString *const DDPDesktopUA = @"Mozilla/5.0 (Macintosh; Intel Mac OS X 1
         WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
         config.defaultWebpagePreferences.allowsContentJavaScript = YES;   // 替代已废弃的 javaScriptEnabled
         _webView = [[WKWebView alloc] initWithFrame:CGRectZero configuration:config];
-        _webView.customUserAgent = DDPMobileUA;   // 默认移动 UA（视频开箱即用）；图集跳转时临时切桌面 UA
+        _webView.customUserAgent = DDPMobileUA;   // 全程移动 UA
         _webView.navigationDelegate = self;
         _webView.hidden = YES;   // WKWebView 独立进程渲染，无需挂窗口；hidden 防误显示
     }
@@ -344,7 +343,7 @@ static NSString *const DDPDesktopUA = @"Mozilla/5.0 (Macintosh; Intel Mac OS X 1
 }
 - (void)fetchHTMLFromURL:(NSString *)url completion:(void (^)(NSString *html, NSInteger errCode))completion {
     self.completion = completion;     self.hasCompleted = NO;
-    // 每次抓取重置为移动 UA：避免上一次图集跳转遗留的桌面 UA 污染本次视频抓取
+    // 全程移动 UA（已统一，无需按类型切换）
     self.webView.customUserAgent = DDPMobileUA;
     NSURL *nsurl = [NSURL URLWithString:url];
     NSURLRequest *request = [NSURLRequest requestWithURL:nsurl cachePolicy:NSURLRequestUseProtocolCachePolicy timeoutInterval:30.0];
@@ -362,11 +361,10 @@ static NSString *const DDPDesktopUA = @"Mozilla/5.0 (Macintosh; Intel Mac OS X 1
         NSString *type = [u substringWithRange:[m rangeAtIndex:1]];
         NSString *awemeId = [u substringWithRange:[m rangeAtIndex:2]];
         NSString *canon = [NSString stringWithFormat:@"https://www.douyin.com/%@/%@", type, awemeId];
-        // 图集：移动 UA 下 www.douyin.com/note 给壳页，必须临时切桌面 UA 再加载规范地址才拿得到 900KB 真页
+        // 图集：移动 UA 下统一跳规范地址（不再切桌面 UA）。若仍拿壳页，下一步考虑不跳、留在 iesdouyin.com/share/note
         if ([type caseInsensitiveCompare:@"note"] == NSOrderedSame) {
-            webView.customUserAgent = DDPDesktopUA;
             self.fetchStart = CFAbsoluteTimeGetCurrent();
-            DDDLog(@"[fetch] note → 跳规范(桌面UA) %@", canon);
+            DDDLog(@"[fetch] note → 跳规范 %@", canon);
             [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:canon]]];
             return;
         }
