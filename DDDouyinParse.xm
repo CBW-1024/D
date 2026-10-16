@@ -355,8 +355,12 @@ static UIWindow *DDPHostWindow(void) {
 @property (nonatomic, strong) WKWebView *webView;
 @property (nonatomic, assign) unsigned int retries;
 @property (nonatomic, assign) BOOL hasCompleted;
+@property (nonatomic, assign) BOOL warmingUp;      // 预热导航期间跳过抠 HTML
+@property (nonatomic, assign) double startAt;      // 本次抓取起点（CFAbsoluteTime），用于耗时日志
 @property (nonatomic, copy) void (^completion)(NSString *html, NSInteger code, NSError *error);
 + (instancetype)sharedFetcher;
++ (void)ddpWarmup;                                              // 预热：建单例 + 挂窗 + 冷启动 WebContent
++ (void)ddpWarmupStep:(int)step;                                // 预热内部：主窗口未就绪时退避重试挂窗
 - (void)fetchHTMLFromURL:(NSString *)url completion:(void (^)(NSString *html, NSInteger code, NSError *error))completion;
 - (void)cleanupWebView;
 - (void)ddpRetryLoop:(NSURLRequest *)req;                       // PKC block@0x3cae8
@@ -370,43 +374,86 @@ static UIWindow *DDPHostWindow(void) {
 }
 
 // PKC -init@0x3c340：建一次 WKWebView → 开 JS → 换 UA → 设代理 → 挂主窗口 → frame=窗口 bounds → hidden=YES
+// 注意：本方法很可能被 %ctor 的预热在极早期调用，此时 app 主窗口可能还没建好（win=nil）。
+// 挂不上的话由 -fetchHTMLFromURL: 的补挂分支兜底（见下）。
 - (instancetype)init {
     if (self = [super init]) {
         WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
         config.defaultWebpagePreferences.allowsContentJavaScript = YES;   // 等价 PKC 的 [prefs setJavaScriptEnabled:YES]
         _webView = [[WKWebView alloc] initWithFrame:CGRectZero configuration:config];
-        _webView.customUserAgent = [%c(CUtility) GetMMUserAgent];
+        NSString *ua = [%c(CUtility) GetMMUserAgent];
+        _webView.customUserAgent = ua;
         _webView.navigationDelegate = self;
         UIWindow *win = DDPHostWindow();
         if (win) { [win addSubview:_webView]; _webView.frame = win.bounds; }
         _webView.hidden = YES;
+        DDDLog(@"WebView init：挂窗=%@ UA长度=%lu", win ? @"成功" : @"失败(待补挂)", (unsigned long)ua.length);
     }
     return self;
+}
+
+// 预热（实测必需）：PKC 的 WebView 是常驻单例、tweak 初始化时就建好并已跑过页面，
+// 所以它的首轮（等 retries=2 秒）就能命中。我们原来是懒加载，第一次解析才 init，
+// 冷启动 WebContent 进程 2 秒根本不够 → 首轮必 miss → 只能靠后面几轮硬撞，实测 58 秒。
+// 这里把冷启动成本提前付掉：建单例 + 挂窗 + 跑一个空文档把 WebContent 进程拉起来。
++ (void)ddpWarmup {
+    dispatch_async(dispatch_get_main_queue(), ^{ [self ddpWarmupStep:0]; });
+}
++ (void)ddpWarmupStep:(int)step {
+    DDPWebFetcher *f = [self sharedFetcher];
+    if (!f.webView.window) {                       // 还没真正挂到窗口层级上
+        UIWindow *win = DDPHostWindow();
+        if (!win) {
+            if (step >= 20) { DDDLog(@"预热：等了 20 次仍无主窗口，放弃（将退化为懒加载+补挂）"); return; }
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ [self ddpWarmupStep:step + 1]; });
+            return;
+        }
+        [win addSubview:f.webView];
+        f.webView.frame = win.bounds;
+        f.webView.hidden = YES;
+        DDDLog(@"预热：第 %d 次尝试挂窗成功", step);
+    }
+    f.warmingUp = YES;                             // 预热导航不参与抠 HTML
+    [f.webView loadHTMLString:@"<!DOCTYPE html><html><body>ddp</body></html>" baseURL:nil];
+    DDDLog(@"预热：已发起空文档导航 step=%d", step);
 }
 
 // PKC -fetchHTMLFromURL:completion:@0x3c6d8
 - (void)fetchHTMLFromURL:(NSString *)url completion:(void (^)(NSString *html, NSInteger code, NSError *error))completion {
     self.completion = completion;
     self.hasCompleted = NO;
+    self.startAt = CFAbsoluteTimeGetCurrent();
+    // 预热导航可能还没回来（WebContent 进程启动慢），此时用户就开始解析了；
+    // 若不清标志，这次真实导航的 didFinish 会被当成预热而跳过，白白吃掉首轮机会。
+    self.warmingUp = NO;
     NSURL *u = [NSURL URLWithString:url];
     if (!u) {
         NSError *err = [NSError errorWithDomain:@"InvalidURL" code:1001
                                       userInfo:@{NSLocalizedDescriptionKey: @"Invalid URL string"}];
+        DDDLog(@"fetchHTMLFromURL: URL 非法 → %@", url);
         if (completion) completion(nil, 0, err);
         return;
     }
     NSURLRequest *req = [NSURLRequest requestWithURL:u cachePolicy:NSURLRequestUseProtocolCachePolicy timeoutInterval:30.0];
 
-    // PKC 的 pkcDyJxHtEnable 开关：关闭且代理脱落时，重新挂载（addSubview + frame + hidden）
-    if (!_webView.navigationDelegate) {
-        _webView.navigationDelegate = self;
+    // 补挂：预热若因主窗口还没建好而没挂上，这里再试一次。
+    // 判定用 webView.window（是否真在窗口层级里），而不是 navigationDelegate —— 后者 init 时就设过、
+    // 永远非空，照 PKC 原样写的那个分支是死的，永远不会补挂。
+    if (!_webView.window) {
         UIWindow *win = DDPHostWindow();
-        if (win) { [win addSubview:_webView]; _webView.frame = win.bounds; }
-        _webView.hidden = YES;
+        if (win) {
+            [win addSubview:_webView];
+            _webView.frame = win.bounds;
+            DDDLog(@"fetchHTMLFromURL: WebView 未挂窗 → 已补挂");
+        } else {
+            DDDLog(@"fetchHTMLFromURL: 警告——拿不到主窗口，WebView 游离（解析大概率失败）");
+        }
+        _webView.navigationDelegate = self;
     }
     _webView.hidden = YES;
 
-    DDDLog(@"fetchHTMLFromURL: %@", url);
+    DDDLog(@"fetchHTMLFromURL: %@（挂窗=%@）", url, _webView.window ? @"是" : @"否");
     // PKC：dispatch_async(全局队列, block@0x3cae8) 跑重载驱动
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{ [self ddpRetryLoop:req]; });
 }
@@ -416,19 +463,30 @@ static UIWindow *DDPHostWindow(void) {
 //   最多 11 轮，全 miss 才回调 error 500；一旦命中（hasCompleted）立刻退出
 - (void)ddpRetryLoop:(NSURLRequest *)req {
     self.retries = 1;
+    int round = 0;
     if (self.hasCompleted) { [self cleanupWebView]; return; }
     while (self.retries != 0 && self.retries < 11) {
+        round++;
+        DDDLog(@"[轮%d] loadRequest（retries=%u，累计%.1fs）", round, self.retries, CFAbsoluteTimeGetCurrent() - self.startAt);
         dispatch_async(dispatch_get_main_queue(), ^{
             [self.webView loadRequest:req];
             self.retries = self.retries + 1;
         });
-        sleep((unsigned)(self.retries + 10));
-        if (self.hasCompleted) break;
+        // 这里读到的 retries 可能是 1 也可能是 2：主队列那个 block 是否已执行不确定（PKC 原样竞态）
+        unsigned sl = (unsigned)(self.retries + 10);
+        DDDLog(@"[轮%d] sleep(%u)s 开始（累计%.1fs）", round, sl, CFAbsoluteTimeGetCurrent() - self.startAt);
+        sleep(sl);
+        if (self.hasCompleted) {
+            DDDLog(@"[轮%d] 唤醒，已命中 → 退出（累计%.1fs）", round, CFAbsoluteTimeGetCurrent() - self.startAt);
+            break;
+        }
+        DDDLog(@"[轮%d] 唤醒，未命中 → 再来一轮（累计%.1fs）", round, CFAbsoluteTimeGetCurrent() - self.startAt);
     }
     if (self.retries >= 11 && self.completion && !self.hasCompleted) {
         self.hasCompleted = YES;
         NSError *err = [NSError errorWithDomain:@"DDP" code:500
                                       userInfo:@{NSLocalizedDescriptionKey: @"页面加载超时，请重试"}];
+        DDDLog(@"[轮%d] 达到 11 轮上限，放弃（累计%.1fs）", round, CFAbsoluteTimeGetCurrent() - self.startAt);
         self.completion(nil, 0, err);
     }
     [self cleanupWebView];
@@ -439,7 +497,15 @@ static UIWindow *DDPHostWindow(void) {
 
 // PKC -webView:didFinishNavigation:@0x3cd0c：等 retries 秒再抠 outerHTML
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
+    // 预热导航：只用来把 WebContent 进程拉起来，不抠 HTML（否则空文档会走一遍 miss 分支）
+    if (self.warmingUp) {
+        self.warmingUp = NO;
+        DDDLog(@"预热：空文档导航完成，WebContent 进程已就绪");
+        return;
+    }
     int64_t delay = (int64_t)((unsigned long long)self.retries * NSEC_PER_SEC) + 5;   // PKC: (int64_t)(retries*1e9 + 5.0)
+    DDDLog(@"didFinish（累计%.1fs）→ 等 %llds 再抠 outerHTML（retries=%u）",
+           CFAbsoluteTimeGetCurrent() - self.startAt, (long long)(delay / NSEC_PER_SEC), self.retries);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay), dispatch_get_main_queue(), ^{
         [webView evaluateJavaScript:@"document.documentElement.outerHTML" completionHandler:^(id result, NSError *error) {
             [self ddpHandleHTML:result error:error];
@@ -449,8 +515,9 @@ static UIWindow *DDPHostWindow(void) {
 
 // PKC 的 JS 回调 block@0x3ce34：还原转义 → 风控提示 → 打标记 → 命中才回调
 - (void)ddpHandleHTML:(id)result error:(NSError *)error {
-    if (error) return;
-    if (![result isKindOfClass:[NSString class]]) return;   // 防 setString: 收到非字符串
+    double el = CFAbsoluteTimeGetCurrent() - self.startAt;
+    if (error) { DDDLog(@"抠HTML：JS 报错 %@（累计%.1fs）", error.localizedDescription, el); return; }
+    if (![result isKindOfClass:[NSString class]]) { DDDLog(@"抠HTML：结果非字符串，跳过（累计%.1fs）", el); return; }
     NSMutableString *html = [NSMutableString string];
     [html setString:result];
     NSRange full = NSMakeRange(0, html.length);
@@ -469,13 +536,19 @@ static UIWindow *DDPHostWindow(void) {
     NSInteger dur = [self extractDurationFromHTML:html];
     BOOL gallery = [html containsString:@"aweme-share-swiper-item"] || [html containsString:@"aweme-slides-swiper-item"];
     BOOL video   = [html containsString:@"video_id="];
+    DDDLog(@"抠HTML：长度=%lu gallery=%d video=%d dur=%ld risk=%d（累计%.1fs）",
+           (unsigned long)html.length, gallery, video, (long)dur, risk, el);
     // 三类标记全无 → 不回调，交给重载循环再来一轮（PKC 原样；
     // PKC 还比了一个 dur==0xF4161，那是死分支：dur 是「秒」，永远不可能等于 0xF4161）
-    if (!gallery && !video && dur != DDPCodeGallery) return;
+    if (!gallery && !video && dur != DDPCodeGallery) {
+        DDDLog(@"抠HTML：三个标记全无 → 本轮 miss，等重载循环");
+        return;
+    }
 
     NSInteger code = gallery ? DDPCodeGallery : dur;
     if (self.completion && !self.hasCompleted) {
         self.hasCompleted = YES;
+        DDDLog(@"抠HTML：命中 code=%ld → 回调（总耗时 %.1fs）", (long)code, CFAbsoluteTimeGetCurrent() - self.startAt);
         self.completion(html, code, nil);
     }
     self.retries = 0;   // 通知重载循环收工
@@ -1120,7 +1193,10 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     Class mgrCls = objc_getClass("WCPluginsMgr");
     if (mgrCls) {
         [[mgrCls sharedInstance] registerControllerWithTitle:@"DD抖音解析"
-                                                     version:@"1.2.0"
+                                                     version:@"1.2.1"
                                                   controller:@"DDPDouyinParseSettingsViewController"];
     }
+    // 预热：把 WebContent 进程冷启动的成本提前付掉（tweak 加载时就在后台建好 WebView 并跑一个空文档）。
+    // 不预热的话第一次解析要冷启动，首轮等 2 秒必然不够 → 靠后面几轮硬撞，实测 58 秒。
+    [DDPWebFetcher ddpWarmup];
 }
