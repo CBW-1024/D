@@ -305,11 +305,15 @@ static void DDPShowDone(NSString *text) {
 
 static const NSInteger DDPCodeGallery = 0x4161;   // 图集类型标记
 
-// 抓取/下载用 UA：必须是真实浏览器 UA。抖音按 UA 分流——
-// ① 微信 UA(原 GetMMUserAgent) 会被当成 App 内嵌 webview，发壳页/跳 App，图集取不到数据；
-// ② 桌面 Safari 会让视频短链 302 到 www.douyin.com/video/<id> 的 SPA 壳页（数据走 XHR，outerHTML 无 playwm），视频解析失败；
-// ③ 移动版 Safari：视频走回 iesdouyin.com/share/video/<id> 分享页（内嵌 playwm），图集也不被当微信壳页 —— 两端兼顾。
-static NSString *const DDPFetchUA = @"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1";
+// 抓取用 UA：抖音按 UA 分流，视频与图集诉求冲突，必须按类型分别设置：
+// ① 移动版 Safari（默认）：视频短链 302 到 iesdouyin.com/share/video/<id> 分享页，内嵌 playwm，视频解析可用；
+//    但移动 UA 下 www.douyin.com/note/<id> 会给壳页，图集取不到数据。
+// ② 桌面版 Safari：www.douyin.com/note/<id> 给 900KB 真页（含图集数据）；但桌面 UA 下视频短链 302 到
+//    www.douyin.com/video/<id> 的 SPA 壳页（数据走 XHR，outerHTML 无 playwm），视频解析失败。
+// ③ 微信 UA(原 GetMMUserAgent) 最差：被当 App 内嵌 webview，图集/视频都发壳页。
+// 策略：默认移动 UA（视频开箱即用）；图集在跳规范地址前临时切桌面 UA 再加载。
+static NSString *const DDPMobileUA  = @"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1";
+static NSString *const DDPDesktopUA = @"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15";
 
 @interface DDPWebFetcher : NSObject <WKNavigationDelegate>
 @property (nonatomic, readonly) WKWebView *webView;
@@ -332,7 +336,7 @@ static NSString *const DDPFetchUA = @"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 li
         WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
         config.defaultWebpagePreferences.allowsContentJavaScript = YES;   // 替代已废弃的 javaScriptEnabled
         _webView = [[WKWebView alloc] initWithFrame:CGRectZero configuration:config];
-        _webView.customUserAgent = DDPFetchUA;
+        _webView.customUserAgent = DDPMobileUA;   // 默认移动 UA（视频开箱即用）；图集跳转时临时切桌面 UA
         _webView.navigationDelegate = self;
         _webView.hidden = YES;   // WKWebView 独立进程渲染，无需挂窗口；hidden 防误显示
     }
@@ -340,6 +344,8 @@ static NSString *const DDPFetchUA = @"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 li
 }
 - (void)fetchHTMLFromURL:(NSString *)url completion:(void (^)(NSString *html, NSInteger errCode))completion {
     self.completion = completion;     self.hasCompleted = NO;
+    // 每次抓取重置为移动 UA：避免上一次图集跳转遗留的桌面 UA 污染本次视频抓取
+    self.webView.customUserAgent = DDPMobileUA;
     NSURL *nsurl = [NSURL URLWithString:url];
     NSURLRequest *request = [NSURLRequest requestWithURL:nsurl cachePolicy:NSURLRequestUseProtocolCachePolicy timeoutInterval:30.0];
     self.fetchStart = CFAbsoluteTimeGetCurrent();
@@ -356,10 +362,11 @@ static NSString *const DDPFetchUA = @"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 li
         NSString *type = [u substringWithRange:[m rangeAtIndex:1]];
         NSString *awemeId = [u substringWithRange:[m rangeAtIndex:2]];
         NSString *canon = [NSString stringWithFormat:@"https://www.douyin.com/%@/%@", type, awemeId];
-        // 图集：分享页只有渲染后的 DOM <img>、没有内嵌 JSON "images"，必须跳规范地址才取得到 url_list
+        // 图集：移动 UA 下 www.douyin.com/note 给壳页，必须临时切桌面 UA 再加载规范地址才拿得到 900KB 真页
         if ([type caseInsensitiveCompare:@"note"] == NSOrderedSame) {
+            webView.customUserAgent = DDPDesktopUA;
             self.fetchStart = CFAbsoluteTimeGetCurrent();
-            DDDLog(@"[fetch] note → 跳规范 %@", canon);
+            DDDLog(@"[fetch] note → 跳规范(桌面UA) %@", canon);
             [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:canon]]];
             return;
         }
@@ -587,7 +594,7 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
     [request setValue:@"bytes=0-" forHTTPHeaderField:@"Range"];
     [request setValue:url forHTTPHeaderField:@"Referer"];
     [request setValue:@"*/*" forHTTPHeaderField:@"Accept"];
-    [request setValue:DDPFetchUA forHTTPHeaderField:@"User-Agent"];
+    [request setValue:DDPMobileUA forHTTPHeaderField:@"User-Agent"];
 
     NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
     cfg.timeoutIntervalForRequest = 60;
