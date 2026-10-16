@@ -315,20 +315,20 @@ static NSString *DDPTempPathExt(NSString *url, NSString *ext) {
     return [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.%@", md5, ext]];
 }
 // 取 URL 后缀作为临时文件扩展名（默认 jpg）
+// 必须先截掉 ?/# 再取：图片直链形如 ...q80.webp?lk3s=xxx&x-expires=xxx，
+// 直接 pathExtension 会把整个 query 当成扩展名，临时文件名变成 <md5>.webp?lk3s=... 又脏又长
 static NSString *DDPImageExt(NSString *url) {
-    NSString *ue = [url pathExtension].lowercaseString;
+    NSString *s = url ?: @"";
+    NSRange t = [s rangeOfCharacterFromSet:[NSCharacterSet characterSetWithCharactersInString:@"?#"]];
+    if (t.location != NSNotFound) s = [s substringToIndex:t.location];
+    NSString *ue = [s pathExtension].lowercaseString;
     NSString *r = ue.length ? ue : @"jpg";
     DDDLogOnce([@"ext-" stringByAppendingString:r], @"[工具] DDPImageExt：%@ → %@%@", url, r, ue.length ? @"" : @"（走默认 jpg 兜底）");
     return r;
 }
 
-// 主窗口：单主窗口 app，直接取 AppDelegate.window，不遍历场景
-// 注：与上面的 DDPHostWindow() 功能重复（后者多了 connectedScenes 兜底），留着看日志确认调用点
-static inline UIWindow *DDPKeyWindow(void) {
-    UIWindow *w = UIApplication.sharedApplication.delegate.window;
-    DDDLogOnce((w ? @"keywin-Y" : @"keywin-N"), @"[工具] DDPKeyWindow 被调用，返回%@", w ? @"窗口" : @"nil");
-    return w;
-}
+// 主窗口统一用 DDPHostWindow()（见下方抓取区定义，含 connectedScenes 兜底）。
+// 原先这里还有个 DDPKeyWindow()，功能与之重复，日志确认过只有 3 处调用，已合并。
 
 static WeToast *DDPToast(void) { return [%c(WeToast) toast]; }
 static WeToast *gDDPBusyToast;
@@ -399,6 +399,7 @@ static UIWindow *DDPHostWindow(void) {
 @property (nonatomic, assign) unsigned int retries;
 @property (nonatomic, assign) BOOL hasCompleted;
 @property (nonatomic, assign) BOOL warmingUp;      // 预热导航期间跳过抠 HTML
+@property (nonatomic, assign) int  pollTicks;      // 本轮 reload 内已轮询到第几拍
 @property (nonatomic, assign) double startAt;      // 本次抓取起点（CFAbsoluteTime），用于耗时日志
 @property (nonatomic, copy) void (^completion)(NSString *html, NSInteger code, NSError *error);
 + (instancetype)sharedFetcher;
@@ -407,7 +408,8 @@ static UIWindow *DDPHostWindow(void) {
 - (void)fetchHTMLFromURL:(NSString *)url completion:(void (^)(NSString *html, NSInteger code, NSError *error))completion;
 - (void)cleanupWebView;
 - (void)ddpRetryLoop:(NSURLRequest *)req;                       // PKC block@0x3cae8
-- (void)ddpHandleHTML:(id)result error:(NSError *)error;        // PKC block@0x3ce34
+- (void)ddpPollHTML:(WKWebView *)webView;                       // 一轮 reload 内的多次采样（替代 PKC 的固定延时）
+- (BOOL)ddpHandleHTML:(id)result error:(NSError *)error;        // PKC block@0x3ce34，返回是否命中
 - (NSInteger)extractDurationFromHTML:(NSString *)html;          // PKC @0xe2210
 @end
 
@@ -538,7 +540,13 @@ static UIWindow *DDPHostWindow(void) {
 // PKC -webView:didStartProvisionalNavigation:@0x3cd08 —— 空实现（原样保留）
 - (void)webView:(WKWebView *)webView didStartProvisionalNavigation:(WKNavigation *)navigation {}
 
-// PKC -webView:didFinishNavigation:@0x3cd0c：等 retries 秒再抠 outerHTML
+// 这里偏离 PKC：PKC 是「didFinish 后固定等 retries 秒，抠一次，不中就等下一轮 reload」。
+// 实测问题：图集页是 SSR 直出，2 秒够；视频页是 SPA，轮1 只拿到 50993 字符（三标记全无）就判 miss，
+// 白等 11 秒后轮2 才拿到 143233 字符命中 —— 视频总耗时 16.1s。
+// 改成：didFinish 后按固定间隔反复抠，命中即回调，不再赌一个固定延时。
+static const NSInteger DDPMaxPoll = 12;          // 最多轮询 12 次
+static const double    DDMPollGap = 1.2;         // 每次间隔 1.2 秒（12 次 ≈ 14.4s 覆盖）
+
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
     // 预热导航：只用来把 WebContent 进程拉起来，不抠 HTML（否则空文档会走一遍 miss 分支）
     if (self.warmingUp) {
@@ -546,36 +554,52 @@ static UIWindow *DDPHostWindow(void) {
         DDDLog(@"预热：空文档导航完成，WebContent 进程已就绪");
         return;
     }
-    int64_t delay = (int64_t)((unsigned long long)self.retries * NSEC_PER_SEC) + 5;   // PKC: (int64_t)(retries*1e9 + 5.0)
-    DDDLog(@"didFinish（累计%.1fs）→ 等 %llds 再抠 outerHTML（retries=%u）",
-           CFAbsoluteTimeGetCurrent() - self.startAt, (long long)(delay / NSEC_PER_SEC), self.retries);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay), dispatch_get_main_queue(), ^{
+    DDDLog(@"didFinish（累计%.1fs）→ 开始轮询抠 HTML（间隔 %.1fs，最多 %ld 次）",
+           CFAbsoluteTimeGetCurrent() - self.startAt, DDMPollGap, (long)DDPMaxPoll);
+    self.pollTicks = 0;
+    [self ddpPollHTML:webView];
+}
+
+// 一轮 reload 内的多次采样：JS 还没渲染完就下一拍再来，命中即停
+- (void)ddpPollHTML:(WKWebView *)webView {
+    if (self.hasCompleted) return;
+    self.pollTicks = self.pollTicks + 1;
+    int tick = self.pollTicks;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(DDMPollGap * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (self.hasCompleted) return;                       // 已被别的拍命中
         [webView evaluateJavaScript:@"document.documentElement.outerHTML" completionHandler:^(id result, NSError *error) {
-            [self ddpHandleHTML:result error:error];
+            BOOL hit = [self ddpHandleHTML:result error:error];
+            if (!hit && !self.hasCompleted && tick < DDPMaxPoll) {
+                DDDLog(@"[轮询] 第 %d 拍未命中，再来（累计%.1fs）", tick, CFAbsoluteTimeGetCurrent() - self.startAt);
+                [self ddpPollHTML:webView];
+            } else if (!hit) {
+                DDDLog(@"[轮询] 第 %d 拍仍未命中，已达上限 → 交给重载循环 reload（累计%.1fs）",
+                       tick, CFAbsoluteTimeGetCurrent() - self.startAt);
+            }
         }];
     });
 }
 
 // PKC 的 JS 回调 block@0x3ce34：还原转义 → 风控提示 → 打标记 → 命中才回调
-- (void)ddpHandleHTML:(id)result error:(NSError *)error {
+// 返回是否命中，供 -ddpPollHTML: 决定要不要继续下一拍
+- (BOOL)ddpHandleHTML:(id)result error:(NSError *)error {
     double el = CFAbsoluteTimeGetCurrent() - self.startAt;
-    if (error) { DDDLog(@"抠HTML：JS 报错 %@（累计%.1fs）", error.localizedDescription, el); return; }
-    if (![result isKindOfClass:[NSString class]]) { DDDLog(@"抠HTML：结果非字符串，跳过（累计%.1fs）", el); return; }
+    if (error) { DDDLog(@"抠HTML：JS 报错 %@（累计%.1fs）", error.localizedDescription, el); return NO; }
+    if (![result isKindOfClass:[NSString class]]) { DDDLog(@"抠HTML：结果非字符串，跳过（累计%.1fs）", el); return NO; }
     NSMutableString *html = [NSMutableString string];
     [html setString:result];
     NSRange full = NSMakeRange(0, html.length);
-    // 逐步记录替换处数：哪一步恒为 0 就说明它没在干活，可以删
+    // 3 步清洗（原第 1 步 \u0026→& 经 4 次采样恒为 0 处，已删）
     NSUInteger len0 = html.length;
-    NSUInteger n1 = [html replaceOccurrencesOfString:@"\\u0026" withString:@"&" options:NSCaseInsensitiveSearch range:full];
-    full = NSMakeRange(0, html.length);
     NSUInteger n2 = [html replaceOccurrencesOfString:@"amp;" withString:@"" options:NSCaseInsensitiveSearch range:full];
     full = NSMakeRange(0, html.length);
     NSUInteger n3 = [html replaceOccurrencesOfString:@"u002F" withString:@"/" options:NSCaseInsensitiveSearch range:full];
     full = NSMakeRange(0, html.length);
     NSUInteger n4 = [html replaceOccurrencesOfString:@"\\" withString:@"" options:NSCaseInsensitiveSearch range:full];
-    DDDLog(@"[清洗] 长度 %lu→%lu｜\\u0026→& %lu 处｜amp;→空 %lu 处｜u002F→/ %lu 处｜\\→空 %lu 处",
+    DDDLog(@"[清洗] 长度 %lu→%lu｜amp;→空 %lu 处｜u002F→/ %lu 处｜\\→空 %lu 处",
            (unsigned long)len0, (unsigned long)html.length,
-           (unsigned long)n1, (unsigned long)n2, (unsigned long)n3, (unsigned long)n4);
+           (unsigned long)n2, (unsigned long)n3, (unsigned long)n4);
 
     BOOL risk = [html containsString:@"验证码中间页"];
     if (risk) [DDPToast() showToastWithText:@"被检测了，请验证后再试"];
@@ -589,8 +613,8 @@ static UIWindow *DDPHostWindow(void) {
     // 三类标记全无 → 不回调，交给重载循环再来一轮（PKC 原样；
     // PKC 还比了一个 dur==0xF4161，那是死分支：dur 是「秒」，永远不可能等于 0xF4161）
     if (!gallery && !video && dur != DDPCodeGallery) {
-        DDDLog(@"抠HTML：三个标记全无 → 本轮 miss，等重载循环");
-        return;
+        DDDLog(@"抠HTML：三个标记全无 → 本拍 miss");
+        return NO;
     }
 
     NSInteger code = gallery ? DDPCodeGallery : dur;
@@ -600,6 +624,7 @@ static UIWindow *DDPHostWindow(void) {
         self.completion(html, code, nil);
     }
     self.retries = 0;   // 通知重载循环收工
+    return YES;
 }
 
 // PKC -extractDurationFromHTML:@0xe2210：正则 "bit_rate":null,"duration":(\d+)，组1 / 1000
@@ -662,13 +687,11 @@ static UIWindow *DDPHostWindow(void) {
     NSMutableArray *result = [NSMutableArray array];
     NSMutableString *decoded = [html mutableCopy];
     NSUInteger len0 = decoded.length;
-    NSUInteger g1 = [decoded replaceOccurrencesOfString:@"\\u002f" withString:@"/" options:0 range:NSMakeRange(0, decoded.length)];
-    NSUInteger g2 = [decoded replaceOccurrencesOfString:@"\\/" withString:@"/" options:0 range:NSMakeRange(0, decoded.length)];
-    NSUInteger g3 = [decoded replaceOccurrencesOfString:@"\\\"" withString:@"\"" options:0 range:NSMakeRange(0, decoded.length)];
+    // 只保留 &quot;→" ：原先的 \u002f / \/ / \" 三步经采样恒为 0 处，
+    // 因为 ddpHandleHTML 的「\→空」已把所有反斜杠删光（采样数据自洽：316×5=1580=长度差）
     NSUInteger g4 = [decoded replaceOccurrencesOfString:@"&quot;" withString:@"\"" options:0 range:NSMakeRange(0, decoded.length)];
-    DDDLog(@"[抽取·图集] 解码 %lu→%lu｜\\u002f→/ %lu｜\\/→/ %lu｜\\\"→\" %lu｜&quot;→\" %lu",
-           (unsigned long)len0, (unsigned long)decoded.length,
-           (unsigned long)g1, (unsigned long)g2, (unsigned long)g3, (unsigned long)g4);
+    DDDLog(@"[抽取·图集] 解码 %lu→%lu｜&quot;→\" %lu 处",
+           (unsigned long)len0, (unsigned long)decoded.length, (unsigned long)g4);
 
     // 统计 "images" 出现次数：若多于 1 次，说明「只取第一个容器」这条假设有风险
     NSUInteger imgCount = 0;
@@ -744,7 +767,8 @@ static UIWindow *DDPHostWindow(void) {
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:nsurl];
     request.HTTPMethod = @"GET";
     [request setValue:@"zh-CN,zh;q=0.9" forHTTPHeaderField:@"Accept-language"];
-    [request setValue:@"bytes=0-" forHTTPHeaderField:@"Range"];
+    // 原先带 Range: bytes=0- —— 它等价于「从第 0 字节到末尾」即全量，并不产生任何断点续传效果，
+    // 只让 CDN 统一回 206 而不是 200，已删。
     [request setValue:url forHTTPHeaderField:@"Referer"];
     [request setValue:@"*/*" forHTTPHeaderField:@"Accept"];
     NSString *ua = [%c(CUtility) GetMMUserAgent];
@@ -780,7 +804,7 @@ static CMessageMgr *DDPMessageMgr(void) {
 }
 // 取当前会话名：在 VC 树里找 BaseMsgContentViewController
 static NSString *DDPCurrentChatName(void) {
-    UIViewController *vc = DDPKeyWindow().rootViewController;
+    UIViewController *vc = DDPHostWindow().rootViewController;
     while (vc.presentedViewController) vc = vc.presentedViewController;
     NSMutableArray *stack = vc ? [NSMutableArray arrayWithObject:vc] : [NSMutableArray array];
     while (stack.count) {
@@ -824,6 +848,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 + (void)saveVideoToAlbumAtPath:(NSString *)path completion:(void(^)(BOOL success))completion;
 + (void)saveImageToAlbumAtPath:(NSString *)path completion:(void(^)(BOOL success))completion;
 + (void)downloadAndSaveImages:(NSArray<NSString *> *)urls finish:(void(^)(void))finish;
++ (NSArray<NSString *> *)ddpFetchImages:(NSArray<NSString *> *)urls;   // 「存相册」与「预览」共用的串行下载
 + (void)sendVideoForURL:(NSString *)videoURL shareURL:(NSString *)shareURL user:(NSString *)user finish:(void(^)(void))finish;
 + (void)downloadImagesLocally:(NSArray<NSString *> *)urls completion:(void (^)(NSArray<NSString *> *paths))completion;
 + (void)presentImageViewer:(NSArray<NSString *> *)paths fromVC:(UIViewController *)vc;
@@ -834,7 +859,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 + (BOOL)showForContent:(NSString *)content user:(NSString *)user {
     NSString *url = DDPExtractURL(content);
     if (!url.length) return NO;
-    UIViewController *top = DDPKeyWindow().rootViewController;
+    UIViewController *top = DDPHostWindow().rootViewController;
     while (top.presentedViewController) top = top.presentedViewController;
     WCActionSheet *sheet = [[%c(WCActionSheet) alloc] initWithTitle:@"抖音解析" cancelButtonTitle:@"取消"];
     [sheet addButtonWithTitle:@"直接发送" eventAction:^{ [DDPPanel handleDirectSend:content user:user]; }];
@@ -842,7 +867,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     [sheet addButtonWithTitle:@"解析预览" eventAction:^{ [DDPPanel handleParsePreview:url fromVC:top]; }];
     [sheet addButtonWithTitle:@"解析链接" eventAction:^{ [DDPPanel handleParseLink:url user:user]; }];
     [sheet addButtonWithTitle:@"保存相册" eventAction:^{ [DDPPanel handleSaveAlbum:url]; }];
-    [sheet showInView:DDPKeyWindow()];
+    [sheet showInView:DDPHostWindow()];
     return YES;
 }
 
@@ -875,23 +900,43 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 }
 
 // 下载图片直链并批量存相册
+// 串行下载一组图片直链到本地缓存，返回成功落盘的路径。
+// 原先 downloadAndSaveImages: 与 downloadImagesLocally: 各抄了一遍这段循环，现合并。
++ (NSArray<NSString *> *)ddpFetchImages:(NSArray<NSString *> *)urls {
+    double t0 = CFAbsoluteTimeGetCurrent();
+    DDDLog(@"[下载·图集] 开始串行下载 %lu 张", (unsigned long)urls.count);
+    NSMutableArray *out = [NSMutableArray array];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *imgURL in urls) {
+        NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL];
+        if (!data.length) continue;
+        NSString *path = DDPTempPathExt(imgURL, DDPImageExt(imgURL));
+        if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
+        if ([data writeToFile:path atomically:YES]) [out addObject:path];
+    }
+    DDDLog(@"[下载·图集] %lu 张串行下载完成 成功 %lu 张 总耗时 %.2fs",
+           (unsigned long)urls.count, (unsigned long)out.count, CFAbsoluteTimeGetCurrent() - t0);
+    return out;
+}
+
 + (void)downloadAndSaveImages:(NSArray<NSString *> *)urls finish:(void(^)(void))finish {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        __block NSInteger total = 0, done = 0, failed = 0;
+        NSArray *paths = [self ddpFetchImages:urls];
+        NSInteger total = paths.count;
+        if (total == 0) {
+            DDDLog(@"[面板] 图集全部下载失败，无图可存");
+            if (finish) dispatch_async(dispatch_get_main_queue(), finish);
+            return;
+        }
+        __block NSInteger done = 0, failed = 0;
         dispatch_queue_t q = dispatch_queue_create("ddp.save", DISPATCH_QUEUE_SERIAL);
-        for (NSString *imgURL in urls) {
-            NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL];
-            if (!data.length) continue;
-            NSString *path = DDPTempPathExt(imgURL, DDPImageExt(imgURL));
-            NSFileManager *fm = [NSFileManager defaultManager];
-            if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
-            if (![data writeToFile:path atomically:YES]) continue;
-            total++;
+        for (NSString *path in paths) {
             [DDPPanel saveImageToAlbumAtPath:path completion:^(BOOL success) {
                 dispatch_async(q, ^{
                     done++; if (!success) failed++;
                     if (done < total) return;
                     dispatch_async(dispatch_get_main_queue(), ^{
+                        DDDLog(@"[面板] 存相册完成 %ld/%ld 失败 %ld", (long)done, (long)total, (long)failed);
                         if (failed == 0) DDPShowDone(@"保存成功");
                         else if (failed < total) DDPShowDone(@"部分保存成功");
                         else DDPShowError(@"保存失败");
@@ -899,7 +944,6 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
                 });
             }];
         }
-        if (total == 0 && finish) finish();
     });
 }
 
@@ -1034,22 +1078,8 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 
 // 下载图片直链到本地缓存（供预览，不存相册；复用 MD5 缓存）
 + (void)downloadImagesLocally:(NSArray<NSString *> *)urls completion:(void (^)(NSArray<NSString *> *paths))completion {
-    double t0 = CFAbsoluteTimeGetCurrent();
-    DDDLog(@"[下载·图集] 开始串行下载 %lu 张", (unsigned long)urls.count);
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSMutableArray *out = [NSMutableArray array];
-        NSFileManager *fm = [NSFileManager defaultManager];
-        for (NSString *imgURL in urls) {
-            NSData *data = [[DDPEngine shared] downloadVideoFromURL:imgURL];
-            NSString *path = DDPTempPathExt(imgURL, DDPImageExt(imgURL));
-            if (data.length) {
-                if ([fm fileExistsAtPath:path]) [fm removeItemAtPath:path error:nil];
-                [data writeToFile:path atomically:YES];
-            }
-            if ([fm fileExistsAtPath:path]) [out addObject:path];
-        }
-        DDDLog(@"[下载·图集] %lu 张串行下载完成 成功 %lu 张 总耗时 %.2fs",
-               (unsigned long)urls.count, (unsigned long)out.count, CFAbsoluteTimeGetCurrent() - t0);
+        NSArray *out = [self ddpFetchImages:urls];       // 与「存相册」共用同一段串行下载
         dispatch_async(dispatch_get_main_queue(), ^{ if (completion) completion(out); });
     });
 }
@@ -1292,7 +1322,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     Class mgrCls = objc_getClass("WCPluginsMgr");
     if (mgrCls) {
         [[mgrCls sharedInstance] registerControllerWithTitle:@"DD抖音解析"
-                                                     version:@"1.2.2"
+                                                     version:@"1.3.0"
                                                   controller:@"DDPDouyinParseSettingsViewController"];
     }
     // 预热：把 WebContent 进程冷启动的成本提前付掉（tweak 加载时就在后台建好 WebView 并跑一个空文档）。
