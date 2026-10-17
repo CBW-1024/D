@@ -116,18 +116,6 @@
 @property (nonatomic, copy) NSArray<NSURL *> *urls;
 @end
 @implementation DDPQLViewer
-- (void)viewDidAppear:(BOOL)animated {
-    [super viewDidAppear:animated];
-    UINavigationBar *bar = self.navigationController.navigationBar;
-    if (bar) {
-        UINavigationBarAppearance *ap = [UINavigationBarAppearance new];
-        ap.backgroundColor = [UIColor systemBackgroundColor]; // 不透明底色，自动跟随浅/深色
-        ap.backgroundEffect = nil;                            // 去掉毛玻璃透明，拒绝沉浸式
-        bar.standardAppearance = ap;
-        bar.scrollEdgeAppearance = ap;   // 顶部（scrollEdge）也锁死不透明，图透不上来
-        bar.compactAppearance = ap;
-    }
-}
 - (NSInteger)numberOfPreviewItemsInPreviewController:(QLPreviewController *)controller {
     return (NSInteger)self.urls.count;
 }
