@@ -786,7 +786,6 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 + (NSString *)generateThumbnailForVideoPath:(NSString *)path;
 + (void)sendImageAtPath:(NSString *)path toUser:(NSString *)user;
 + (void)sendImagesForURLs:(NSArray<NSString *> *)urls user:(NSString *)user finish:(void(^)(void))finish;
-+ (void)playVideoAtPath:(NSString *)path fromVC:(UIViewController *)vc;
 + (void)saveVideoToAlbumAtPath:(NSString *)path completion:(void(^)(BOOL success))completion;
 + (void)saveImageToAlbumAtPath:(NSString *)path completion:(void(^)(BOOL success))completion;
 + (void)downloadAndSaveImages:(NSArray<NSString *> *)urls finish:(void(^)(void))finish;
@@ -1009,7 +1008,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         void (^finish)(void) = ^{ DDPHideLoading(); };
         if (type == DDPMediaTypeVideo) {
             [self ddpFetchVideo:videoURL forURL:url then:^(NSString *p) {
-                dispatch_async(dispatch_get_main_queue(), ^{ [DDPPanel playVideoAtPath:p fromVC:vc]; finish(); });
+                dispatch_async(dispatch_get_main_queue(), ^{ if (p.length) [DDPPanel presentImageViewer:@[p] fromVC:vc]; finish(); });
             }];
         } else {
             [DDPPanel downloadImagesLocally:imageURLs completion:^(NSArray<NSString *> *paths) {
@@ -1018,16 +1017,6 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
             }];
         }
     }];
-}
-
-// 视频预览：系统 AVPlayerViewController（自带关闭 + 画中画按钮），不自定义、不内置保存
-+ (void)playVideoAtPath:(NSString *)path fromVC:(UIViewController *)vc {
-    AVPlayerViewController *pvc = [[AVPlayerViewController alloc] init];
-    pvc.player = [AVPlayer playerWithURL:[NSURL fileURLWithPath:path]];
-    pvc.allowsPictureInPicturePlayback = YES;
-    pvc.entersFullScreenWhenPlaybackBegins = NO;   // 显式关闭自动全屏，保住 pageSheet 半模态
-    pvc.modalPresentationStyle = UIModalPresentationPageSheet;   // 半模态卡片：顶部/底部露出微信，与图片预览一致
-    [vc presentViewController:pvc animated:YES completion:^{ [pvc.player play]; }];
 }
 
 // 下载图片直链到本地缓存（供预览，不存相册；复用 MD5 缓存）
@@ -1263,7 +1252,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     Class mgrCls = objc_getClass("WCPluginsMgr");
     if (mgrCls) {
         [[mgrCls sharedInstance] registerControllerWithTitle:@"DD抖音解析"
-                                                     version:@"1.3.13"
+                                                     version:@"1.3.14"
                                                   controller:@"DDPDouyinParseSettingsViewController"];
     }
     // 预热：把 WebContent 进程冷启动的成本提前付掉（tweak 加载时就在后台建好 WebView 并跑一个空文档）。
