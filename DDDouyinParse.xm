@@ -1025,6 +1025,8 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     AVPlayerViewController *pvc = [[AVPlayerViewController alloc] init];
     pvc.player = [AVPlayer playerWithURL:[NSURL fileURLWithPath:path]];
     pvc.allowsPictureInPicturePlayback = YES;
+    pvc.entersFullScreenWhenPlaybackBegins = NO;   // 显式关闭自动全屏，保住 pageSheet 半模态
+    pvc.modalPresentationStyle = UIModalPresentationPageSheet;   // 半模态卡片：顶部/底部露出微信，与图片预览一致
     [vc presentViewController:pvc animated:YES completion:^{ [pvc.player play]; }];
 }
 
@@ -1261,7 +1263,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     Class mgrCls = objc_getClass("WCPluginsMgr");
     if (mgrCls) {
         [[mgrCls sharedInstance] registerControllerWithTitle:@"DD抖音解析"
-                                                     version:@"1.3.12"
+                                                     version:@"1.3.13"
                                                   controller:@"DDPDouyinParseSettingsViewController"];
     }
     // 预热：把 WebContent 进程冷启动的成本提前付掉（tweak 加载时就在后台建好 WebView 并跑一个空文档）。
