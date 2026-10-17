@@ -950,21 +950,19 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
 @property (nonatomic, strong) id tableViewMgr;
 @end
 @implementation DDPDouyinParseSettingsViewController
-- (void)ensureTableViewMgr { if (!_tableViewMgr) _tableViewMgr = [[%c(WCTableViewManager) alloc] initWithFrame:[UIScreen mainScreen].bounds style:UITableViewStyleInsetGrouped]; }
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"DD抖音解析";
-    [self ensureTableViewMgr];
-    [self buildTable];
+
+    _tableViewMgr = [[%c(WCTableViewManager) alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
     UITableView *tv = [_tableViewMgr getTableView];
+    tv.frame = self.view.bounds;
+    tv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    tv.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
     self.view.backgroundColor = tv.backgroundColor;
-    tv.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
     [self.view addSubview:tv];
-}
-- (void)viewDidLayoutSubviews {
-    [super viewDidLayoutSubviews];
-    UITableView *tv = [_tableViewMgr getTableView];
-    tv.frame = CGRectMake(0, self.view.safeAreaInsets.top, self.view.bounds.size.width, self.view.bounds.size.height - self.view.safeAreaInsets.top);
+
+    [self buildTable];
 }
 - (void)buildTable {
     [_tableViewMgr clearAllSection];
