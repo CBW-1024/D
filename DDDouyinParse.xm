@@ -331,10 +331,10 @@ static void DDPAttachWebView(WKWebView *wv) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{ [self ddpRetryLoop:req]; });
 }
 
-// 重载驱动：首请求常拿到空壳页，需多次 reload（最多 4 轮 = 3 次加载）直到命中或超时。
+// 重载驱动：首请求常拿到空壳页，需多次 reload（最多 3 轮 = 2 次加载）直到命中或超时。
 - (void)ddpRetryLoop:(NSURLRequest *)req {
     self.retries = 1;
-    while (self.retries < 4) {
+    while (self.retries < 3) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self.webView loadRequest:req];
             self.retries = self.retries + 1;
@@ -351,7 +351,7 @@ static void DDPAttachWebView(WKWebView *wv) {
         }
         if (self.hasCompleted) break;
     }
-    if (self.retries >= 4 && self.completion && !self.hasCompleted) {
+    if (self.retries >= 3 && self.completion && !self.hasCompleted) {
         self.hasCompleted = YES;
         NSError *err = [NSError errorWithDomain:@"DDP" code:500
                                       userInfo:@{NSLocalizedDescriptionKey: @"页面加载超时，请重试"}];
@@ -361,7 +361,7 @@ static void DDPAttachWebView(WKWebView *wv) {
 }
 
 // 页面加载完成后，按固定间隔反复采样 HTML，命中即停
-static const NSInteger DDPMaxPoll = 8;   // 最多轮询 8 次
+static const NSInteger DDPMaxPoll = 5;   // 最多轮询 5 次
 static const double    DDMPollGap = 1.2; // 每次间隔 1.2 秒
 
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
