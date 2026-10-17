@@ -451,7 +451,7 @@ static const double    DDMPollGap = 1.2; // 每次间隔 1.2 秒
     NSString *url = self.webView.URL.absoluteString;
     if ([url containsString:@"webcast.amemv.com"] ||
         [url containsString:@"live.douyin.com"]) {
-        return @"直播链接暂不支持解析";
+        return @"直播链接不支持";
     }
     return nil;
 }
