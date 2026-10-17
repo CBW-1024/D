@@ -1,7 +1,5 @@
-// DDDouyinParse —— 微信内抖音分享链接解析插件（v1.0.0）
+// DDDouyinParse —— 微信内抖音分享链接解析插件
 // 识别抖音分享链接，抓取分享页提取无水印视频 / 图集直链，支持发送 / 预览 / 存相册。
-//
-// 模块：配置 / 工具 / 抓取 / 解析引擎 / 面板与服务 / Hook / 设置 / 注册
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -11,9 +9,15 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <AVFoundation/AVFoundation.h>
 #import <QuickLook/QuickLook.h>
-#import <unistd.h> // usleep
+#import <unistd.h>
 
 #pragma mark - 微信私有类声明
+
+// 插件管理声明（依赖懒猫的插件管理）
+@interface WCPluginsMgr : NSObject
++ (instancetype)sharedInstance;
+- (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
+@end
 
 @interface WeToast : NSObject
 + (instancetype)toast;
@@ -103,16 +107,11 @@
 + (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 on:(BOOL)arg4;
 @end
 
-@interface WCPluginsMgr : NSObject
-+ (instancetype)sharedInstance;
-- (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
-@end
-
 @interface MMMenuController : NSObject
 - (void)setMenuItems:(id)items;
 @end
 
-// 用系统 QLPreviewController 预览（自带导航栏与分享/保存）
+// 用系统 QLPreviewController 预览
 @interface DDPQLViewer : QLPreviewController <QLPreviewControllerDataSource>
 @property (nonatomic, copy) NSArray<NSURL *> *urls;
 @end
@@ -261,10 +260,10 @@ static void DDPAttachWebView(WKWebView *wv) {
 @property (nonatomic, strong) WKWebView *webView;
 @property (nonatomic, assign) unsigned int retries;
 @property (nonatomic, assign) BOOL hasCompleted;
-@property (nonatomic, assign) int pollTicks;          // 本轮 reload 内已轮询到第几拍
-@property (nonatomic, assign) NSUInteger lastHTMLLen; // 上一拍的 HTML 长度
-@property (nonatomic, assign) int sameLenTicks;       // 长度连续相同的拍数
-@property (nonatomic, assign) BOOL reloadNow;         // 本轮已判定无望，通知重载循环提前 reload
+@property (nonatomic, assign) int pollTicks;
+@property (nonatomic, assign) NSUInteger lastHTMLLen;
+@property (nonatomic, assign) int sameLenTicks;
+@property (nonatomic, assign) BOOL reloadNow;
 @property (nonatomic, copy) void (^completion)(NSString *html, NSError *error);
 + (instancetype)sharedFetcher;
 - (void)fetchHTMLFromURL:(NSString *)url completion:(void (^)(NSString *html, NSError *error))completion;
@@ -917,8 +916,8 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     NSString *content = ddp_wrapContent(gDDPMenuWrap);
     BOOL enabled = DDPEnabled()
                    && DDPExtractURL(content).length && !DDPIsDouyinLiveText(content);
-    NSArray *all = ddp_inject_item(gDDPMenuVC, items, enabled, @"解析", @"icons_filled_search", @selector(ddp_vcParse:), 1010);
-    all = ddp_inject_item(gDDPMenuVC, all, enabled, @"预览", @"icons_filled_play", @selector(ddp_vcPreview:), 1011);
+    NSArray *all = ddp_inject_item(gDDPMenuVC, items, enabled, @"解析", @"icons_filled_search", @selector(ddp_vcParse:), 0);
+    all = ddp_inject_item(gDDPMenuVC, all, enabled, @"预览", @"icons_filled_play", @selector(ddp_vcPreview:), 1);
     %orig(all);
 }
 %end
@@ -953,7 +952,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
 @implementation DDPDouyinParseSettingsViewController
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"DD抖音解析";
+    self.title = @"抖音解析设置";
     // 表格布局交由 viewDidLayoutSubviews 处理（避开导航栏）
     _tableViewMgr = [[%c(WCTableViewManager) alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
     UITableView *tv = [_tableViewMgr getTableView];
@@ -982,7 +981,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
 - (void)onEnabledSwitch:(UISwitch *)sender { DDPSetEnabled(sender.isOn); }
 @end
 
-#pragma mark - 注册入口
+#pragma mark - 注册入口（依赖懒猫的插件管理）
 
 %ctor {
     Class mgrCls = objc_getClass("WCPluginsMgr");
