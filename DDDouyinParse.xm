@@ -15,7 +15,7 @@
 #import <objc/runtime.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreGraphics/CoreGraphics.h>
-#import <AVKit/AVKit.h>
+#import <AVFoundation/AVFoundation.h>
 #import <QuickLook/QuickLook.h>   // 系统图片预览 QLPreviewController（自带导航栏，无需自定义）
 #import <unistd.h>     // usleep() —— 重载循环的等待节拍（PKC 原样用的是 sleep 死等，已改）
 
@@ -439,12 +439,12 @@ static void DDPAttachWebView(WKWebView *wv) {
 
 // PKC 的重载驱动 block@0x3cae8：
 //   retries=1 → while(retries!=0 && retries<11){ 主队列 loadRequest; retries++; sleep(retries+10); }
-//   最多 11 轮，全 miss 才回调 error 500；一旦命中（hasCompleted）立刻退出
+//   我们的上界收紧到 6（= 5 次重载）：首请求随机拿到空壳页时轮2基本解决，极少超 3 次；
+//   全 miss 才回调 error 500，一旦命中（hasCompleted）立刻退出。
 - (void)ddpRetryLoop:(NSURLRequest *)req {
     self.retries = 1;
     int round = 0;
-    if (self.hasCompleted) { [self cleanupWebView]; return; }
-    while (self.retries != 0 && self.retries < 11) {
+    while (self.retries < 6) {
         round++;
         DDDLog(@"[轮%d] loadRequest（retries=%u，累计%.1fs）", round, self.retries, CFAbsoluteTimeGetCurrent() - self.startAt);
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -471,11 +471,11 @@ static void DDPAttachWebView(WKWebView *wv) {
         }
         DDDLog(@"[轮%d] 等到上限仍未判定 → 再来一轮（累计%.1fs）", round, CFAbsoluteTimeGetCurrent() - self.startAt);
     }
-    if (self.retries >= 11 && self.completion && !self.hasCompleted) {
+    if (self.retries >= 6 && self.completion && !self.hasCompleted) {
         self.hasCompleted = YES;
         NSError *err = [NSError errorWithDomain:@"DDP" code:500
                                       userInfo:@{NSLocalizedDescriptionKey: @"页面加载超时，请重试"}];
-        DDDLog(@"[轮%d] 达到 11 轮上限，放弃（累计%.1fs）", round, CFAbsoluteTimeGetCurrent() - self.startAt);
+        DDDLog(@"[轮%d] 达到 6 轮上限，放弃（累计%.1fs）", round, CFAbsoluteTimeGetCurrent() - self.startAt);
         self.completion(nil, 0, err);
     }
     [self cleanupWebView];
@@ -560,14 +560,15 @@ static const double    DDMPollGap = 1.2;         // 每次间隔 1.2 秒（12 �
     if (risk) [DDPToast() showToastWithText:@"被检测了，请验证后再试"];
     _webView.hidden = !risk;
 
-    NSInteger dur = [self extractDurationFromHTML:html];
     BOOL gallery = [html containsString:@"aweme-share-swiper-item"] || [html containsString:@"aweme-slides-swiper-item"];
     BOOL video   = [html containsString:@"video_id="];
+    // 图集页 code 固定 DDPCodeGallery，dur 永不入 code，跳过这次全 HTML 正则扫描（仅视频页需要 dur 作 code）
+    NSInteger dur = gallery ? 0 : [self extractDurationFromHTML:html];
     DDDLog(@"抠HTML：长度=%lu gallery=%d video=%d dur=%ld risk=%d（累计%.1fs）",
            (unsigned long)html.length, gallery, video, (long)dur, risk, el);
     // 三类标记全无 → 不回调，交给重载循环再来一轮（PKC 原样；
-    // PKC 还比了一个 dur==0xF4161，那是死分支：dur 是「秒」，永远不可能等于 0xF4161）
-    if (!gallery && !video && dur != DDPCodeGallery) {
+    // 注：PKC 原比 dur==0xF4161 作命中信号，但 dur 已 /1000 成秒，永不可能为 999777，该条件恒真，已删）
+    if (!gallery && !video) {
         DDDLog(@"抠HTML：三个标记全无 → 本拍 miss");
         return NO;
     }
@@ -1252,7 +1253,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     Class mgrCls = objc_getClass("WCPluginsMgr");
     if (mgrCls) {
         [[mgrCls sharedInstance] registerControllerWithTitle:@"DD抖音解析"
-                                                     version:@"1.3.14"
+                                                     version:@"1.3.18"
                                                   controller:@"DDPDouyinParseSettingsViewController"];
     }
     // 预热：把 WebContent 进程冷启动的成本提前付掉（tweak 加载时就在后台建好 WebView 并跑一个空文档）。
