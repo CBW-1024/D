@@ -4,6 +4,16 @@
 //      支持「直接发送 / 解析发送 / 解析预览 / 解析链接 / 保存相册」。
 // 原理：把 WKWebView 挂载到 App 主窗口（即便 hidden），抓取抖音 SSR 分享页 HTML 并从中提取直链。
 // 私有类一律用 %c() 在运行时取，编译期不产生链接符号；下方只声明插件用到的方法。
+//
+// 模块划分：
+//   配置        —— 开关读写
+//   工具函数    —— 队列 / 正则缓存 / 字符串与 Toast 辅助
+//   抓取        —— DDPWebFetcher：WebView 抓 SSR 分享页 HTML
+//   解析引擎    —— DDPEngine：从 HTML 抠直链 / 下载
+//   面板与服务  —— DDPPanel：发送 / 预览 / 存相册 等动作编排
+//   Hook        —— 长按菜单注入、MMMenuController 装配、CMessageMgr 拦截
+//   设置界面    —— 开关页
+//   注册入口    —— %ctor 注册到 WCPluginsMgr
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -103,7 +113,6 @@
 
 @interface WCTableViewCellManager : NSObject
 + (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 on:(BOOL)arg4;
-+ (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3;
 @end
 
 @interface WCPluginsMgr : NSObject
@@ -173,10 +182,6 @@ static NSRegularExpression *DDPRegex(NSString *pattern, NSRegularExpressionOptio
         }
     }
     return re;
-}
-
-static BOOL DDPContainsDouyinLink(NSString *text) {
-    return [text containsString:@"douyin.com"];
 }
 
 static BOOL DDPIsDouyinLiveText(NSString *text) {
@@ -257,7 +262,7 @@ static UIWindow *DDPHostWindow(void) {
     return UIApplication.sharedApplication.delegate.window;
 }
 
-// 挂载 WebView 到主窗口（hidden）
+// 挂载 WebView 到主窗口
 static void DDPAttachWebView(WKWebView *wv) {
     UIWindow *win = DDPHostWindow();
     [win addSubview:wv];
@@ -627,14 +632,12 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     }];
 }
 
-// 下载视频直链并发到聊天
+// 下载视频直链并发到聊天（复用 ddpFetchVideo 的下载逻辑）
 + (void)sendVideoForURL:(NSString *)videoURL shareURL:(NSString *)url user:(NSString *)user finish:(void(^)(void))finish {
-    NSString *path = DDPTempPath(url);
-    dispatch_async(DDPBg(), ^{
-        if (![DDPPanel ddpFetchToPath:path fromURL:videoURL]) { DDPShowError(@"解析失败"); return; }
+    [self ddpFetchVideo:videoURL forURL:url then:^(NSString *p) {
         if (finish) finish();
-        [DDPPanel sendVideoAtPath:path toUser:user];
-    });
+        if (p.length) [DDPPanel sendVideoAtPath:p toUser:user];
+    }];
 }
 
 // 下载并落盘到指定路径，失败返回 nil（视频与图片共用）
@@ -921,7 +924,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
 - (void)setMenuItems:(NSArray *)items {
     NSString *content = ddp_wrapContent(gDDPMenuWrap);
     BOOL enabled = DDPEnabled()
-                   && DDPContainsDouyinLink(content) && !DDPIsDouyinLiveText(content);
+                   && DDPExtractURL(content).length && !DDPIsDouyinLiveText(content);
     NSArray *all = ddp_inject_item(gDDPMenuVC, items, enabled, @"解析", @"icons_filled_search", @selector(ddp_vcParse:), 1010);
     all = ddp_inject_item(gDDPMenuVC, all, enabled, @"预览", @"icons_filled_play", @selector(ddp_vcPreview:), 1011);
     %orig(all);
@@ -942,7 +945,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
         BOOL bypass = gDDPDyTcEnable; gDDPDyTcEnable = NO;   // 复位须在检测前
         if (bypass) break;
         NSString *content = wrap.m_nsContent;
-        if (!DDPContainsDouyinLink(content)) break;
+        if (!DDPExtractURL(content)) break;
         if (DDPIsDouyinLiveText(content)) break;
         NSString *target = usr.length ? usr : wrap.m_nsToUsr;
         if ([DDPPanel showForContent:content user:target]) return;   // 命中后拦截
