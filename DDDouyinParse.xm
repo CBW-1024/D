@@ -83,6 +83,10 @@
 - (void)setMenuType:(long long)type;
 @end
 
+@interface MMMenuController : NSObject
+- (void)setMenuItems:(id)items;
+@end
+
 @interface WCActionSheet : NSObject
 - (instancetype)initWithTitle:(NSString *)title cancelButtonTitle:(NSString *)cancelTitle;
 - (long long)addButtonWithTitle:(NSString *)title eventAction:(void (^)(void))action;
@@ -105,10 +109,6 @@
 
 @interface WCTableViewCellManager : NSObject
 + (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 on:(BOOL)arg4;
-@end
-
-@interface MMMenuController : NSObject
-- (void)setMenuItems:(id)items;
 @end
 
 // 用系统 QLPreviewController 预览
