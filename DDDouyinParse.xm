@@ -1043,7 +1043,8 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     qlc.urls = urls;
     qlc.dataSource = qlc;            // 自己当自己的数据源（weak，self 由 present 体系强引用）
     qlc.currentPreviewItemIndex = 0;
-    [vc presentViewController:qlc animated:YES completion:nil];   // 直接弹，不带自定义 UINavigationController
+    qlc.modalPresentationStyle = UIModalPresentationPageSheet;   // 半模态卡片：顶部/底部露出微信，不全屏盖死导航栏
+    [vc presentViewController:qlc animated:YES completion:nil];
 }
 
 + (void)handleParseLink:(NSString *)url user:(NSString *)user {
@@ -1260,7 +1261,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     Class mgrCls = objc_getClass("WCPluginsMgr");
     if (mgrCls) {
         [[mgrCls sharedInstance] registerControllerWithTitle:@"DD抖音解析"
-                                                     version:@"1.3.11"
+                                                     version:@"1.3.12"
                                                   controller:@"DDPDouyinParseSettingsViewController"];
     }
     // 预热：把 WebContent 进程冷启动的成本提前付掉（tweak 加载时就在后台建好 WebView 并跑一个空文档）。
