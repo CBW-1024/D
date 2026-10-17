@@ -953,16 +953,22 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"DD抖音解析";
-
+    // 表格布局交由 viewDidLayoutSubviews 处理（避开导航栏）
     _tableViewMgr = [[%c(WCTableViewManager) alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
     UITableView *tv = [_tableViewMgr getTableView];
-    tv.frame = self.view.bounds;
-    tv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    tv.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
     self.view.backgroundColor = tv.backgroundColor;
+    tv.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
     [self.view addSubview:tv];
 
     [self buildTable];
+}
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    CGFloat top = self.view.safeAreaInsets.top;
+    UITableView *tv = [_tableViewMgr getTableView];
+    CGFloat w = self.view.bounds.size.width;
+    CGFloat h = self.view.bounds.size.height;
+    tv.frame = CGRectMake(0, top, w, h - top);
 }
 - (void)buildTable {
     [_tableViewMgr clearAllSection];
