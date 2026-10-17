@@ -830,6 +830,9 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     qlc.dataSource = qlc;
     qlc.currentPreviewItemIndex = 0;
     qlc.modalPresentationStyle = UIModalPresentationPageSheet;
+    // 半屏，可上拖全屏
+    qlc.sheetPresentationController.detents = @[UISheetPresentationControllerDetent.mediumDetent, UISheetPresentationControllerDetent.largeDetent];
+    qlc.sheetPresentationController.prefersGrabberVisible = YES;
     [vc presentViewController:qlc animated:YES completion:nil];
 }
 
