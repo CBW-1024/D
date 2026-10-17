@@ -23,7 +23,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <AVFoundation/AVFoundation.h>
 #import <QuickLook/QuickLook.h>
-#import <unistd.h>   // usleep：重载循环中的等待节拍
+#import <unistd.h> // usleep：重载循环中的等待节拍
 
 #pragma mark - 微信私有类声明
 
@@ -165,7 +165,9 @@ static void DDPSetEnabled(BOOL on) {
 #pragma mark - 工具函数
 
 // 后台并发队列
-#define DDPBg() dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0)
+static dispatch_queue_t DDPBg(void) {
+    return dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+}
 
 // 编译并缓存正则（按 pattern+opts 复用，避免轮询中反复编译）
 static NSRegularExpression *DDPRegex(NSString *pattern, NSRegularExpressionOptions opts) {
@@ -254,7 +256,7 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
     DDPMediaTypeVideo   = 0,
     DDPMediaTypeImage   = 1,
 };
-static const NSInteger DDPCodeGallery = 0xF4161;   // 图集标记
+static const NSInteger DDPCodeGallery = 0xF4161; // 图集标记
 
 // 取 App 主窗口：WebView 必须挂到主窗口上（即使 hidden），
 // 否则 WebContent 进程不被调度、JS 不执行，解析就会时好时坏。
@@ -274,11 +276,11 @@ static void DDPAttachWebView(WKWebView *wv) {
 @property (nonatomic, strong) WKWebView *webView;
 @property (nonatomic, assign) unsigned int retries;
 @property (nonatomic, assign) BOOL hasCompleted;
-@property (nonatomic, assign) int  pollTicks;        // 本轮 reload 内已轮询到第几拍
+@property (nonatomic, assign) int pollTicks;          // 本轮 reload 内已轮询到第几拍
 @property (nonatomic, assign) NSUInteger lastHTMLLen; // 上一拍的 HTML 长度
-@property (nonatomic, assign) int  sameLenTicks;     // 长度连续相同的拍数
-@property (nonatomic, assign) BOOL reloadNow;        // 本轮已判定无望，通知重载循环提前 reload
-@property (nonatomic, assign) double startAt;        // 抓取起点（CFAbsoluteTime）
+@property (nonatomic, assign) int sameLenTicks;       // 长度连续相同的拍数
+@property (nonatomic, assign) BOOL reloadNow;         // 本轮已判定无望，通知重载循环提前 reload
+@property (nonatomic, assign) double startAt;         // 抓取起点（CFAbsoluteTime）
 @property (nonatomic, copy) void (^completion)(NSString *html, NSInteger code, NSError *error);
 + (instancetype)sharedFetcher;
 - (void)fetchHTMLFromURL:(NSString *)url completion:(void (^)(NSString *html, NSInteger code, NSError *error))completion;
@@ -291,7 +293,10 @@ static void DDPAttachWebView(WKWebView *wv) {
 
 @implementation DDPWebFetcher
 + (instancetype)sharedFetcher {
-    static DDPWebFetcher *i; static dispatch_once_t once; dispatch_once(&once, ^{ i = [[self alloc] init]; }); return i;
+    static DDPWebFetcher *i;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ i = [[self alloc] init]; });
+    return i;
 }
 
 - (instancetype)init {
@@ -356,8 +361,8 @@ static void DDPAttachWebView(WKWebView *wv) {
 }
 
 // 页面加载完成后，按固定间隔反复采样 HTML，命中即停
-static const NSInteger DDPMaxPoll = 12;          // 最多轮询 12 次
-static const double    DDMPollGap = 1.2;         // 每次间隔 1.2 秒
+static const NSInteger DDPMaxPoll = 12;  // 最多轮询 12 次
+static const double    DDMPollGap = 1.2; // 每次间隔 1.2 秒
 
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
     self.pollTicks = 0;
@@ -374,7 +379,7 @@ static const double    DDMPollGap = 1.2;         // 每次间隔 1.2 秒
         [webView evaluateJavaScript:@"document.documentElement.outerHTML" completionHandler:^(id result, NSError *error) {
             BOOL hit = [self ddpHandleHTML:result error:error];
             if (hit || self.hasCompleted) return;
-            if (self.sameLenTicks >= 1) {   // 长度连续不变 → 本轮无望，提前 reload
+            if (self.sameLenTicks >= 1) { // 长度连续不变 → 本轮无望，提前 reload
                 self.reloadNow = YES;
                 return;
             }
@@ -416,7 +421,7 @@ static const double    DDMPollGap = 1.2;         // 每次间隔 1.2 秒
         self.hasCompleted = YES;
         self.completion(html, code, nil);
     }
-    self.retries = 0;   // 通知重载循环收工
+    self.retries = 0; // 通知重载循环收工
     return YES;
 }
 
@@ -444,7 +449,10 @@ static const double    DDMPollGap = 1.2;         // 每次间隔 1.2 秒
 
 @implementation DDPEngine
 + (instancetype)shared {
-    static DDPEngine *i; static dispatch_once_t once; dispatch_once(&once, ^{ i = [[self alloc] init]; }); return i;
+    static DDPEngine *i;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ i = [[self alloc] init]; });
+    return i;
 }
 
 // 从 HTML 抠视频直链（playwm），并过滤图集页的误命中
@@ -453,7 +461,7 @@ static const double    DDMPollGap = 1.2;         // 每次间隔 1.2 秒
     NSRegularExpression *re = DDPRegex(@"https://aweme\\.snssdk\\.com/aweme/v1/playwm/\\?[^\"\\s]+", NSRegularExpressionCaseInsensitive);
     for (NSTextCheckingResult *m in [re matchesInString:html options:0 range:NSMakeRange(0, html.length)]) {
         NSString *u = [[html substringWithRange:m.range] stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
-        if ([u containsString:@"video_id=https:"]) continue;   // 图集页 video_id 套娃，过滤
+        if ([u containsString:@"video_id=https:"]) continue; // 图集页 video_id 套娃，过滤
         [result addObject:DDPRemoveWatermark(u)];
     }
     return [result copy];
@@ -532,7 +540,7 @@ static const double    DDMPollGap = 1.2;         // 每次间隔 1.2 秒
 
 #pragma mark - 面板与服务
 
-static BOOL gDDPDyTcEnable;   // 一次性放行：防「直接发送」重发被自己拦截
+static BOOL gDDPDyTcEnable; // 一次性放行：防「直接发送」重发被自己拦截
 
 static CMessageMgr *DDPMessageMgr(void) {
     return [[%c(MMContext) activeUserContext] getService:%c(CMessageMgr)];
@@ -813,9 +821,9 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     NSMutableArray<NSURL *> *urls = [NSMutableArray arrayWithCapacity:paths.count];
     for (NSString *p in paths) [urls addObject:[NSURL fileURLWithPath:p]];
     qlc.urls = urls;
-    qlc.dataSource = qlc;            // 自己当自己的数据源（weak，self 由 present 体系强引用）
+    qlc.dataSource = qlc; // 自己当自己的数据源（weak，self 由 present 体系强引用）
     qlc.currentPreviewItemIndex = 0;
-    qlc.modalPresentationStyle = UIModalPresentationPageSheet;   // 半模态：顶部/底部露出微信，不全屏盖死导航栏
+    qlc.modalPresentationStyle = UIModalPresentationPageSheet; // 半模态：顶部/底部露出微信，不全屏盖死导航栏
     [vc presentViewController:qlc animated:YES completion:nil];
 }
 
@@ -942,13 +950,13 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
         if (!DDPIsOutgoing(wrap)) break;
         unsigned int mt = wrap.m_uiMessageType;
         if (mt != 1) break;
-        BOOL bypass = gDDPDyTcEnable; gDDPDyTcEnable = NO;   // 复位须在检测前
+        BOOL bypass = gDDPDyTcEnable; gDDPDyTcEnable = NO; // 复位须在检测前
         if (bypass) break;
         NSString *content = wrap.m_nsContent;
         if (!DDPExtractURL(content)) break;
         if (DDPIsDouyinLiveText(content)) break;
         NSString *target = usr.length ? usr : wrap.m_nsToUsr;
-        if ([DDPPanel showForContent:content user:target]) return;   // 命中后拦截
+        if ([DDPPanel showForContent:content user:target]) return; // 命中后拦截
     } while (0);
     %orig;
 }
