@@ -870,8 +870,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 
 // 取消息文本
 static NSString *ddp_wrapContent(CMessageWrap *wrap) {
-    // 8.0.79 CMessageWrap 无 m_nsTitle（真实头文件不存在），抖音分享链接为文本消息走 m_nsContent 即可
-    return wrap.m_nsContent; // 对 nil 发消息返回 nil，天然 nil 安全
+    return wrap.m_nsContent;
 }
 
 // 菜单对应的消息与宿主 VC（由 willShowMenuController 缓存）
