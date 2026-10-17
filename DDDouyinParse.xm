@@ -336,7 +336,7 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
 static const NSInteger DDPCodeGallery = 0xF4161;   // PKC 的图集标记，原值就是 0xF4161
 
 // 8.0.79 头文件确认 MicroMessengerAppDelegate 有 -(id)window，
-// 且实测 %ctor 预热时它就已可用（日志恒为「挂窗=成功」），
+// 首次解析经懒加载 init 时主窗口已就绪（日志恒为「挂窗=成功」），
 // 故不再需要 connectedScenes 兜底——窗口获取收敛到这一行。
 static UIWindow *DDPHostWindow(void) {
     return UIApplication.sharedApplication.delegate.window;
@@ -355,7 +355,6 @@ static void DDPAttachWebView(WKWebView *wv) {
 @property (nonatomic, strong) WKWebView *webView;
 @property (nonatomic, assign) unsigned int retries;
 @property (nonatomic, assign) BOOL hasCompleted;
-@property (nonatomic, assign) BOOL warmingUp;      // 预热导航期间跳过抠 HTML
 @property (nonatomic, assign) int  pollTicks;      // 本轮 reload 内已轮询到第几拍
 @property (nonatomic, assign) NSUInteger lastHTMLLen;   // 上一拍的 HTML 长度
 @property (nonatomic, assign) int  sameLenTicks;   // 长度连续相同的拍数
@@ -363,7 +362,6 @@ static void DDPAttachWebView(WKWebView *wv) {
 @property (nonatomic, assign) double startAt;      // 本次抓取起点（CFAbsoluteTime），用于耗时日志
 @property (nonatomic, copy) void (^completion)(NSString *html, NSInteger code, NSError *error);
 + (instancetype)sharedFetcher;
-+ (void)ddpWarmup;                                              // 预热：建单例 + 挂窗 + 冷启动 WebContent
 - (void)fetchHTMLFromURL:(NSString *)url completion:(void (^)(NSString *html, NSInteger code, NSError *error))completion;
 - (void)cleanupWebView;
 - (void)ddpRetryLoop:(NSURLRequest *)req;                       // PKC block@0x3cae8
@@ -378,8 +376,7 @@ static void DDPAttachWebView(WKWebView *wv) {
 }
 
 // PKC -init@0x3c340：建一次 WKWebView → 开 JS → 换 UA → 设代理 → 挂主窗口 → frame=窗口 bounds → hidden=YES
-// 注意：本方法很可能被 %ctor 的预热在极早期调用，此时 app 主窗口可能还没建好（win=nil）。
-// 挂不上的话由 -fetchHTMLFromURL: 的补挂分支兜底（见下）。
+// 首次解析时由 -fetchHTMLFromURL: 经 sharedFetcher 懒加载触发，此时 app 主窗口已就绪，挂窗稳定。
 - (instancetype)init {
     if (self = [super init]) {
         WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
@@ -394,27 +391,11 @@ static void DDPAttachWebView(WKWebView *wv) {
     return self;
 }
 
-// 预热（实测必需）：PKC 的 WebView 是常驻单例、tweak 初始化时就建好并已跑过页面，
-// 所以它的首轮（等 retries=2 秒）就能命中。我们原来是懒加载，第一次解析才 init，
-// 冷启动 WebContent 进程 2 秒根本不够 → 首轮必 miss → 只能靠后面几轮硬撞，实测 58 秒。
-// 这里把冷启动成本提前付掉：建单例 + 挂窗 + 跑一个空文档把 WebContent 进程拉起来。
-+ (void)ddpWarmup {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        DDPWebFetcher *f = [self sharedFetcher];     // init 里已经挂窗，这里不再补挂
-        f.warmingUp = YES;                           // 预热导航不参与抠 HTML
-        [f.webView loadHTMLString:@"<!DOCTYPE html><html><body>ddp</body></html>" baseURL:nil];
-        DDDLog(@"预热：已发起空文档导航（挂窗=%@）", f.webView.window ? @"是" : @"否");
-    });
-}
-
 // PKC -fetchHTMLFromURL:completion:@0x3c6d8
 - (void)fetchHTMLFromURL:(NSString *)url completion:(void (^)(NSString *html, NSInteger code, NSError *error))completion {
     self.completion = completion;
     self.hasCompleted = NO;
     self.startAt = CFAbsoluteTimeGetCurrent();
-    // 预热导航可能还没回来（WebContent 进程启动慢），此时用户就开始解析了；
-    // 若不清标志，这次真实导航的 didFinish 会被当成预热而跳过，白白吃掉首轮机会。
-    self.warmingUp = NO;
     self.pollTicks = 0;         // 每轮状态一并重置，防止上一次解析的残留串到这次
     self.lastHTMLLen = 0;
     self.sameLenTicks = 0;
@@ -429,8 +410,8 @@ static void DDPAttachWebView(WKWebView *wv) {
     }
     NSURLRequest *req = [NSURLRequest requestWithURL:u cachePolicy:NSURLRequestUseProtocolCachePolicy timeoutInterval:30.0];
 
-    // 挂窗已在 init 完成，这里不再补挂——原先那三层补挂（init 判空 / 预热补挂 / 抓取补挂）
-    // 日志里一次都没触发过。挂窗状态仍打出来，方便万一出问题时一眼看出。
+    // 挂窗已在 init 完成，这里不再补挂——日志里挂窗一次都没失败过。
+    // 挂窗状态仍打出来，方便万一出问题时一眼看出。
     _webView.hidden = YES;
     DDDLog(@"fetchHTMLFromURL: %@（挂窗=%@）", url, _webView.window ? @"是" : @"否");
     // PKC：dispatch_async(全局队列, block@0x3cae8) 跑重载驱动
@@ -489,12 +470,6 @@ static const NSInteger DDPMaxPoll = 12;          // 最多轮询 12 次
 static const double    DDMPollGap = 1.2;         // 每次间隔 1.2 秒（12 次 ≈ 14.4s 覆盖）
 
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
-    // 预热导航：只用来把 WebContent 进程拉起来，不抠 HTML（否则空文档会走一遍 miss 分支）
-    if (self.warmingUp) {
-        self.warmingUp = NO;
-        DDDLog(@"预热：空文档导航完成，WebContent 进程已就绪");
-        return;
-    }
     DDDLog(@"didFinish（累计%.1fs）→ 开始轮询抠 HTML（间隔 %.1fs，最多 %ld 次）",
            CFAbsoluteTimeGetCurrent() - self.startAt, DDMPollGap, (long)DDPMaxPoll);
     self.pollTicks = 0;
@@ -1253,10 +1228,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     Class mgrCls = objc_getClass("WCPluginsMgr");
     if (mgrCls) {
         [[mgrCls sharedInstance] registerControllerWithTitle:@"DD抖音解析"
-                                                     version:@"1.3.18"
+                                                     version:@"1.3.19"
                                                   controller:@"DDPDouyinParseSettingsViewController"];
     }
-    // 预热：把 WebContent 进程冷启动的成本提前付掉（tweak 加载时就在后台建好 WebView 并跑一个空文档）。
-    // 不预热的话第一次解析要冷启动，首轮等 2 秒必然不够 → 靠后面几轮硬撞，实测 58 秒。
-    [DDPWebFetcher ddpWarmup];
 }
