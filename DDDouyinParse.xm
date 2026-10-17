@@ -117,8 +117,6 @@
 @property (nonatomic, copy) NSArray<NSURL *> *urls;
 @end
 @implementation DDPQLViewer
-// 半屏 sheet 下状态栏会压住 QL 导航栏，预览时直接隐藏状态栏让导航栏完整露出
-- (BOOL)prefersStatusBarHidden { return YES; }
 - (NSInteger)numberOfPreviewItemsInPreviewController:(QLPreviewController *)controller {
     return (NSInteger)self.urls.count;
 }
@@ -833,7 +831,6 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     qlc.dataSource = qlc;
     qlc.currentPreviewItemIndex = 0;
     qlc.modalPresentationStyle = UIModalPresentationPageSheet;
-    qlc.modalPresentationCapturesStatusBarAppearance = YES; // 让 QL 的 prefersStatusBarHidden 生效，避免状态栏压住导航栏
     // 半屏，可上拖全屏
     qlc.sheetPresentationController.detents = @[UISheetPresentationControllerDetent.mediumDetent, UISheetPresentationControllerDetent.largeDetent];
     qlc.sheetPresentationController.prefersGrabberVisible = YES;
