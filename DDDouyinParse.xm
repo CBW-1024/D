@@ -341,8 +341,8 @@ static void DDPAttachWebView(WKWebView *wv) {
 }
 
 // 反复采样 HTML，命中即停
-static const NSInteger DDPMaxPoll = 5;   // 最多轮询 5 次
-static const double    DDMPollGap = 1.2; // 每次间隔 1.2 秒
+static const NSInteger DDPMaxPoll = 6;   // 最多轮询 6 次
+static const double    DDMPollGap = 1.0; // 每次间隔 1.0 秒
 
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
     self.pollTicks = 0;
