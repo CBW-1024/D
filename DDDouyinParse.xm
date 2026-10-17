@@ -63,7 +63,6 @@
 @end
 
 @interface CMessageMgr : NSObject
-- (id)AddVideoMsg:(NSString *)fromUsr ToUsr:(NSString *)toUsr VideoInfo:(id)info;
 - (void)AddMsg:(NSString *)usr MsgWrap:(CMessageWrap *)wrap;
 @end
 
@@ -481,9 +480,6 @@ static void DDPAttachWebView(WKWebView *wv) {
     }
     [self cleanupWebView];
 }
-
-// PKC -webView:didStartProvisionalNavigation:@0x3cd08 —— 空实现（原样保留）
-- (void)webView:(WKWebView *)webView didStartProvisionalNavigation:(WKNavigation *)navigation {}
 
 // 这里偏离 PKC：PKC 是「didFinish 后固定等 retries 秒，抠一次，不中就等下一轮 reload」。
 // 实测问题：图集页是 SSR 直出，2 秒够；视频页是 SPA，轮1 只拿到 50993 字符（三标记全无）就判 miss，
@@ -958,9 +954,9 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
         [info setM_nsSpecifiedChatName:chatName];
 
         NSString *from = [%c(SettingUtil) getLocalUsrName:0];
+        // 8.0.79 头文件已确认 BaseMsgContentLogicController 存在且 init 不返回 nil，不保留 CMessageMgr 旧路径兜底
         BaseMsgContentLogicController *ctrl = [[%c(BaseMsgContentLogicController) alloc] init];
-        if (ctrl) [ctrl AddVideoMsg:from ToUsr:chatName VideoInfo:info];
-        else [DDPMessageMgr() AddVideoMsg:from ToUsr:chatName VideoInfo:info];
+        [ctrl AddVideoMsg:from ToUsr:chatName VideoInfo:info];
     });
 }
 
@@ -1215,11 +1211,10 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
 @end
 @implementation DDPDouyinParseSettingsViewController
 - (void)ensureTableViewMgr { if (!_tableViewMgr) _tableViewMgr = [[%c(WCTableViewManager) alloc] initWithFrame:[UIScreen mainScreen].bounds style:UITableViewStyleInsetGrouped]; }
-- (instancetype)init { if (self = [super init]) [self ensureTableViewMgr]; return self; }
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"DD抖音解析";
-    [self ensureTableViewMgr];
+    [self ensureTableViewMgr];   // viewDidLoad 无论微信用 init 还是 initWithNibName: 都必跑，单一保底即可；init 里再调是重复且可能永不触发
     [self buildTable];
     UITableView *tv = [_tableViewMgr getTableView];
     self.view.backgroundColor = tv.backgroundColor;
@@ -1267,7 +1262,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     Class mgrCls = objc_getClass("WCPluginsMgr");
     if (mgrCls) {
         [[mgrCls sharedInstance] registerControllerWithTitle:@"DD抖音解析"
-                                                     version:@"1.3.8"
+                                                     version:@"1.3.10"
                                                   controller:@"DDPDouyinParseSettingsViewController"];
     }
     // 预热：把 WebContent 进程冷启动的成本提前付掉（tweak 加载时就在后台建好 WebView 并跑一个空文档）。
