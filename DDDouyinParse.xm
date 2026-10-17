@@ -181,6 +181,7 @@ static BOOL DDPIsOutgoing(CMessageWrap *wrap) { return [%c(CMessageWrap) isSende
 
 // 抽取第一个抖音链接
 static NSString *DDPExtractURL(NSString *text) {
+    if (!text) return nil; // nil 不安全：matchesInString:nil 会抛异常
     NSRegularExpression *re = DDPRegex(@"https?://[^\\s\"'<>]+", 0);
     for (NSTextCheckingResult *m in [re matchesInString:text options:0 range:NSMakeRange(0, text.length)]) {
         NSString *u = [text substringWithRange:m.range];
@@ -869,7 +870,8 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 
 // 取消息文本
 static NSString *ddp_wrapContent(CMessageWrap *wrap) {
-    return wrap.m_nsContent;
+    // 8.0.79 CMessageWrap 无 m_nsTitle（真实头文件不存在），抖音分享链接为文本消息走 m_nsContent 即可
+    return wrap.m_nsContent; // 对 nil 发消息返回 nil，天然 nil 安全
 }
 
 // 菜单对应的消息与宿主 VC（由 willShowMenuController 缓存）
