@@ -181,7 +181,7 @@ static BOOL DDPIsOutgoing(CMessageWrap *wrap) { return [%c(CMessageWrap) isSende
 
 // 抽取第一个抖音链接
 static NSString *DDPExtractURL(NSString *text) {
-    if (!text) return nil; // nil 不安全：matchesInString:nil 会抛异常
+    if (!text) return nil;
     NSRegularExpression *re = DDPRegex(@"https?://[^\\s\"'<>]+", 0);
     for (NSTextCheckingResult *m in [re matchesInString:text options:0 range:NSMakeRange(0, text.length)]) {
         NSString *u = [text substringWithRange:m.range];
