@@ -16,6 +16,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <AVKit/AVKit.h>
+#import <QuickLook/QuickLook.h>   // 系统图片预览 QLPreviewController（自带导航栏，无需自定义）
 #import <unistd.h>     // usleep() —— 重载循环的等待节拍（PKC 原样用的是 sleep 死等，已改）
 
 #pragma mark - 微信私有类声明
@@ -124,65 +125,17 @@
 @end
 
 
-// 可缩放单图页：UIScrollView + UIImageView，支持捏合/双击缩放，背景随深色模式
-@interface DDPPhotoPage : UIViewController <UIScrollViewDelegate>
-@property (nonatomic, copy) NSString *path;
+// 系统预览：直接用 QLPreviewController（自带导航栏「完成」+ 分享/保存，无需自定义导航）。
+// 自己当自己的 dataSource：dataSource 是 weak，self 由 present 体系强引用，不会提前释放。
+@interface DDPQLViewer : QLPreviewController <QLPreviewControllerDataSource>
+@property (nonatomic, copy) NSArray<NSURL *> *urls;
 @end
-@implementation DDPPhotoPage
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.view.backgroundColor = UIColor.systemBackgroundColor;
-    UIScrollView *sv = [[UIScrollView alloc] initWithFrame:self.view.bounds];
-    sv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    sv.minimumZoomScale = 1.0;
-    sv.maximumZoomScale = 4.0;
-    sv.delegate = self;
-    UIImageView *iv = [[UIImageView alloc] initWithImage:[UIImage imageWithContentsOfFile:self.path]];
-    iv.contentMode = UIViewContentModeScaleAspectFit;
-    iv.frame = sv.bounds;
-    iv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    [sv addSubview:iv];
-    [self.view addSubview:sv];
+@implementation DDPQLViewer
+- (NSInteger)numberOfPreviewItemsInPreviewController:(QLPreviewController *)controller {
+    return (NSInteger)self.urls.count;
 }
-- (UIView *)viewForZoomingInScrollView:(UIScrollView *)scrollView {
-    return scrollView.subviews.firstObject;
-}
-@end
-
-// 多图浏览器：UIPageViewController 左右滑切换
-@interface DDPPhotoBrowser : UIPageViewController <UIPageViewControllerDataSource>
-@property (nonatomic, copy) NSArray<NSString *> *paths;
-@property (nonatomic, copy) void (^onSaveCurrent)(NSString *path);
-@end
-@implementation DDPPhotoBrowser
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.view.backgroundColor = UIColor.systemBackgroundColor;
-    self.dataSource = self;
-    if (self.paths.count)
-        [self setViewControllers:@[[self pageAt:0]] direction:UIPageViewControllerNavigationDirectionForward animated:NO completion:nil];
-    self.navigationItem.leftBarButtonItem =
-        [[UIBarButtonItem alloc] initWithTitle:@"关闭" style:UIBarButtonItemStylePlain target:self action:@selector(ddp_dismiss:)];
-    self.navigationItem.rightBarButtonItem =
-        [[UIBarButtonItem alloc] initWithTitle:@"保存" style:UIBarButtonItemStylePlain target:self action:@selector(ddp_saveCurrent:)];
-}
-- (DDPPhotoPage *)pageAt:(NSInteger)i {
-    DDPPhotoPage *p = [[DDPPhotoPage alloc] init];
-    p.path = self.paths[i];
-    return p;
-}
-- (UIViewController *)pageViewController:(UIPageViewController *)pc viewControllerBeforeViewController:(UIViewController *)vc {
-    NSInteger i = [self.paths indexOfObject:[(DDPPhotoPage *)vc path]];
-    return (i > 0) ? [self pageAt:i - 1] : nil;
-}
-- (UIViewController *)pageViewController:(UIPageViewController *)pc viewControllerAfterViewController:(UIViewController *)vc {
-    NSInteger i = [self.paths indexOfObject:[(DDPPhotoPage *)vc path]];
-    return (i < (NSInteger)self.paths.count - 1) ? [self pageAt:i + 1] : nil;
-}
-- (void)ddp_dismiss:(id)sender { [self dismissViewControllerAnimated:YES completion:nil]; }
-- (void)ddp_saveCurrent:(id)sender {
-    DDPPhotoPage *cur = (DDPPhotoPage *)self.viewControllers.firstObject;
-    if (cur.path && self.onSaveCurrent) self.onSaveCurrent(cur.path);
+- (id<QLPreviewItem>)previewController:(QLPreviewController *)controller previewItemAtIndex:(NSInteger)index {
+    return self.urls[index];   // NSURL 本就遵循 QLPreviewItem
 }
 @end
 
@@ -1088,15 +1041,13 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 }
 
 + (void)presentImageViewer:(NSArray<NSString *> *)paths fromVC:(UIViewController *)vc {
-    DDPPhotoBrowser *browser = [[DDPPhotoBrowser alloc] init];
-    browser.paths = paths;
-    browser.onSaveCurrent = ^(NSString *path) {
-        [DDPPanel saveImageToAlbumAtPath:path completion:^(BOOL success) {
-            if (success) DDPShowDone(@"保存成功"); else DDPShowError(@"保存失败");
-        }];
-    };
-    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:browser];
-    [vc presentViewController:nav animated:YES completion:nil];
+    DDPQLViewer *qlc = [[DDPQLViewer alloc] init];
+    NSMutableArray<NSURL *> *urls = [NSMutableArray arrayWithCapacity:paths.count];
+    for (NSString *p in paths) [urls addObject:[NSURL fileURLWithPath:p]];
+    qlc.urls = urls;
+    qlc.dataSource = qlc;            // 自己当自己的数据源（weak，self 由 present 体系强引用）
+    qlc.currentPreviewItemIndex = 0;
+    [vc presentViewController:qlc animated:YES completion:nil];   // 直接弹，不带自定义 UINavigationController
 }
 
 + (void)handleParseLink:(NSString *)url user:(NSString *)user {
@@ -1316,7 +1267,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     Class mgrCls = objc_getClass("WCPluginsMgr");
     if (mgrCls) {
         [[mgrCls sharedInstance] registerControllerWithTitle:@"DD抖音解析"
-                                                     version:@"1.3.7"
+                                                     version:@"1.3.8"
                                                   controller:@"DDPDouyinParseSettingsViewController"];
     }
     // 预热：把 WebContent 进程冷启动的成本提前付掉（tweak 加载时就在后台建好 WebView 并跑一个空文档）。
