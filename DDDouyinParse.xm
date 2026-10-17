@@ -414,6 +414,17 @@ static const double    DDMPollGap = 1.2; // 每次间隔 1.2 秒
     BOOL gallery = [html containsString:@"aweme-share-swiper-item"] || [html containsString:@"aweme-slides-swiper-item"];
     BOOL video   = [html containsString:@"video_id="];
     NSInteger dur = gallery ? 0 : [self extractDurationFromHTML:html];
+    NSString *fail = [self ddpFailReason];
+    if (fail) {
+        if (self.completion && !self.hasCompleted) {
+            self.hasCompleted = YES;
+            NSError *err = [NSError errorWithDomain:@"DDP" code:501
+                                          userInfo:@{NSLocalizedDescriptionKey: fail}];
+            self.completion(nil, 0, err);
+        }
+        self.retries = 0; // 通知重载循环收工
+        return YES;
+    }
     if (!gallery && !video) return NO;
 
     NSInteger code = gallery ? DDPCodeGallery : dur;
@@ -431,6 +442,18 @@ static const double    DDMPollGap = 1.2; // 每次间隔 1.2 秒
     NSTextCheckingResult *m = [re firstMatchInString:html options:0 range:NSMakeRange(0, html.length)];
     if (!m || m.numberOfRanges < 2) return 0;
     return [[html substringWithRange:[m rangeAtIndex:1]] intValue] / 1000;
+}
+
+// 终态识别：命中直播等无法解析的链接，返回提示文案；否则 nil。
+// 微信里拿到的是抖音短链（v.douyin.com/xxx），WebView 加载后会 302 跳转到直播间最终地址，
+// 这里读的是跳转后的最终 URL，只按直播专属域名判定，正常视频页不可能命中，零误伤。
+- (NSString *)ddpFailReason {
+    NSString *url = self.webView.URL.absoluteString;
+    if ([url containsString:@"webcast.amemv.com"] ||
+        [url containsString:@"live.douyin.com"]) {
+        return @"直播链接暂不支持解析";
+    }
+    return nil;
 }
 
 - (void)cleanupWebView {
@@ -627,7 +650,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
 + (void)ddpParse:(NSString *)url then:(void (^)(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs))then {
     DDPShowLoading(@"正在解析…");
     [[DDPEngine shared] parseDouyinURL:url completion:^(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err) {
-        if (err || type == DDPMediaTypeUnknown) { DDPShowError(@"解析失败"); return; }
+        if (err || type == DDPMediaTypeUnknown) { DDPShowError(err.localizedDescription ?: @"解析失败"); return; }
         then(type, videoURL, imageURLs);
     }];
 }
