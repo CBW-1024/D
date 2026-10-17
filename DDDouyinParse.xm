@@ -256,8 +256,6 @@ typedef NS_ENUM(NSInteger, DDPMediaType) {
     DDPMediaTypeVideo   = 0,
     DDPMediaTypeImage   = 1,
 };
-static const NSInteger DDPCodeGallery = 0xF4161; // 图集标记
-
 // 取 App 主窗口：WebView 必须挂到主窗口上（即使 hidden），
 // 否则 WebContent 进程不被调度、JS 不执行，解析就会时好时坏。
 static UIWindow *DDPHostWindow(void) {
@@ -280,15 +278,13 @@ static void DDPAttachWebView(WKWebView *wv) {
 @property (nonatomic, assign) NSUInteger lastHTMLLen; // 上一拍的 HTML 长度
 @property (nonatomic, assign) int sameLenTicks;       // 长度连续相同的拍数
 @property (nonatomic, assign) BOOL reloadNow;         // 本轮已判定无望，通知重载循环提前 reload
-@property (nonatomic, assign) double startAt;         // 抓取起点（CFAbsoluteTime）
-@property (nonatomic, copy) void (^completion)(NSString *html, NSInteger code, NSError *error);
+@property (nonatomic, copy) void (^completion)(NSString *html, NSError *error);
 + (instancetype)sharedFetcher;
-- (void)fetchHTMLFromURL:(NSString *)url completion:(void (^)(NSString *html, NSInteger code, NSError *error))completion;
+- (void)fetchHTMLFromURL:(NSString *)url completion:(void (^)(NSString *html, NSError *error))completion;
 - (void)cleanupWebView;
 - (void)ddpRetryLoop:(NSURLRequest *)req;
 - (void)ddpPollHTML:(WKWebView *)webView;
 - (BOOL)ddpHandleHTML:(id)result error:(NSError *)error;
-- (NSInteger)extractDurationFromHTML:(NSString *)html;
 @end
 
 @implementation DDPWebFetcher
@@ -311,10 +307,9 @@ static void DDPAttachWebView(WKWebView *wv) {
     return self;
 }
 
-- (void)fetchHTMLFromURL:(NSString *)url completion:(void (^)(NSString *html, NSInteger code, NSError *error))completion {
+- (void)fetchHTMLFromURL:(NSString *)url completion:(void (^)(NSString *html, NSError *error))completion {
     self.completion = completion;
     self.hasCompleted = NO;
-    self.startAt = CFAbsoluteTimeGetCurrent();
     self.pollTicks = 0;
     self.lastHTMLLen = 0;
     self.sameLenTicks = 0;
@@ -323,7 +318,7 @@ static void DDPAttachWebView(WKWebView *wv) {
     if (!u) {
         NSError *err = [NSError errorWithDomain:@"InvalidURL" code:1001
                                       userInfo:@{NSLocalizedDescriptionKey: @"Invalid URL string"}];
-        if (completion) completion(nil, 0, err);
+        if (completion) completion(nil, err);
         return;
     }
     NSURLRequest *req = [NSURLRequest requestWithURL:u cachePolicy:NSURLRequestUseProtocolCachePolicy timeoutInterval:30.0];
@@ -355,7 +350,7 @@ static void DDPAttachWebView(WKWebView *wv) {
         self.hasCompleted = YES;
         NSError *err = [NSError errorWithDomain:@"DDP" code:500
                                       userInfo:@{NSLocalizedDescriptionKey: @"页面加载超时，请重试"}];
-        self.completion(nil, 0, err);
+        self.completion(nil, err);
     }
     [self cleanupWebView];
 }
@@ -407,41 +402,27 @@ static const double    DDMPollGap = 1.2; // 每次间隔 1.2 秒
     else self.sameLenTicks = 0;
     self.lastHTMLLen = html.length;
 
-    BOOL risk = [html containsString:@"验证码中间页"];
-    if (risk) [DDPToast() showToastWithText:@"被检测了，请验证后再试"];
-    _webView.hidden = !risk;
-
     BOOL gallery = [html containsString:@"aweme-share-swiper-item"] || [html containsString:@"aweme-slides-swiper-item"];
     BOOL video   = [html containsString:@"video_id="];
-    NSInteger dur = gallery ? 0 : [self extractDurationFromHTML:html];
     NSString *fail = [self ddpFailReason];
     if (fail) {
         if (self.completion && !self.hasCompleted) {
             self.hasCompleted = YES;
             NSError *err = [NSError errorWithDomain:@"DDP" code:501
                                           userInfo:@{NSLocalizedDescriptionKey: fail}];
-            self.completion(nil, 0, err);
+            self.completion(nil, err);
         }
         self.retries = 0; // 通知重载循环收工
         return YES;
     }
     if (!gallery && !video) return NO;
 
-    NSInteger code = gallery ? DDPCodeGallery : dur;
     if (self.completion && !self.hasCompleted) {
         self.hasCompleted = YES;
-        self.completion(html, code, nil);
+        self.completion(html, nil);
     }
     self.retries = 0; // 通知重载循环收工
     return YES;
-}
-
-// 从 HTML 抽取视频时长（秒）
-- (NSInteger)extractDurationFromHTML:(NSString *)html {
-    NSRegularExpression *re = DDPRegex(@"\"bit_rate\":null,\"duration\":(\\d+)", 0);
-    NSTextCheckingResult *m = [re firstMatchInString:html options:0 range:NSMakeRange(0, html.length)];
-    if (!m || m.numberOfRanges < 2) return 0;
-    return [[html substringWithRange:[m rangeAtIndex:1]] intValue] / 1000;
 }
 
 // 终态识别：命中直播等无法解析的链接，返回提示文案；否则 nil。
@@ -518,7 +499,7 @@ static const double    DDMPollGap = 1.2; // 每次间隔 1.2 秒
 
 - (void)parseDouyinURL:(NSString *)url
             completion:(void (^)(DDPMediaType type, NSString *videoURL, NSArray<NSString *> *imageURLs, NSError *err))completion {
-    [[DDPWebFetcher sharedFetcher] fetchHTMLFromURL:url completion:^(NSString *html, NSInteger code, NSError *err) {
+    [[DDPWebFetcher sharedFetcher] fetchHTMLFromURL:url completion:^(NSString *html, NSError *err) {
         if (html.length) {
             NSArray *videos = [self extractVideoLinksFromHTML:html];
             if (videos.count) {
@@ -707,7 +688,6 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
                     if (done < total) return;
                     dispatch_async(dispatch_get_main_queue(), ^{
                         if (failed == 0) DDPShowDone(@"保存成功");
-                        else if (failed < total) DDPShowDone(@"部分保存成功");
                         else DDPShowError(@"保存失败");
                     });
                 });
@@ -800,7 +780,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
                 anySent = YES;
             }
         }
-        if (!anySent) DDPShowError(@"解析失败");
+        if (!anySent) DDPShowError(@"发送失败");
         else if (finish) finish();
     });
 }
@@ -810,7 +790,7 @@ static void DDPSendTextMsg(NSString *content, NSString *user) {
     NSString *path = DDPTempPath(url);
     dispatch_async(DDPBg(), ^{
         NSString *p = [self ddpFetchToPath:path fromURL:videoURL];
-        if (!p) { DDPShowError(@"解析失败"); return; }
+        if (!p) { DDPShowError(@"下载失败"); return; }
         if (then) then(p);
     });
 }
