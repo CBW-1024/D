@@ -1185,10 +1185,8 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
         if (!DDPEnabled() || !wrap) { DDDLogOnce(@"addmsg-off", @"[Hook] AddMsg 跳过：开关=%d wrap=%@", DDPEnabled(), wrap ? @"有" : @"nil"); break; }
         if (!DDPIsOutgoing(wrap)) { DDDLogOnce(@"addmsg-in", @"[Hook] AddMsg 跳过：非本人发出"); break; }
         unsigned int mt = wrap.m_uiMessageType;
-        if (mt != 1 && mt != 49 && mt != 62) {
-            // key 必须先算成变量再传：宏参数按逗号切分，直接把 stringWithFormat: 写进去会被切成两半
-            NSString *mtKey = [NSString stringWithFormat:@"addmsg-mt-%u", mt];
-            DDDLogOnce(mtKey, @"[Hook] AddMsg 跳过：消息类型 %u 不在 1/49/62（记录实际出现过的类型）", mt);
+        if (mt != 1) {
+            DDDLogOnce(@"addmsg-nottext", @"[Hook] AddMsg 跳过：消息类型 %u 不是文本(1)", mt);
             break;
         }
         BOOL bypass = gDDPDyTcEnable; gDDPDyTcEnable = NO;       // 复位须在检测前
@@ -1262,7 +1260,7 @@ static NSArray *ddp_inject_item(id cell, NSArray *original, BOOL enabled, NSStri
     Class mgrCls = objc_getClass("WCPluginsMgr");
     if (mgrCls) {
         [[mgrCls sharedInstance] registerControllerWithTitle:@"DD抖音解析"
-                                                     version:@"1.3.10"
+                                                     version:@"1.3.11"
                                                   controller:@"DDPDouyinParseSettingsViewController"];
     }
     // 预热：把 WebContent 进程冷启动的成本提前付掉（tweak 加载时就在后台建好 WebView 并跑一个空文档）。
