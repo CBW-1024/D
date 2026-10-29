@@ -15,6 +15,14 @@
 - (void)ddipad_loginModeConfirmRestart;
 @end
 
+@interface WCAccountMainLoginViewController : UIViewController
+@property (nonatomic, strong) UIButton *bothDeviceButton;
+// 插件新增方法（%new）
+- (void)ddipad_loginModeChanged:(UISegmentedControl *)seg;
+- (void)ddipad_loginModeCancel;
+- (void)ddipad_loginModeConfirmRestart;
+@end
+
 @interface DeviceInfo : NSObject
 + (BOOL)isiPad;
 + (BOOL)isiPadOrVision;
@@ -215,9 +223,11 @@ static void DDiPadLoginModeLayoutControl(UIViewController *vc) {
     if (x < 12.0) {
         x = 12.0;
     }
+    seg.hidden = NO;
+    seg.alpha = 1.0;
     seg.frame = CGRectMake(x, y, w, h);
     if (DDiPadLoginOn() && [vc respondsToSelector:@selector(bothDeviceButton)]) {
-        UIButton *both = [(WCAccountLoginLastUserViewController *)vc bothDeviceButton];
+        UIButton *both = [(id)vc bothDeviceButton];
         if ([both isKindOfClass:[UIButton class]]) {
             both.hidden = NO;
             both.alpha = 1.0;
@@ -318,6 +328,85 @@ static void DDiPadLoginModeInstallControl(UIViewController *vc) {
     message:@"切换登录模式需要重启微信"
     preferredStyle:UIAlertControllerStyleAlert];
     WCAccountLoginLastUserViewController *vc = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) {
+        [vc ddipad_loginModeCancel];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"立即重启" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        [vc ddipad_loginModeConfirmRestart];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+%new
+- (void)ddipad_loginModeCancel {
+    objc_setAssociatedObject(self, kDDiPadLoginModePendingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    DDiPadLoginModeSyncSegment(self);
+}
+
+%new
+- (void)ddipad_loginModeConfirmRestart {
+    NSNumber *pending = objc_getAssociatedObject(self, kDDiPadLoginModePendingKey);
+    objc_setAssociatedObject(self, kDDiPadLoginModePendingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    BOOL wantPad = pending ? pending.boolValue : (DDiPadLoginModeSegment(self).selectedSegmentIndex == 1);
+    [DDiPadConfig setIPadLoginModeEnabled:wantPad];
+    DDiPadLoginModeRestartWeChat();
+}
+
+%end
+
+#pragma mark - 主登录页（无存储账号 / 首次登录）
+
+%hook WCAccountMainLoginViewController
+
+- (void)viewDidLoad {
+    sDDiPadLoginPageVisible = YES;
+    %orig;
+    DDiPadLoginModeInstallControl(self);
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    sDDiPadLoginPageVisible = YES;
+    %orig;
+    DDiPadLoginModeInstallControl(self);
+}
+
+- (void)viewDidDisappear:(BOOL)animated {
+    %orig;
+    sDDiPadLoginPageVisible = NO;
+}
+
+- (void)viewDidLayoutSubviews {
+    %orig;
+    DDiPadLoginModeLayoutControl(self);
+}
+
+%new
+- (void)ddipad_loginModeChanged:(UISegmentedControl *)seg {
+    BOOL wantPad = seg.selectedSegmentIndex == 1;
+    BOOL current = [DDiPadConfig iPadLoginModeEnabled];
+    if (wantPad == current) {
+        objc_setAssociatedObject(self, kDDiPadLoginModePendingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return;
+    }
+    objc_setAssociatedObject(self, kDDiPadLoginModePendingKey, @(wantPad), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    Class alertClass = objc_getClass("WCUIAlertView");
+    if (alertClass && [alertClass respondsToSelector:@selector(showAlertWithTitle:message:btnTitle:target:sel:btnTitle:target:sel:)]) {
+        [alertClass showAlertWithTitle:@"提示"
+        message:@"切换登录模式需要重启微信"
+        btnTitle:@"取消"
+        target:self
+        sel:@selector(ddipad_loginModeCancel)
+        btnTitle:@"立即重启"
+        target:self
+        sel:@selector(ddipad_loginModeConfirmRestart)];
+        return;
+    }
+
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"提示"
+    message:@"切换登录模式需要重启微信"
+    preferredStyle:UIAlertControllerStyleAlert];
+    WCAccountMainLoginViewController *vc = self;
     [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) {
         [vc ddipad_loginModeCancel];
     }]];
