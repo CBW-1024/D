@@ -103,15 +103,14 @@
 
 #pragma mark - hook 逻辑
 
-static BOOL sDDiPadLogin = NO;
 static BOOL sDDiPadLoginPageVisible = NO;
 
 static const void *kDDiPadLoginModeSegKey = &kDDiPadLoginModeSegKey;
 static const void *kDDiPadLoginModePendingKey = &kDDiPadLoginModePendingKey;
 
-// 是否启用伪装
+// 是否启用伪装（开关持久化在 NSUserDefaults，直接读取即可）
 static BOOL DDiPadLoginOn(void) {
-    return sDDiPadLogin || [DDiPadConfig iPadLoginModeEnabled];
+    return [DDiPadConfig iPadLoginModeEnabled];
 }
 
 // 仅在登录页生效（进主界面后保持手机功能）
@@ -599,5 +598,4 @@ static void DDiPadLoginModeInstallControl(UIViewController *vc) {
 
 %ctor {
     %init;
-    sDDiPadLogin = [DDiPadConfig iPadLoginModeEnabled];
 }
