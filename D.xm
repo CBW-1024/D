@@ -9,6 +9,10 @@
 @property (nonatomic, strong) UIButton *bothDeviceButton;
 - (BOOL)isBakDeviceOrPad;
 - (void)refreshView;
+// 插件新增方法（%new）
+- (void)ddipad_loginModeChanged:(UISegmentedControl *)seg;
+- (void)ddipad_loginModeCancel;
+- (void)ddipad_loginModeConfirmRestart;
 @end
 
 @interface DeviceInfo : NSObject
@@ -119,9 +123,9 @@ static NSString *DDiPadifyDeviceString(NSString *s) {
         return s;
     }
     NSString *n = [s stringByReplacingOccurrencesOfString:@"iPhone"
-                                               withString:@"iPad"
-                                                  options:NSCaseInsensitiveSearch
-                                                    range:NSMakeRange(0, s.length)];
+    withString:@"iPad"
+    options:NSCaseInsensitiveSearch
+    range:NSMakeRange(0, s.length)];
     if ([n rangeOfString:@"iPad"].location != NSNotFound) {
         return n;
     }
@@ -300,19 +304,19 @@ static void DDiPadLoginModeInstallControl(UIViewController *vc) {
     Class alertClass = objc_getClass("WCUIAlertView");
     if (alertClass && [alertClass respondsToSelector:@selector(showAlertWithTitle:message:btnTitle:target:sel:btnTitle:target:sel:)]) {
         [alertClass showAlertWithTitle:@"提示"
-                               message:@"切换登录模式需要重启微信"
-                              btnTitle:@"取消"
-                                target:self
-                                   sel:@selector(ddipad_loginModeCancel)
-                              btnTitle:@"立即重启"
-                                target:self
-                                   sel:@selector(ddipad_loginModeConfirmRestart)];
+        message:@"切换登录模式需要重启微信"
+        btnTitle:@"取消"
+        target:self
+        sel:@selector(ddipad_loginModeCancel)
+        btnTitle:@"立即重启"
+        target:self
+        sel:@selector(ddipad_loginModeConfirmRestart)];
         return;
     }
 
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"提示"
-                                                                   message:@"切换登录模式需要重启微信"
-                                                            preferredStyle:UIAlertControllerStyleAlert];
+    message:@"切换登录模式需要重启微信"
+    preferredStyle:UIAlertControllerStyleAlert];
     WCAccountLoginLastUserViewController *vc = self;
     [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) {
         [vc ddipad_loginModeCancel];
