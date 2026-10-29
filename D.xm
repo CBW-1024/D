@@ -1,96 +1,78 @@
-//
-//  DDiPad.xm
-//  登录页 iPhone / iPad 切换：伪装 iPad 登录，可与手机同时在线
-//  单文件版：微信类声明 + 配置类 + hook 逻辑全部内联
-//  微信类签名已对照微信 8.0.80 头文件核验
-//
+// DDiPad - 登录页 iPhone/iPad 切换，伪装 iPad 登录（单文件版）
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
-
-#pragma mark - 微信类手动前向声明（对照 8.0.80 头文件核验，不 import dump）
+#pragma mark - 微信类声明
 
 @interface WCAccountLoginLastUserViewController : UIViewController
-@property (nonatomic, strong) UIButton *bothDeviceButton;   // 真实: out/WeChat/headers/WCAccountLoginLastUserViewController.h L50
-- (BOOL)isBakDeviceOrPad;                                   // 真实 L128
-- (void)refreshView;                                        // 真实 L124
+@property (nonatomic, strong) UIButton *bothDeviceButton;
+- (BOOL)isBakDeviceOrPad;
+- (void)refreshView;
 @end
 
-#pragma mark - 设备信息判定
-
 @interface DeviceInfo : NSObject
-+ (BOOL)isiPad;                                             // 真实: DeviceInfo.h L63
-+ (BOOL)isiPadOrVision;                                     // 真实 L64
++ (BOOL)isiPad;
++ (BOOL)isiPadOrVision;
 @end
 
 @interface CAppUtil : NSObject
-+ (id)getDeviceType;                                        // 真实: CAppUtil.h L146
-+ (id)getCurrentDeviceName;                                 // 真实 L154
++ (id)getDeviceType;
++ (id)getCurrentDeviceName;
 @end
 
 @interface CommonAffClientUtilsObjcStatic : NSObject
-+ (id)getDeviceType;                                        // 真实: CommonAffClientUtilsObjcStatic.h L5
++ (id)getDeviceType;
 @end
 
 @interface MatrixDeviceInfo : NSObject
-+ (BOOL)isiPad;                                             // 真实: MatrixDeviceInfo.h L5
-+ (id)getDeviceType;                                        // 真实 L7
++ (BOOL)isiPad;
++ (id)getDeviceType;
 @end
 
 @interface DeviceUtility : NSObject
-+ (id)SystemNameForDeviceType;                              // 真实: DeviceUtility.h L6
++ (id)SystemNameForDeviceType;
 @end
 
-#pragma mark - 鉴权请求（device 字段伪装目标）
-
 @interface BaseRequest : NSObject
-@property (retain, nonatomic) NSData *deviceType;           // 真实: BaseRequest.h L9
+@property (retain, nonatomic) NSData *deviceType;
 @end
 
 @interface ManualAuthAesReqData : NSObject
-@property (retain, nonatomic) NSString *deviceType;         // 真实: ManualAuthAesReqData.h L13
-@property (retain, nonatomic) NSString *deviceModel;        // 真实 L19
-@property (retain, nonatomic) NSString *deviceName;         // 真实 L12
-@property (retain, nonatomic) NSString *iphoneVer;          // 真实 L24
-@property (retain, nonatomic) NSString *softType;          // 真实 L8
+@property (retain, nonatomic) NSString *deviceType;
+@property (retain, nonatomic) NSString *deviceModel;
+@property (retain, nonatomic) NSString *deviceName;
+@property (retain, nonatomic) NSString *iphoneVer;
+@property (retain, nonatomic) NSString *softType;
 @end
 
 @interface AutoAuthAesReqData : NSObject
-@property (retain, nonatomic) NSString *deviceType;         // 真实: AutoAuthAesReqData.h L14
-@property (retain, nonatomic) NSString *deviceName;        // 真实 L13
-@property (retain, nonatomic) NSString *softType;          // 真实 L9
+@property (retain, nonatomic) NSString *deviceType;
+@property (retain, nonatomic) NSString *deviceName;
+@property (retain, nonatomic) NSString *softType;
 @end
 
 @interface NewSyncRequest : NSObject
-@property (retain, nonatomic) NSString *deviceType;         // 真实: NewSyncRequest.h L9
+@property (retain, nonatomic) NSString *deviceType;
 @end
 
 @interface AxAuthRequest : NSObject
-@property (retain, nonatomic) NSString *deviceType;         // 真实: AxAuthRequest.h L12
-@property (retain, nonatomic) NSString *deviceName;         // 真实 L11
-@property (retain, nonatomic) NSString *softType;          // 真实 L9
+@property (retain, nonatomic) NSString *deviceType;
+@property (retain, nonatomic) NSString *deviceName;
+@property (retain, nonatomic) NSString *softType;
 @end
-
-#pragma mark - 弹窗（运行时 objc_getClass 获取，此处补签名消除编译警告）
 
 @interface WCUIAlertView : NSObject
-+ (id)showAlertWithTitle:(id)arg1 message:(id)arg2 btnTitle:(id)arg3 target:(id)arg4 sel:(SEL)arg5 btnTitle:(id)arg6 target:(id)arg7 sel:(SEL)arg8; // 真实: WCUIAlertView.h L13
++ (id)showAlertWithTitle:(id)arg1 message:(id)arg2 btnTitle:(id)arg3 target:(id)arg4 sel:(SEL)arg5 btnTitle:(id)arg6 target:(id)arg7 sel:(SEL)arg8;
 @end
 
-#pragma mark - DDiPad 配置类（NSUserDefaults 持久化）
+#pragma mark - 配置类
 
-// 持久化开关所用的 NSUserDefaults key（修复：原合并脚本从 @interface 截断，丢掉了该宏定义）
 #define kDDiPadIPadLoginModeKey @"ddipad_ipad_login_mode"
 
 @interface DDiPadConfig : NSObject
-
-/// 是否启用 iPad 登录伪装模式
 + (BOOL)iPadLoginModeEnabled;
-
-/// 设置并持久化 iPad 登录伪装开关
 + (void)setIPadLoginModeEnabled:(BOOL)enabled;
-
 @end
 
 @implementation DDiPadConfig
@@ -107,8 +89,7 @@
 
 @end
 
-#pragma mark - 插件逻辑（hook）
-
+#pragma mark - hook 逻辑
 
 static BOOL sDDiPadLogin = NO;
 static BOOL sDDiPadLoginPageVisible = NO;
@@ -116,16 +97,17 @@ static BOOL sDDiPadLoginPageVisible = NO;
 static const void *kDDiPadLoginModeSegKey = &kDDiPadLoginModeSegKey;
 static const void *kDDiPadLoginModePendingKey = &kDDiPadLoginModePendingKey;
 
-// 微信类前向声明已移至 WeChatHeaders.h（手动声明，对照 8.0.80 头文件核验）
-
+// 是否启用伪装
 static BOOL DDiPadLoginOn(void) {
     return sDDiPadLogin || [DDiPadConfig iPadLoginModeEnabled];
 }
 
+// 仅在登录页生效（进主界面后保持手机功能）
 static BOOL DDiPadLoginUISpoofOn(void) {
     return DDiPadLoginOn() && sDDiPadLoginPageVisible;
 }
 
+// 将设备标识字符串伪装为 iPad
 static NSString *DDiPadifyDeviceString(NSString *s) {
     if (!DDiPadLoginOn()) {
         return s;
@@ -146,6 +128,7 @@ static NSString *DDiPadifyDeviceString(NSString *s) {
     return [@"iPad " stringByAppendingString:s];
 }
 
+// NSData 形式同上
 static NSData *DDiPadifyDeviceData(NSData *data) {
     if (!DDiPadLoginOn() || data.length == 0) {
         return data;
@@ -161,6 +144,7 @@ static NSData *DDiPadifyDeviceData(NSData *data) {
     return [n dataUsingEncoding:NSUTF8StringEncoding];
 }
 
+// 挂起并退出，由越狱看门狗重启微信
 static void DDiPadLoginModeRestartWeChat(void) {
     UIApplication *app = [UIApplication sharedApplication];
     [app performSelector:@selector(suspend)];
@@ -172,6 +156,7 @@ static UISegmentedControl *DDiPadLoginModeSegment(UIViewController *vc) {
     return objc_getAssociatedObject(vc, kDDiPadLoginModeSegKey);
 }
 
+// 同步分段控件选中状态
 static void DDiPadLoginModeSyncSegment(UIViewController *vc) {
     UISegmentedControl *seg = DDiPadLoginModeSegment(vc);
     if (!seg) {
@@ -185,6 +170,7 @@ static void DDiPadLoginModeSyncSegment(UIViewController *vc) {
     }
 }
 
+// 计算右侧预留空间，避免遮挡其它控件
 static CGFloat DDiPadLoginModeRightReserved(UIView *host, UIView *seg) {
     CGFloat reserve = 16.0;
     CGFloat topBand = MAX(host.safeAreaInsets.top, 20.0) + 52.0;
@@ -204,6 +190,7 @@ static CGFloat DDiPadLoginModeRightReserved(UIView *host, UIView *seg) {
     return reserve;
 }
 
+// 把分段控件布局到登录页右上角
 static void DDiPadLoginModeLayoutControl(UIViewController *vc) {
     UIView *host = vc.view;
     UISegmentedControl *seg = DDiPadLoginModeSegment(vc);
@@ -238,6 +225,7 @@ static void DDiPadLoginModeLayoutControl(UIViewController *vc) {
     DDiPadLoginModeSyncSegment(vc);
 }
 
+// 安装 iPhone/iPad 分段控件
 static void DDiPadLoginModeInstallControl(UIViewController *vc) {
     if (DDiPadLoginModeSegment(vc)) {
         DDiPadLoginModeLayoutControl(vc);
@@ -251,7 +239,7 @@ static void DDiPadLoginModeInstallControl(UIViewController *vc) {
     DDiPadLoginModeLayoutControl(vc);
 }
 
-#pragma mark - 登录页分段控件
+#pragma mark - 登录页
 
 %hook WCAccountLoginLastUserViewController
 
@@ -352,7 +340,7 @@ static void DDiPadLoginModeInstallControl(UIViewController *vc) {
 
 %end
 
-#pragma mark - 伪装 iPad 登录（仅登录页按 iPad 显示，进主界面后保持手机功能）
+#pragma mark - 设备伪装
 
 %hook DeviceInfo
 + (BOOL)isiPad {
