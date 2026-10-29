@@ -1,45 +1,72 @@
 name: build deb
 
-on: 
+on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: macos-latest
 
     steps:
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@v7
         with:
           submodules: true
 
       - name: Check cache
         run: |
-          echo upstream_heads=`git ls-remote https://github.com/roothide/theos | head -n 1 | cut -f 1`-`git ls-remote https://github.com/theos/sdks | head -n 1 | cut -f 1` >> $GITHUB_ENV
+          upstream_head=$(git ls-remote https://github.com/roothide/theos | head -n 1 | cut -f 1)
+          echo "upstream_head=$upstream_head" >> "$GITHUB_ENV"
 
       - name: Use cache
         id: cache
-        uses: actions/cache@v4.2.1
+        uses: actions/cache@v6
         with:
           path: ${{ github.workspace }}/theos
-          key: ${{ runner.os }}-${{ env.upstream_heads }}
+          key: ${{ runner.os }}-${{ env.upstream_head }}
 
-      - name: Prepare Theos
-        uses: CW-1024/theos-action@main
-
-      - name: Setup GNU Make
+      - name: Install build dependencies
         run: |
-          echo "$(brew --prefix)/opt/make/libexec/gnubin" >> $GITHUB_PATH
+          brew install ldid make || true
+
+      - name: Setup environment
+        run: |
+          echo "THEOS=${{ github.workspace }}/theos" >> "$GITHUB_ENV"
+          echo "$(brew --prefix)/opt/make/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Clone Theos
+        run: |
+          set -e
+          THEOS_DIR="${{ github.workspace }}/theos"
+          if [ -d "$THEOS_DIR/.git" ]; then
+            echo "Theos already cached, updating..."
+            git -C "$THEOS_DIR" fetch --depth 1 origin
+            git -C "$THEOS_DIR" reset --hard "origin/HEAD" || git -C "$THEOS_DIR" reset --hard
+            git -C "$THEOS_DIR" submodule update --init --recursive --depth 1
+          else
+            git clone --recursive --depth 1 https://github.com/roothide/theos.git "$THEOS_DIR"
+          fi
+
+      - name: Show toolchain versions
+        run: |
+          xcodebuild -version
+          echo "iOS SDK version : $(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "iOS SDK path    : $(xcrun --sdk iphoneos --show-sdk-path)"
+          echo "GNU Make        : $(make --version | head -n 1)"
 
       - name: Build package
         run: |
+          set -e
           rm -f packages/*
-          make package FINALPACKAGE=1 -j$(sysctl -n hw.ncpu)
-          make package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1 -j$(sysctl -n hw.ncpu)
-          make package THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1 -j$(sysctl -n hw.ncpu)
+          jobs=$(sysctl -n hw.ncpu)
+          make package FINALPACKAGE=1 -j"$jobs"
+          make package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1 -j"$jobs"
+          make package THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1 -j"$jobs"
+          ls -l packages/
 
       - name: Upload specific Deb packages
-        uses: actions/upload-artifact@v4.6.0
+        uses: actions/upload-artifact@v7
         with:
           name: D
           path: ${{ github.workspace }}/packages/*.deb
